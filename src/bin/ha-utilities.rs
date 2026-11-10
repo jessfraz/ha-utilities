@@ -2,6 +2,7 @@ use chrono::NaiveDate;
 use clap::{Args, Parser, Subcommand};
 use ha_utilities::{
     client::{Client, ClientError, Transport},
+    config::read_secret,
     models::{ListQuery, SyncInput},
 };
 use serde::Serialize;
@@ -15,14 +16,17 @@ use std::path::PathBuf;
 struct Cli {
     #[arg(
         long,
-        env = "UTILITIES_URL",
-        default_value = "http://127.0.0.1:8080",
+        help = "Origin. Defaults to UTILITIES_URL or HOME_ASSISTANT_URL for the selected transport",
         global = true
     )]
-    url: String,
+    url: Option<String>,
     #[arg(long, value_enum, default_value = "native", global = true)]
     transport: Transport,
-    #[arg(long, env = "UTILITIES_TOKEN_FILE", global = true)]
+    #[arg(
+        long,
+        global = true,
+        help = "Credential file overriding the selected transport environment"
+    )]
     token_file: Option<PathBuf>,
     #[arg(long, global = true)]
     json: bool,
@@ -132,16 +136,45 @@ fn print<T: Serialize>(value: &T, json: bool) -> Result<(), ClientError> {
     println!("{result}");
     Ok(())
 }
+fn variable(name: &str) -> Result<Option<String>, ClientError> {
+    match std::env::var(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err(ClientError::new("invalid_configuration", None))
+        }
+    }
+}
+
+fn configured_client(cli: &Cli) -> Result<Client, ClientError> {
+    let url = match &cli.url {
+        Some(url) => url.clone(),
+        None => match cli.transport {
+            Transport::Native => {
+                variable("UTILITIES_URL")?.unwrap_or_else(|| "http://127.0.0.1:8080".to_owned())
+            }
+            Transport::Ha => variable("HOME_ASSISTANT_URL")?
+                .ok_or_else(|| ClientError::new("url_required", None))?,
+        },
+    };
+    let token_file = cli.token_file.clone().or_else(|| match cli.transport {
+        Transport::Native => std::env::var_os("UTILITIES_TOKEN_FILE").map(PathBuf::from),
+        Transport::Ha => None,
+    });
+    let token = if let Some(path) = token_file {
+        read_secret(&path).map_err(|_| ClientError::new("credential_file_unavailable", None))?
+    } else {
+        match cli.transport {
+            Transport::Native => return Err(ClientError::new("credential_file_required", None)),
+            Transport::Ha => variable("HOME_ASSISTANT_TOKEN")?
+                .ok_or_else(|| ClientError::new("credential_required", None))?,
+        }
+    };
+    Client::new(&url, cli.transport, &token)
+}
+
 async fn run(cli: Cli) -> Result<(), ClientError> {
-    let client = Client::new(
-        &cli.url,
-        cli.transport,
-        cli.token_file.as_deref().ok_or(ClientError {
-            error: "credential_file_required",
-            message: "--token-file or UTILITIES_TOKEN_FILE is required".to_owned(),
-            status: None,
-        })?,
-    )?;
+    let client = configured_client(&cli)?;
     match cli.command {
         Command::Health => print(&client.health().await?, cli.json),
         Command::System => print(&client.system().await?, cli.json),
