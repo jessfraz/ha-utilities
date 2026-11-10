@@ -100,7 +100,10 @@ expect_rejection() {
         return 1
     fi
     docker logs "$container" >"$scratch/service.log" 2>&1
-    rg --quiet --fixed-strings "$expected" "$scratch/service.log"
+    python3 - "$scratch/service.log" "$expected" <<'PY_CHECK'
+import pathlib, sys
+assert sys.argv[2] in pathlib.Path(sys.argv[1]).read_text(), 'Unexpected startup rejection'
+PY_CHECK
 }
 
 docker start "$container" >/dev/null
