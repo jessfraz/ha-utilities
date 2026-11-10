@@ -11,25 +11,33 @@ from typing import Literal
 
 import pytest
 from aiohttp import ClientError, ClientSession, web
-from playwright.async_api import Page, async_playwright, expect
+from playwright.async_api import (
+    BrowserContext,
+    Frame,
+    Page,
+    Route,
+    async_playwright,
+    expect,
+)
 from pytest_aiohttp.plugin import AiohttpServer
 
 from tests_web.conftest import ROOT, TOKEN, WebBackend
 
 ONBOARD_LINK = "https://bayou.energy/companies/12345/onboard/fictional-signin_Token"
+LEGACY_LINK = "https://bayou.energy/companies/12345/sign_up?key=fictional-private-link"
 
 
 @dataclass
 class BayouFixture:
-    """Only documented provider shapes, with entirely fictional identifiers."""
+    """Bayou response shapes with entirely fictional identifiers."""
 
     external_id: str | None = None
     authenticated: bool = False
     posts: list[dict[str, object]] = field(default_factory=list)
     lookup_error_status: int | None = None
-    onboarding_link: str | None = (
-        "https://bayou.energy/companies/12345/sign_up?key=fictional-private-link"
-    )
+    lookup_gate: asyncio.Event | None = None
+    lookup_started: asyncio.Event = field(default_factory=asyncio.Event)
+    onboarding_link: str | None = LEGACY_LINK
     lose_post_response: bool = False
     post_received: asyncio.Event = field(default_factory=asyncio.Event)
 
@@ -57,6 +65,9 @@ class BayouFixture:
                 return web.json_response({}, status=409)
             self.external_id = value["external_id"]
             return web.json_response({}, status=503 if self.lose_post_response else 201)
+        if self.lookup_gate is not None:
+            self.lookup_started.set()
+            await self.lookup_gate.wait()
         if self.lookup_error_status is not None:
             return web.json_response({}, status=self.lookup_error_status)
         if request.path.endswith("/bills"):
@@ -188,8 +199,9 @@ async def sign_in(page: Page, fixture: ConnectionBackend) -> None:
 
 
 async def start_connection(
-    page: Page, provider: BayouFixture, screenshot: Path | None = None
+    page: Page | Frame, provider: BayouFixture, screenshot: Path | None = None
 ) -> None:
+    owner = page.page if isinstance(page, Frame) else page
     await page.get_by_role("button", name="Settings", exact=True).click()
     await expect(
         page.get_by_role("heading", name="Settings", exact=True)
@@ -199,7 +211,7 @@ async def start_connection(
     await dialog.get_by_label("Utility", exact=True).select_option("speculoos_power")
     await dialog.get_by_label("Display name (optional)").fill("Example electricity")
     if screenshot is not None:
-        await page.screenshot(path=str(screenshot), full_page=True)
+        await owner.screenshot(path=str(screenshot), full_page=True)
     consent = dialog.get_by_role("checkbox")
     await expect(consent).not_to_be_checked()
     submit = dialog.get_by_role("button", name="Continue to sign-in")
@@ -217,7 +229,7 @@ async def start_connection(
         dialog.get_by_role("button", name="Close utility connection")
     ).to_be_in_viewport(ratio=1)
     if screenshot is not None:
-        await page.screenshot(
+        await owner.screenshot(
             path=str(screenshot.with_stem(screenshot.stem + "-policy")), full_page=True
         )
     await consent.check()
@@ -227,7 +239,119 @@ async def start_connection(
     )
 
 
-async def test_hosted_onboard_link_is_available_without_navigating_to_bayou(
+async def serve_fictional_bayou(context: BrowserContext, link: str) -> None:
+    async def serve(route: Route) -> None:
+        if route.request.url != link:
+            await route.abort()
+            return
+        await route.fulfill(
+            status=200, content_type="text/html", body="<h1>Fictional Bayou</h1>"
+        )
+
+    await context.route("https://bayou.energy/**", serve)
+
+
+async def test_hosted_sign_in_opens_one_tab_before_delayed_authorization(
+    connection_backend: ConnectionBackend,
+) -> None:
+    fixture = connection_backend
+    fixture.provider.onboarding_link = ONBOARD_LINK
+    gate = asyncio.Event()
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch()
+        try:
+            page = await browser.new_page()
+            await serve_fictional_bayou(page.context, ONBOARD_LINK)
+            await sign_in(page, fixture)
+            await start_connection(page, fixture.provider)
+            fixture.provider.lookup_gate = gate
+            dialog = page.get_by_role("dialog")
+            async with page.expect_response(
+                lambda response: response.url.endswith("/authorization")
+            ) as authorization:
+                # Match the old label too so the base fails for opening no tab.
+                button = dialog.get_by_role(
+                    "button",
+                    name=re.compile(r"^(Sign in on Bayou|Get secure sign-in link)$"),
+                )
+                async with page.context.expect_page(timeout=5000) as opened:
+                    await button.click()
+                popup = await opened.value
+                assert popup.url == "about:blank"
+                assert await popup.evaluate("window.opener === null")
+                await asyncio.wait_for(fixture.provider.lookup_started.wait(), 5)
+                gate.set()
+            response = await authorization.value
+            assert response.status == 200
+            assert response.headers["cache-control"] == "no-store"
+            assert await response.json() == {"url": ONBOARD_LINK}
+            await popup.wait_for_url(ONBOARD_LINK)
+            await expect(
+                popup.get_by_role("heading", name="Fictional Bayou")
+            ).to_be_visible()
+            assert await popup.evaluate("document.referrer") == ""
+            assert await popup.evaluate("window.opener === null")
+            assert len(page.context.pages) == 2
+            await popup.close()
+            await expect(dialog.get_by_role("status")).to_have_text("Sign-in needed")
+            await expect(button).to_have_text("Sign in on Bayou")
+            await expect(
+                dialog.get_by_text(
+                    "Bayou stores your utility login to keep data in sync. "
+                    "Home Assistant never receives your password.",
+                    exact=False,
+                )
+            ).to_be_visible()
+        finally:
+            gate.set()
+            await browser.close()
+
+
+@pytest.mark.parametrize("dismiss", [False, True])
+async def test_pending_bayou_tab_closes_on_failure_or_dismissal(
+    connection_backend: ConnectionBackend, dismiss: bool
+) -> None:
+    fixture = connection_backend
+    fixture.provider.onboarding_link = ONBOARD_LINK
+    gate = asyncio.Event()
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch()
+        try:
+            page = await browser.new_page()
+            await serve_fictional_bayou(page.context, ONBOARD_LINK)
+            await sign_in(page, fixture)
+            await start_connection(page, fixture.provider)
+            fixture.provider.lookup_gate = gate
+            fixture.provider.lookup_error_status = None if dismiss else 503
+            dialog = page.get_by_role("dialog")
+            async with page.context.expect_page() as opened:
+                await dialog.get_by_role("button", name="Sign in on Bayou").click()
+            popup = await opened.value
+            assert popup.url == "about:blank"
+            await asyncio.wait_for(fixture.provider.lookup_started.wait(), 5)
+            async with popup.expect_event("close", timeout=5000):
+                if dismiss:
+                    await dialog.get_by_role(
+                        "button", name="Close utility connection"
+                    ).click()
+                else:
+                    gate.set()
+            if dismiss:
+                await expect(dialog).to_be_hidden()
+            else:
+                await expect(dialog.get_by_role("alert")).to_have_text(
+                    "Bayou could not be reached. Saved connection details are safe."
+                )
+                await expect(
+                    dialog.get_by_role("button", name="Sign in on Bayou")
+                ).to_be_enabled()
+            assert page.context.pages == [page]
+        finally:
+            gate.set()
+            await browser.close()
+
+
+async def test_sandboxed_popup_falls_back_to_a_safe_bayou_link(
     connection_backend: ConnectionBackend,
 ) -> None:
     fixture = connection_backend
@@ -235,25 +359,29 @@ async def test_hosted_onboard_link_is_available_without_navigating_to_bayou(
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch()
         try:
-            page = await browser.new_page()
+            page = await browser.new_page(viewport={"width": 1200, "height": 900})
+            await serve_fictional_bayou(page.context, ONBOARD_LINK)
             await sign_in(page, fixture)
-            await start_connection(page, fixture.provider)
-            dialog = page.get_by_role("dialog")
-            async with page.expect_response(
-                lambda response: response.url.endswith("/authorization")
-            ) as authorization:
-                await dialog.get_by_role(
-                    "button", name="Get secure sign-in link"
-                ).click()
-            response = await authorization.value
-            assert response.status == 200
-            assert response.headers["cache-control"] == "no-store"
-            assert await response.json() == {"url": ONBOARD_LINK}
+            # The browser denies popups inside this real sandboxed app frame.
+            await page.set_content(
+                '<iframe name="no-popups" title="Utilities" '
+                'sandbox="allow-forms allow-scripts allow-same-origin" src="/" '
+                'width="1180" height="860"></iframe>'
+            )
+            await expect(
+                page.frame_locator("iframe").locator("#content")
+            ).to_have_attribute("aria-busy", "false")
+            frame = page.frame(name="no-popups")
+            assert frame is not None
+            await start_connection(frame, fixture.provider)
+            dialog = frame.get_by_role("dialog")
+            await dialog.get_by_role("button", name="Sign in on Bayou").click()
             link = dialog.get_by_role("link", name="Continue on Bayou")
             await expect(link).to_have_attribute("href", ONBOARD_LINK)
             await expect(link).to_have_attribute("rel", "noopener noreferrer")
             await expect(link).to_have_attribute("referrerpolicy", "no-referrer")
-            assert len(page.context.pages) == 1
+            await expect(link).to_have_attribute("target", "_blank")
+            assert page.context.pages == [page]
         finally:
             await browser.close()
 
@@ -292,9 +420,7 @@ async def test_hosted_sign_in_distinguishes_bad_links_credentials_and_outages(
                 async with page.expect_response(
                     lambda response: response.url.endswith("/authorization")
                 ) as authorization:
-                    await dialog.get_by_role(
-                        "button", name="Get secure sign-in link"
-                    ).click()
+                    await dialog.get_by_role("button", name="Sign in on Bayou").click()
                 response = await authorization.value
                 assert response.status == 503
                 assert (await response.json())["error_code"] == code
@@ -325,6 +451,7 @@ async def test_hosted_link_meter_selection_and_saved_connection(
             )
             errors: list[str] = []
             page.on("pageerror", lambda error: errors.append(str(error)))
+            await serve_fictional_bayou(page.context, LEGACY_LINK)
             await sign_in(page, fixture)
             await start_connection(
                 page,
@@ -337,14 +464,11 @@ async def test_hosted_link_meter_selection_and_saved_connection(
                 full_page=True,
             )
             assert len(fixture.provider.posts) == 1
-            await dialog.get_by_role("button", name="Get secure sign-in link").click()
-            link = dialog.get_by_role("link", name="Continue on Bayou")
-            await expect(link).to_have_attribute("rel", "noopener noreferrer")
-            await expect(link).to_have_attribute("referrerpolicy", "no-referrer")
-            await expect(link).to_have_attribute(
-                "href",
-                re.compile(r"^https://bayou\.energy/companies/12345/sign_up\?key="),
-            )
+            async with page.context.expect_page() as opened:
+                await dialog.get_by_role("button", name="Sign in on Bayou").click()
+            popup = await opened.value
+            await popup.wait_for_url(LEGACY_LINK)
+            await popup.close()
             await page.keyboard.press("Escape")
             await expect(dialog).to_be_hidden()
             await expect(

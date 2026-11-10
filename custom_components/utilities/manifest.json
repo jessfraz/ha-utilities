@@ -13,7 +13,7 @@
   "iot_class": "local_polling",
   "requirements": [],
   "single_config_entry": true,
-  "version": "0.1.4",
+  "version": "0.1.5",
   "after_dependencies": [
     "hassio",
     "recorder"

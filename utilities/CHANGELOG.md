@@ -1,3 +1,7 @@
+# 0.1.5
+
+Open Bayou sign-in in one click and explain why Bayou saves the utility login.
+
 # 0.1.4
 
 Repair app and integration version mismatches from Home Assistant Repairs.

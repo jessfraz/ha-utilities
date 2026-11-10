@@ -1,4 +1,44 @@
 // Hosted authorization stays with Bayou. Only durable connection status is kept here.
+function openBayouTab() {
+  let tab;
+  let placeholder;
+  try {
+    tab = window.open('about:blank', '_blank');
+    if (!tab) return null;
+    tab.opener = null;
+    placeholder = tab.document;
+  } catch {
+    tab?.close();
+    return null;
+  }
+  // Keep ownership only while this is the blank document we opened.
+  function ownsPlaceholder() {
+    try { return !tab.closed && tab.document === placeholder; }
+    catch { return false; }
+  }
+  function close() {
+    if (ownsPlaceholder()) tab.close();
+  }
+  return {
+    navigate(url) {
+      if (!ownsPlaceholder()) return false;
+      try {
+        const link = placeholder.createElement('a');
+        link.href = url.href;
+        link.rel = 'noreferrer';
+        link.referrerPolicy = 'no-referrer';
+        (placeholder.body ?? placeholder.documentElement).append(link);
+        link.click();
+        return true;
+      } catch {
+        close();
+        return false;
+      }
+    },
+    close,
+  };
+}
+
 export function createConnections({ api, node, providers, updated, connected, onError }) {
   const dialog = document.createElement('dialog');
   dialog.className = 'connection-dialog';
@@ -124,20 +164,27 @@ export function createConnections({ api, node, providers, updated, connected, on
       renderMeters(next);
     } else {
       if (['awaiting_authorization', 'needs_authentication', 'authenticating'].includes(next.state)) {
-        body.append(node('p', 'Sign in to your utility on Bayou’s secure page. Return here when finished. Utility passwords and verification codes stay with Bayou.'));
+        body.append(node('p', 'Bayou stores your utility login to keep data in sync. Home Assistant never receives your password. Return here when finished.'));
         const linkArea = node('div', undefined, 'connection-link');
-        linkArea.append(action('Get secure sign-in link', async () => {
-          const authorization = await request(endpoint('authorization'), {});
-          if (!dialog.open) return;
-          const url = new URL(authorization.url);
-          if (url.protocol !== 'https:' || url.hostname !== 'bayou.energy' || url.port || url.username || url.password) throw new Error('The sign-in link could not be verified.');
-          const link = node('a', 'Continue on Bayou ↗', 'connection-primary');
-          link.href = url.href;
-          link.target = '_blank';
-          link.rel = 'noopener noreferrer';
-          link.referrerPolicy = 'no-referrer';
-          linkArea.replaceChildren(link);
-          link.focus();
+        linkArea.append(action('Sign in on Bayou', async () => {
+          // Open during the click so delayed authorization cannot lose the gesture.
+          const tab = openBayouTab();
+          try {
+            const authorization = await request(endpoint('authorization'));
+            const url = new URL(authorization.url);
+            if (url.protocol !== 'https:' || url.hostname !== 'bayou.energy' || url.port || url.username || url.password) throw new Error('The sign-in link could not be verified.');
+            if (tab?.navigate(url)) return;
+            const link = node('a', 'Continue on Bayou ↗', 'connection-primary');
+            link.href = url.href;
+            link.target = '_blank';
+            link.rel = 'noopener noreferrer';
+            link.referrerPolicy = 'no-referrer';
+            linkArea.replaceChildren(link);
+            link.focus();
+          } catch (failure) {
+            tab?.close();
+            throw failure;
+          }
         }));
         body.append(linkArea);
       } else if (next.state === 'discovering') {
