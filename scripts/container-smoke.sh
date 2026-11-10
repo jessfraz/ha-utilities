@@ -112,7 +112,7 @@ check_private_files() {
     permissions=$(docker exec "$container" stat -c '%a:%u:%g' \
         /data/api-token /data/config.toml /data/provider-secret /data/options.json)
     if [[ $permissions != $'600:10001:10001\n600:10001:10001\n600:10001:10001\n600:10001:10001' ]]; then
-        echo 'Private runtime file modes/owners were not preserved' >&2
+        echo 'Private runtime files lack owner-only modes or application ownership' >&2
         return 1
     fi
     for file in api-token config.toml provider-secret options.json; do
@@ -162,12 +162,11 @@ check_state
 stop_container
 start_container
 check_state
-database_mode=$(docker exec "$container" stat -c '%a' /data/utilities.sqlite3)
 stop_container
 echo 'Container startup/restart passed; restoring root-owned private data.'
 
-# Native Supervisor restore uses copytree, retaining modes while creating files
-# owned by root. Copy all app data into a new volume without preserving owners.
+# Native Supervisor restore can turn app-owned 0600 files into root-owned 0644
+# files. Reproduce that observed state across the full private data tree.
 docker volume create "$outside_volume" >/dev/null
 docker run --rm --mount "type=volume,source=$volume,target=/data" \
     --mount "type=volume,source=$outside_volume,target=/outside" \
@@ -175,6 +174,8 @@ docker run --rm --mount "type=volume,source=$volume,target=/data" \
         umask 077
         printf "outside-private-data\n" > /outside/sentinel
         mkdir /outside/private /data/owned-nested
+        chmod 640 /outside/sentinel
+        chmod 750 /outside /outside/private
         printf "preserved-private-state\n" > /data/owned-nested/marker
         chown -R 10001:10001 /data/owned-nested
         ln -s /outside /data/external-directory
@@ -192,22 +193,25 @@ docker create --name "$container" \
 docker cp "$scratch/app-data/." "$container:/data"
 docker run --rm --mount "type=volume,source=$restore_volume,target=/data" \
     --entrypoint sh "$image" -c '
-        test "$(stat -c "%a:%u:%g" /data/api-token)" = 600:0:0
-        test "$(stat -c "%a:%u:%g" /data/config.toml)" = 600:0:0
-        test "$(stat -c "%a:%u:%g" /data/provider-secret)" = 600:0:0
+        find -P /data -xdev -type f -exec chmod 644 -- {} +
+        find -P /data -xdev -type d -exec chmod 755 -- {} +
+        test "$(stat -c "%a:%u:%g" /data/api-token)" = 644:0:0
+        test "$(stat -c "%a:%u:%g" /data/config.toml)" = 644:0:0
+        test "$(stat -c "%a:%u:%g" /data/provider-secret)" = 644:0:0
+        test "$(stat -c "%a:%u:%g" /data/owned-nested/marker)" = 644:0:0
         test -L /data/external-directory
         test -L /data/external-file
     '
 start_container
 check_state
 ownership=$(docker exec "$container" stat -c '%a:%u:%g' \
-    /data/utilities.sqlite3 /data/owned-nested/marker)
-if [[ $ownership != "$database_mode:10001:10001"$'\n600:10001:10001' ]]; then
-    echo 'Restored data modes/owners were not preserved' >&2
+    /data/utilities.sqlite3 /data/owned-nested/marker /data /data/owned-nested)
+if [[ $ownership != $'600:10001:10001\n600:10001:10001\n700:10001:10001\n700:10001:10001' ]]; then
+    echo 'Restored data was not normalized to private modes and application ownership' >&2
     exit 1
 fi
 outside=$(docker exec "$container" stat -c '%a:%u:%g' /outside/sentinel /outside/private)
-if [[ $outside != $'600:0:0\n700:0:0' ]]; then
+if [[ $outside != $'640:0:0\n750:0:0' ]]; then
     echo 'Startup followed a private-data symlink outside the owned volume' >&2
     exit 1
 fi
@@ -233,12 +237,23 @@ expect_startup_refusal() {
     fi
 }
 
-# A nested volume must be rejected before ownership repair touches either mount.
+# A nested volume must be rejected before repair touches either mount.
+docker run --rm --mount "type=volume,source=$restore_volume,target=/data" \
+    --entrypoint sh "$image" -c '
+        chown 0:0 /data/owned-nested/marker
+        chmod 644 /data/owned-nested/marker
+        chmod 755 /data/owned-nested
+    '
 docker create --name "$boundary_container" \
     --mount "type=volume,source=$restore_volume,target=/data" \
     --mount "type=volume,source=$outside_volume,target=/data/external-mount" \
     "$image" >/dev/null
 expect_startup_refusal "$boundary_container" 'contains nested mounts'
+docker run --rm --mount "type=volume,source=$restore_volume,target=/data" \
+    --entrypoint sh "$image" -c '
+        test "$(stat -c "%a:%u:%g" /data/owned-nested/marker)" = 644:0:0
+        test "$(stat -c "%a" /data/owned-nested)" = 755
+    '
 docker create --name "$root_link_container" \
     --mount "type=volume,source=$outside_volume,target=/outside" \
     --entrypoint sh "$image" -c \
@@ -246,9 +261,9 @@ docker create --name "$root_link_container" \
 expect_startup_refusal "$root_link_container" 'Private data must be a real directory'
 docker run --rm --mount "type=volume,source=$outside_volume,target=/outside" \
     --entrypoint sh "$image" -c '
-        test "$(stat -c "%a:%u:%g" /outside/sentinel)" = 600:0:0
-        test "$(stat -c "%a:%u:%g" /outside/private)" = 700:0:0
-        test "$(stat -c "%u:%g" /outside)" = 0:0
+        test "$(stat -c "%a:%u:%g" /outside/sentinel)" = 640:0:0
+        test "$(stat -c "%a:%u:%g" /outside/private)" = 750:0:0
+        test "$(stat -c "%a:%u:%g" /outside)" = 750:0:0
     '
 
-echo "Container smoke passed ($expected_arch): uid10001, full private-data restore, unchanged credentials/modes, external-link and mount boundaries, and durable bills/collections/usage."
+echo "Container smoke passed ($expected_arch): UID 10001, root-owned 0644 full restore, files 0600/directories 0700, unchanged credentials, external-link and mount boundaries, and durable bills/collections/usage."
