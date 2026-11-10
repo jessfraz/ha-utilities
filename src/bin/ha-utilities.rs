@@ -3,7 +3,10 @@ use clap::{Args, Parser, Subcommand};
 use ha_utilities::{
     client::{Client, ClientError, Transport},
     config::read_secret,
-    models::{ListQuery, SyncInput},
+    models::{
+        BindConnection, ConnectionProvider, ConnectionSelection, CreateConnection, ListQuery,
+        SyncInput,
+    },
 };
 use serde::Serialize;
 use std::path::PathBuf;
@@ -65,6 +68,57 @@ enum Command {
     Sync {
         #[command(subcommand)]
         command: Sync,
+    },
+    /// Connect a utility through Bayou's hosted sign-in and select its meters.
+    Connections {
+        #[command(subcommand)]
+        command: Connections,
+    },
+}
+
+#[derive(Subcommand)]
+enum Connections {
+    Utilities,
+    List,
+    Get {
+        id: String,
+    },
+    Start {
+        #[arg(long)]
+        utility: String,
+        #[arg(long, default_value = "USD")]
+        currency: String,
+        #[arg(long)]
+        name: Option<String>,
+        /// Accept this Bayou workspace's data-unlocking and billing settings.
+        ///
+        /// Defaults unlock 12 billing periods, future bills, and both meter types.
+        /// Above the 10-meter free tier, billing requires setup and applies to all
+        /// unlocked data, including the first 10. Local meter selection happens
+        /// afterward and does not limit charges.
+        /// https://docs.bayou.energy/docs/pricing-overview
+        #[arg(long, required = true)]
+        accept_provider_settings: bool,
+        /// Reuse the request ID from an interrupted start instead of creating another intent.
+        #[arg(long)]
+        request_id: Option<uuid::Uuid>,
+    },
+    Refresh {
+        id: String,
+    },
+    Resume {
+        id: String,
+    },
+    /// Request a fresh, private hosted sign-in link.
+    Authorize {
+        id: String,
+    },
+    Bind {
+        id: String,
+        #[arg(long)]
+        account: String,
+        #[arg(long = "meter", required = true)]
+        meters: Vec<String>,
     },
 }
 #[derive(Subcommand)]
@@ -132,6 +186,7 @@ fn print<T: Serialize>(value: &T, json: bool) -> Result<(), ClientError> {
         error: "output_error",
         message: "output could not be serialized".to_owned(),
         status: None,
+        request_id: None,
     })?;
     println!("{result}");
     Ok(())
@@ -207,6 +262,50 @@ async fn run(cli: Cli) -> Result<(), ClientError> {
         Command::Sync {
             command: Sync::Get { id },
         } => print(&client.sync_get(&id).await?, cli.json),
+        Command::Connections { command } => match command {
+            Connections::Utilities => print(&client.connection_utilities().await?, cli.json),
+            Connections::List => print(&client.connections().await?, cli.json),
+            Connections::Get { id } => print(&client.connection(&id).await?, cli.json),
+            Connections::Start {
+                utility,
+                currency,
+                name,
+                accept_provider_settings,
+                request_id,
+            } => print(
+                &client
+                    .connection_start(&CreateConnection {
+                        provider: ConnectionProvider::Bayou,
+                        request_id: request_id.unwrap_or_else(uuid::Uuid::now_v7).to_string(),
+                        utility_id: utility,
+                        currency,
+                        name,
+                        accept_provider_settings,
+                    })
+                    .await?,
+                cli.json,
+            ),
+            Connections::Refresh { id } => print(&client.connection_refresh(&id).await?, cli.json),
+            Connections::Resume { id } => print(&client.connection_resume(&id).await?, cli.json),
+            Connections::Authorize { id } => {
+                print(&client.connection_authorization(&id).await?, cli.json)
+            }
+            Connections::Bind {
+                id,
+                account,
+                meters,
+            } => print(
+                &client
+                    .connection_bind(
+                        &id,
+                        &BindConnection {
+                            accounts: vec![ConnectionSelection { account, meters }],
+                        },
+                    )
+                    .await?,
+                cli.json,
+            ),
+        },
     }
 }
 #[tokio::main]

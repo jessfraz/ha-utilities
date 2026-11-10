@@ -1,6 +1,7 @@
 pub mod api;
 pub mod client;
 pub mod config;
+pub mod connect;
 pub mod models;
 pub mod store;
 pub mod supervisor;

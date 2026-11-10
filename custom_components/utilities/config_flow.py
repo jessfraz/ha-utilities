@@ -21,7 +21,7 @@ from .client import (
     normalize_backend_url,
 )
 from .const import CONF_BACKEND_URL, CONF_TOKEN, DOMAIN
-from .models import record
+from .models import record, valid_system
 
 
 class UtilitiesConfigFlow(ConfigFlow, domain=DOMAIN):
@@ -53,11 +53,7 @@ class UtilitiesConfigFlow(ConfigFlow, domain=DOMAIN):
             client = UtilitiesClient(async_get_clientsession(self.hass), origin, token)
             response = await client.request("GET", "/v1/system")
             system = record(response.json())
-            if (
-                response.status != 200
-                or system.get("name") != "Utilities"
-                or system.get("read_only_providers") is not True
-            ):
+            if response.status != 200 or not valid_system(system):
                 return self.async_abort(reason="cannot_connect")
         except ClientError, TimeoutError, ValueError, TypeError, AttributeError:
             return self.async_abort(reason="invalid_discovery")
@@ -124,11 +120,7 @@ class UtilitiesConfigFlow(ConfigFlow, domain=DOMAIN):
                 response = await client.request("GET", "/v1/system")
                 if response.status in {401, 403}:
                     errors["base"] = "invalid_auth"
-                elif (
-                    response.status != 200
-                    or (data := record(response.json())).get("name") != "Utilities"
-                    or data.get("read_only_providers") is not True
-                ):
+                elif response.status != 200 or not valid_system(response.json()):
                     errors["base"] = "cannot_connect"
                 else:
                     values = {

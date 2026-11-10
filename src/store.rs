@@ -1,4 +1,5 @@
 //! Reconciled observations, indexed keyset reads, and durable sync lifecycle.
+pub(crate) mod connections;
 use crate::{
     config::{AccountBinding, Config},
     models::*,
@@ -76,33 +77,15 @@ impl Store {
     pub async fn register(&self, config: &Config) -> anyhow::Result<()> {
         config.validate()?;
         let mut tx = self.pool.begin().await?;
+        // Configuration still owns manual bindings. Retain their observations,
+        // but stop exposing a removed manual account. UI connections stay owned
+        // by the database and are not removed by a configuration reload.
+        sqlx::query(connections::queries::CLEAR_MANUAL)
+            .bind(&config.deployment)
+            .execute(&mut *tx)
+            .await?;
         for binding in &config.accounts {
-            // Labels may change, provider identity and service mappings may not.
-            let identity = (
-                &binding.deployment,
-                &binding.provider,
-                &binding.customer_id,
-                &binding.provider_account,
-                &binding.currency,
-                binding
-                    .services
-                    .iter()
-                    .map(|s| (&s.id, &s.provider_service, s.kind))
-                    .collect::<Vec<_>>(),
-            );
-            let hash = URL_SAFE_NO_PAD.encode(Sha256::digest(serde_json::to_vec(&identity)?));
-            sqlx::query(queries::REGISTER)
-                .bind(&binding.id)
-                .bind(&hash)
-                .execute(&mut *tx)
-                .await?;
-            let existing: String = sqlx::query_scalar(queries::BINDING)
-                .bind(&binding.id)
-                .fetch_one(&mut *tx)
-                .await?;
-            if existing != hash {
-                return Err(StoreError::BindingChanged.into());
-            }
+            Self::register_binding(&mut tx, binding, None).await?;
         }
         tx.commit().await?;
         Ok(())

@@ -29,7 +29,7 @@ async def test_default_collections_include_recent_exceptions(
 ) -> None:
     page = utility_page
     await open_app(page, web_backend)
-    await page.get_by_role("button", name="Collections", exact=True).click()
+    await page.get_by_role("button", name="Trash collections", exact=True).click()
     await expect(
         page.locator(".data-table tbody .badge").filter(
             has_text=re.compile("^Exception$")

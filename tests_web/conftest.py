@@ -30,7 +30,7 @@ class WebBackend:
 
 @pytest.fixture
 async def web_backend(
-    tmp_path: Path, socket_enabled: None
+    tmp_path: Path, socket_enabled: None, request: pytest.FixtureRequest
 ) -> AsyncIterator[WebBackend]:
     """Build first with cargo build --bins --examples, then run the real producer."""
     binary = Path(
@@ -48,6 +48,25 @@ async def web_backend(
     database = tmp_path / "utilities.sqlite3"
     config = tmp_path / "utilities.toml"
     await asyncio.to_thread(shutil.copyfile, ROOT / "config/example.toml", config)
+    if getattr(request, "param", None) == "bayou_only":
+        await asyncio.to_thread(
+            config.write_text,
+            """deployment = "demo"
+[[accounts]]
+id = "demo-energy"
+name = "Energy service"
+deployment = "demo"
+provider = "bayou"
+customer_id = "900000002"
+provider_account = "DEMO-ACCOUNT"
+currency = "USD"
+[[accounts.services]]
+id = "demo-electric"
+name = "Electricity"
+provider_service = "DEMO-METER"
+kind = "electricity"
+""",
+        )
     seed_process = await asyncio.create_subprocess_exec(
         str(seed),
         str(database),

@@ -24,6 +24,33 @@ async def open_app(page: Page, backend: WebBackend) -> None:
     await expect(page.locator("#content")).to_have_attribute("aria-busy", "false")
 
 
+@pytest.mark.parametrize("web_backend", ["bayou_only"], indirect=True)
+async def test_electricity_account_has_no_trash_tab_or_collection_requests(
+    utility_page: Page,
+    web_backend: WebBackend,
+) -> None:
+    page = utility_page
+    requests: list[str] = []
+    page.on("request", lambda request: requests.append(request.url))
+    await open_app(page, web_backend)
+    await expect(
+        page.get_by_role("button", name=re.compile(r"^(Trash )?[Cc]ollections$"))
+    ).to_have_count(0)
+    await expect(page.get_by_text("Saved trash collections", exact=True)).to_have_count(
+        0
+    )
+    await page.goto(web_backend.origin + "/#collections")
+    await expect(
+        page.get_by_role("heading", name="Overview", exact=True)
+    ).to_be_visible()
+    await page.get_by_role("button", name="Usage", exact=True).click()
+    await expect(
+        page.get_by_label("Account", exact=True).locator("option")
+    ).to_have_count(2)
+    await expect(page.get_by_role("button", name="Bills", exact=True)).to_be_visible()
+    assert not any("/v1/collections" in url for url in requests)
+
+
 async def test_native_sign_in_is_masked_and_uses_only_an_httponly_session(
     web_backend: WebBackend,
 ) -> None:
@@ -194,7 +221,7 @@ async def test_collections_and_usage_filters_keep_units_and_report_exceptions(
 ) -> None:
     page = utility_page
     await open_app(page, web_backend)
-    await page.get_by_role("button", name="Collections", exact=True).click()
+    await page.get_by_role("button", name="Trash collections", exact=True).click()
     await expect(page.locator(".data-table tbody tr").first).to_be_visible()
     await page.get_by_label("Service", exact=True).select_option("demo-waste")
     await page.get_by_label("From", exact=True).fill(
@@ -316,7 +343,7 @@ async def test_mobile_dark_keyboard_and_empty_state_layout(
             errors: list[str] = []
             page.on("pageerror", lambda error: errors.append(str(error)))
             await open_app(page, web_backend)
-            for name in ["Overview", "Bills", "Collections", "Usage", "Settings"]:
+            for name in ["Overview", "Bills", "Trash collections", "Usage", "Settings"]:
                 await page.get_by_role("button", name=name, exact=True).click()
                 await expect(
                     page.get_by_role("heading", name=name, exact=True)

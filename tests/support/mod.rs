@@ -3,6 +3,7 @@ use chrono::{Duration, Utc};
 use ha_utilities::{
     api,
     config::Config,
+    connect::ConnectionWorker,
     models::*,
     store::Store,
     sync::{Providers, SyncWorker},
@@ -60,6 +61,7 @@ pub struct App {
     server: Option<dropshot::HttpServer<Arc<api::Context>>>,
     stop: tokio::sync::watch::Sender<bool>,
     worker: Option<tokio::task::JoinHandle<Result<(), ha_utilities::store::StoreError>>>,
+    connection_worker: Option<tokio::task::JoinHandle<Result<(), ha_utilities::store::StoreError>>>,
     pub directory: tempfile::TempDir,
 }
 impl App {
@@ -71,17 +73,23 @@ impl App {
         let (sync, worker) = SyncWorker::new(store.clone(), config.clone(), providers.clone())
             .await
             .unwrap();
+        let (connections, connection_worker) =
+            ConnectionWorker::new(store.clone(), config.clone(), providers.clone())
+                .await
+                .unwrap();
         let context = Arc::new(api::Context::new(
             store.clone(),
             config.clone(),
             providers,
             sync,
+            connections,
             TOKEN,
         ));
         let server = api::start("127.0.0.1:0".parse().unwrap(), context).unwrap();
         let url = format!("http://{}", server.local_addr());
         let (stop, rx) = tokio::sync::watch::channel(false);
-        let worker = tokio::spawn(worker.run(rx));
+        let worker = tokio::spawn(worker.run(rx.clone()));
+        let connection_worker = tokio::spawn(connection_worker.run(rx));
         Self {
             url,
             store,
@@ -89,6 +97,7 @@ impl App {
             server: Some(server),
             stop,
             worker: Some(worker),
+            connection_worker: Some(connection_worker),
             directory,
         }
     }
@@ -98,6 +107,9 @@ impl App {
         }
         let _ = self.stop.send(true);
         if let Some(worker) = self.worker.take() {
+            worker.await.unwrap().unwrap();
+        }
+        if let Some(worker) = self.connection_worker.take() {
             worker.await.unwrap().unwrap();
         }
         self.store.pool().close().await;

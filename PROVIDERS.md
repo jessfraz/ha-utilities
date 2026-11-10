@@ -29,7 +29,32 @@ must match the explicit account binding. No service request is submitted.
 
 [Authentication](https://docs.bayou.energy/docs/quickstart) uses the API key as
 the Basic-auth username with an empty password. Configure `[bayou]` with
-`api_key_file`. Only already-linked customers can be read.
+`api_key_file`. An API key gives access to the Bayou workspace; the utility
+still needs its own hosted sign-in and explicit account and meter selection.
+
+Hosted setup follows Bayou's [customer lifecycle](https://docs.bayou.energy/docs/customer-lifecycle).
+The supported utility catalogue comes from `GET /utilities`. After consent,
+`POST /customers` sends only a random external ID and the chosen utility ID.
+The saved intent precedes that request. Status reads use the same external ID
+to reconcile timeouts and restarts before another create is considered.
+Confirmed customer identity cannot silently change or be recreated.
+
+Bayou's [workspace settings](https://docs.bayou.energy/docs/controlling-unlocked-data)
+default to the last 12 billing periods, future bills, and electric and gas meters.
+The actual workspace settings govern. Its documented
+[free tier](https://docs.bayou.energy/docs/pricing-overview) allows 10 meters.
+Unlocking an 11th requires billing setup, then all unlocked data becomes
+billable, including the first 10, at $2 per meter per billing period.
+Local account and meter selection happens afterward and does not limit those
+workspace charges.
+The UI and CLI require explicit acceptance before creating a customer.
+Utilities never calls an unlock or payment endpoint.
+
+The private installation polls documented customer status, so no public
+callback or port forwarding is needed. Hosted links are fetched on request,
+restricted to Bayou's documented HTTPS sign-up URL, and never saved to SQLite.
+The database keeps opaque request IDs, verified customer/account/meter
+bindings, setup status, and timestamps. Back it up with the app's other data.
 
 The adapter reads [customer identity](https://docs.bayou.energy/reference/get_customers-id),
 [bills](https://docs.bayou.energy/reference/get_customers-customer-id-bills), and
@@ -42,7 +67,11 @@ UTC midnight; local filtering selects interval start dates.
 Amounts are integer cents in the configured currency. `outstanding_balance`
 means the previous billing cycle's balance, not current account balance.
 `unlocked` is data-access status, never payment status. Signed document URLs
-and remote account identifiers are not stored in the normalized read model.
+are not stored in the normalized read model. Remote account and meter IDs are
+stored only in explicit connection bindings, never diagnostics.
+Bill totals cover the whole selected provider account, including its unselected
+meters. Each bill's meters are verified against that provider account. Usage
+intervals are fetched only for meters explicitly selected for this deployment.
 Locked bills, source-auth failures, missing intervals, gaps, and truncation
-remain explicit coverage. Unlocking, refreshing, linking, MFA changes, and
-other provider writes are unavailable.
+remain explicit coverage. Hosted sign-in can request utility authentication
+or MFA on Bayou's page. Those credentials never pass through Utilities.

@@ -1,4 +1,4 @@
-//! Bayou's read-only v2 API. No onboarding, unlock, refresh, or payment requests.
+//! Bayou v2 reads and explicit hosted connection setup. No data unlock or payment requests.
 //!
 //! The published bill and interval endpoints return unpaged arrays. Date windows
 //! provide bounded continuation without inventing an undocumented offset API.
@@ -18,7 +18,8 @@ use url::Url;
 use crate::{
     config::{AccountBinding, BayouConfig, ServiceBinding, read_secret, valid_id},
     models::{
-        Bill, Capability, Coverage, CoverageState, Money, Observation, ProviderId, Service,
+        Bill, Capability, ConnectableUtility, ConnectionAccount, ConnectionAuthStatus,
+        ConnectionMeter, Coverage, CoverageState, Money, Observation, ProviderId, Service,
         ServiceKind, Usage, UsageUnit,
     },
     utility::{Continuation, SyncPage, SyncRequest, Utility, UtilityError},
@@ -28,7 +29,7 @@ const BASE: &str = "https://bayou.energy/api/v2/";
 const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_BILLS_PER_DAY: usize = 4096;
 const MAX_INTERVALS_PER_WINDOW: usize = 10_000;
-const CAPABILITIES: &[Capability] = &[
+pub(crate) const CAPABILITIES: &[Capability] = &[
     Capability::Bills,
     Capability::Balances,
     Capability::Services,
@@ -95,6 +96,12 @@ impl Bayou {
     }
 
     async fn get<T: DeserializeOwned>(&self, url: Url) -> Result<T, UtilityError> {
+        self.get_optional(url)
+            .await?
+            .ok_or(UtilityError::BindingMismatch)
+    }
+
+    async fn get_optional<T: DeserializeOwned>(&self, url: Url) -> Result<Option<T>, UtilityError> {
         // Bayou uses the key as Basic's username; the documented password is blank.
         let mut response = self
             .client
@@ -108,7 +115,7 @@ impl Bayou {
             StatusCode::OK => {}
             StatusCode::UNAUTHORIZED => return Err(UtilityError::Authentication),
             StatusCode::FORBIDDEN => return Err(UtilityError::AccessDenied),
-            StatusCode::NOT_FOUND => return Err(UtilityError::BindingMismatch),
+            StatusCode::NOT_FOUND => return Ok(None),
             StatusCode::TOO_MANY_REQUESTS => return Err(UtilityError::RateLimited),
             status if status.is_server_error() => return Err(UtilityError::Unavailable),
             _ => return Err(UtilityError::InvalidResponse),
@@ -130,7 +137,135 @@ impl Bayou {
             }
             bytes.extend_from_slice(&chunk);
         }
-        serde_json::from_slice(&bytes).map_err(|_| UtilityError::InvalidResponse)
+        serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|_| UtilityError::InvalidResponse)
+    }
+
+    pub(crate) async fn connectable_utilities(
+        &self,
+    ) -> Result<Vec<ConnectableUtility>, UtilityError> {
+        let url = self
+            .base
+            .join("utilities")
+            .map_err(|_| UtilityError::InvalidResponse)?;
+        let response: WireUtilities = self.get(url).await?;
+        if response.utilities.len() > 1000 {
+            return Err(UtilityError::InvalidResponse);
+        }
+        let mut ids = std::collections::HashSet::new();
+        let mut utilities = Vec::with_capacity(response.utilities.len());
+        for utility in response.utilities {
+            if !valid_id(&utility.id)
+                || !ids.insert(utility.id.clone())
+                || !remote_text(&utility.name)
+                || !remote_text(&utility.support)
+            {
+                return Err(UtilityError::InvalidResponse);
+            }
+            utilities.push(ConnectableUtility {
+                id: utility.id,
+                name: utility.name,
+                support: utility.support,
+            });
+        }
+        utilities.sort_by(|left, right| left.name.cmp(&right.name).then(left.id.cmp(&right.id)));
+        Ok(utilities)
+    }
+
+    /// External IDs are unique in Bayou. The owning service saves this intent
+    /// before sending and uses GET by external ID to reconcile uncertain results.
+    /// https://docs.bayou.energy/reference/post_customers
+    pub(crate) async fn create_connection(
+        &self,
+        external_id: &str,
+        utility: &str,
+    ) -> Result<(), UtilityError> {
+        let url = self
+            .base
+            .join("customers")
+            .map_err(|_| UtilityError::InvalidResponse)?;
+        let response = self
+            .client
+            .post(url)
+            .basic_auth(&self.api_key, Some(""))
+            .header(reqwest::header::ACCEPT, "application/json")
+            .json(&CreateCustomer {
+                external_id,
+                utility,
+            })
+            .send()
+            .await
+            .map_err(|_| UtilityError::Unavailable)?;
+        match response.status() {
+            StatusCode::CREATED | StatusCode::CONFLICT => Ok(()),
+            StatusCode::UNAUTHORIZED => Err(UtilityError::Authentication),
+            StatusCode::FORBIDDEN => Err(UtilityError::AccessDenied),
+            StatusCode::TOO_MANY_REQUESTS => Err(UtilityError::RateLimited),
+            status if status.is_server_error() => Err(UtilityError::Unavailable),
+            _ => Err(UtilityError::InvalidResponse),
+        }
+    }
+
+    /// The documented lookup also regenerates expired onboarding links. Tokens
+    /// stay in this transient response and never enter the read model.
+    /// https://docs.bayou.energy/reference/get_customers-id
+    pub(crate) async fn connection(
+        &self,
+        external_id: &str,
+        utility: &str,
+        expected_customer: Option<&str>,
+    ) -> Result<Option<BayouConnection>, UtilityError> {
+        let lookup = format!("external_id:{external_id}");
+        let Some(customer) = self
+            .get_optional::<WireConnectionCustomer>(self.endpoint(&lookup, None)?)
+            .await?
+        else {
+            return Ok(None);
+        };
+        if customer.id == 0
+            || customer.external_id.as_deref() != Some(external_id)
+            || customer.utility != utility
+            || expected_customer.is_some_and(|id| id != customer.id.to_string())
+            || customer.account_numbers.len() > 100
+        {
+            return Err(UtilityError::BindingMismatch);
+        }
+        let mut ids = std::collections::HashSet::new();
+        let mut accounts = Vec::new();
+        for account in customer.account_numbers {
+            if !remote_text(&account.id)
+                || !ids.insert(account.id.clone())
+                || account.meters.len() > 64
+            {
+                return Err(UtilityError::InvalidResponse);
+            }
+            let mut meter_ids = std::collections::HashSet::new();
+            let mut meters = Vec::new();
+            for meter in account.meters {
+                if !remote_text(&meter.id) || !meter_ids.insert(meter.id.clone()) {
+                    return Err(UtilityError::InvalidResponse);
+                }
+                meters.push(ConnectionMeter {
+                    id: meter.id,
+                    kind: meter.kind.service_kind(),
+                });
+            }
+            accounts.push(ConnectionAccount {
+                id: account.id,
+                meters,
+            });
+        }
+        Ok(Some(BayouConnection {
+            customer_id: customer.id.to_string(),
+            auth_status: customer.auth_status,
+            has_filled_credentials: customer.has_filled_credentials,
+            authenticated: customer.is_currently_authenticated,
+            bills_ready: customer.bills_are_ready,
+            intervals_ready: customer.intervals_are_ready,
+            accounts,
+            authorization: customer.onboarding_link,
+        }))
     }
 
     async fn customer(&self, binding: &AccountBinding) -> Result<Customer, UtilityError> {
@@ -171,6 +306,7 @@ impl Bayou {
         let mut observations = Vec::with_capacity(bills.len());
         let mut incomplete = false;
         let mut ids = std::collections::HashSet::new();
+        let account = customer.account(&request.binding)?;
         for bill in bills {
             if bill.customer_id != customer.id
                 || bill.account_number != request.binding.provider_account
@@ -181,13 +317,11 @@ impl Bayou {
             // Even locked/unparsed bills must belong to this account; those states
             // have no usable amount, and reading must never unlock paid data.
             for meter in &bill.meters {
-                let service = request
-                    .binding
-                    .services
-                    .iter()
-                    .find(|service| service.provider_service == meter.id)
-                    .ok_or(UtilityError::BindingMismatch)?;
-                if meter.kind.service_kind() != service.kind {
+                let mut matched = account.meters.iter().filter(|source| source.id == meter.id);
+                let source = matched.next().ok_or(UtilityError::BindingMismatch)?;
+                if matched.next().is_some()
+                    || meter.kind.service_kind() != source.kind.service_kind()
+                {
                     return Err(UtilityError::BindingMismatch);
                 }
             }
@@ -346,6 +480,57 @@ impl Bayou {
             incomplete,
         })
     }
+}
+
+pub(crate) struct BayouConnection {
+    pub customer_id: String,
+    pub auth_status: Option<ConnectionAuthStatus>,
+    pub has_filled_credentials: bool,
+    pub authenticated: bool,
+    pub bills_ready: bool,
+    pub intervals_ready: bool,
+    pub accounts: Vec<ConnectionAccount>,
+    pub authorization: Option<String>,
+}
+
+#[derive(Serialize)]
+struct CreateCustomer<'a> {
+    external_id: &'a str,
+    utility: &'a str,
+}
+
+#[derive(Deserialize)]
+struct WireUtilities {
+    utilities: Vec<WireUtility>,
+}
+
+#[derive(Deserialize)]
+struct WireUtility {
+    id: String,
+    name: String,
+    support: String,
+}
+
+#[derive(Deserialize)]
+struct WireConnectionCustomer {
+    id: u64,
+    external_id: Option<String>,
+    utility: String,
+    #[serde(default)]
+    has_filled_credentials: bool,
+    is_currently_authenticated: bool,
+    auth_status: Option<ConnectionAuthStatus>,
+    #[serde(default)]
+    bills_are_ready: bool,
+    #[serde(default)]
+    intervals_are_ready: bool,
+    #[serde(default)]
+    account_numbers: Vec<WireAccount>,
+    onboarding_link: Option<String>,
+}
+
+fn remote_text(value: &str) -> bool {
+    !value.trim().is_empty() && value.len() <= 300 && !value.chars().any(char::is_control)
 }
 
 impl Utility for Bayou {

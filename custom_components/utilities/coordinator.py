@@ -15,7 +15,16 @@ from homeassistant.util import dt as dt_util
 from .client import ResponseTooLarge, UtilitiesClient
 from .const import DOMAIN, MAX_CALENDAR_ROWS
 from .energy import async_update as async_update_energy
-from .models import Collection, Coverage, Snapshot, Summary, page, record, text
+from .models import (
+    Collection,
+    Coverage,
+    Snapshot,
+    Summary,
+    page,
+    record,
+    text,
+    valid_system,
+)
 
 _LOGGER = logging.getLogger(__name__)
 REPAIRS = (
@@ -115,10 +124,7 @@ class UtilitiesCoordinator(DataUpdateCoordinator[Snapshot]):
     async def _async_update_data(self) -> Snapshot:
         try:
             system = record(await self.read("/v1/system"))
-            if (
-                system.get("name") != "Utilities"
-                or system.get("read_only_providers") is not True
-            ):
+            if not valid_system(system):
                 raise ValueError("Unexpected backend")
             self.backend_version = text(system.get("version"))
             summary = Summary.parse(await self.read("/v1/summary"))

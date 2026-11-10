@@ -1,6 +1,7 @@
 //! Dropshot owns routing, typed request validation, and generated OpenAPI.
 use crate::{
     config::{Config, valid_id},
+    connect::{ConnectionError, ConnectionHandle},
     models::*,
     store::{Store, StoreError},
     sync::{Providers, SyncHandle},
@@ -26,6 +27,7 @@ pub struct Context {
     pub config: Arc<Config>,
     pub providers: Arc<Providers>,
     pub sync: SyncHandle,
+    pub connections: ConnectionHandle,
     owner_digest: [u8; 32],
     ingress_peer: Option<IpAddr>,
 }
@@ -35,6 +37,7 @@ impl Context {
         config: Arc<Config>,
         provider_registry: Arc<Providers>,
         sync: SyncHandle,
+        connection_handle: ConnectionHandle,
         token: &str,
     ) -> Self {
         Self {
@@ -42,6 +45,7 @@ impl Context {
             config,
             providers: provider_registry,
             sync,
+            connections: connection_handle,
             owner_digest: Sha256::digest(token).into(),
             ingress_peer: None,
         }
@@ -50,8 +54,15 @@ impl Context {
         self.ingress_peer = Some(peer);
         self
     }
-    fn accounts(&self) -> Vec<String> {
-        self.config.accounts.iter().map(|a| a.id.clone()).collect()
+    async fn accounts(&self) -> Result<Vec<String>, HttpError> {
+        Ok(self
+            .store
+            .bindings(&self.config.deployment)
+            .await
+            .map_err(store_error)?
+            .into_iter()
+            .map(|account| account.id)
+            .collect())
     }
 }
 
@@ -82,6 +93,47 @@ fn store_error(error: StoreError) -> HttpError {
         StoreError::InvalidQuery => fail(S::BAD_REQUEST, "invalid_query"),
         StoreError::Busy => fail(S::CONFLICT, "sync_busy"),
         _ => HttpError::for_internal_error("database_error".to_owned()),
+    }
+}
+
+fn connection_error(error: ConnectionError) -> HttpError {
+    use dropshot::ClientErrorStatusCode as S;
+    match error {
+        ConnectionError::InvalidInput => fail(S::BAD_REQUEST, "invalid_connection_input"),
+        ConnectionError::ConsentRequired => {
+            fail(S::BAD_REQUEST, "provider_settings_consent_required")
+        }
+        ConnectionError::NotConfigured
+        | ConnectionError::Provider(crate::utility::UtilityError::NotConfigured) => {
+            HttpError::for_unavail(
+                Some("bayou_not_configured".to_owned()),
+                "bayou_not_configured".to_owned(),
+            )
+        }
+        ConnectionError::WorkerUnavailable => HttpError::for_unavail(
+            Some("connection_worker_unavailable".to_owned()),
+            "connection_worker_unavailable".to_owned(),
+        ),
+        ConnectionError::Changed
+        | ConnectionError::Store(StoreError::BindingChanged | StoreError::Busy) => {
+            fail(S::CONFLICT, "connection_changed")
+        }
+        ConnectionError::NotReady => fail(S::CONFLICT, "connection_not_ready"),
+        ConnectionError::Store(StoreError::NotFound) => fail(S::NOT_FOUND, "connection_not_found"),
+        ConnectionError::Store(StoreError::InvalidQuery) => {
+            fail(S::BAD_REQUEST, "invalid_connection_input")
+        }
+        ConnectionError::Store(_) => HttpError::for_internal_error("database_error".to_owned()),
+        ConnectionError::Provider(error) => {
+            let code = match error {
+                crate::utility::UtilityError::Authentication => "bayou_authentication_required",
+                crate::utility::UtilityError::AccessDenied => "bayou_access_denied",
+                crate::utility::UtilityError::RateLimited => "bayou_rate_limited",
+                crate::utility::UtilityError::Unavailable => "bayou_unavailable",
+                _ => "bayou_invalid_response",
+            };
+            HttpError::for_unavail(Some(code.to_owned()), code.to_owned())
+        }
     }
 }
 fn header<'a>(request: &'a RequestContext<Arc<Context>>, key: &str) -> Option<&'a str> {
@@ -145,7 +197,9 @@ async fn system(request: RequestContext<Arc<Context>>) -> Result<PrivateOk<Syste
     Ok(private(System {
         name: "Utilities".to_owned(),
         version: env!("CARGO_PKG_VERSION").to_owned(),
-        read_only_providers: true,
+        read_only_providers: false,
+        read_only_sync: true,
+        hosted_connections: true,
     }))
 }
 #[endpoint {method=GET,path="/health",tags=["system"]}]
@@ -154,7 +208,7 @@ async fn health(request: RequestContext<Arc<Context>>) -> Result<PrivateOk<Healt
     let snapshot = request
         .context()
         .store
-        .summary(&request.context().accounts())
+        .summary(&request.context().accounts().await?)
         .await
         .map_err(store_error)?;
     let status = if snapshot.accounts == 0 {
@@ -184,6 +238,7 @@ async fn providers(
     request: RequestContext<Arc<Context>>,
 ) -> Result<PrivateOk<Page<ProviderInfo>>, HttpError> {
     authorized(&request)?;
+    let allowed = request.context().accounts().await?;
     Ok(private(Page {
         items: request.context().providers.info(),
         next_page: None,
@@ -194,7 +249,7 @@ async fn providers(
             .await
             .map_err(store_error)?
             .into_iter()
-            .filter(|item| request.context().accounts().contains(&item.account_id))
+            .filter(|item| allowed.contains(&item.account_id))
             .collect(),
     }))
 }
@@ -203,8 +258,20 @@ async fn accounts(
     request: RequestContext<Arc<Context>>,
 ) -> Result<PrivateOk<Page<Account>>, HttpError> {
     authorized(&request)?;
+    let mut current = request.context().config.as_ref().clone();
+    current.accounts = request
+        .context()
+        .store
+        .bindings(&current.deployment)
+        .await
+        .map_err(store_error)?;
+    let allowed = current
+        .accounts
+        .iter()
+        .map(|account| account.id.as_str())
+        .collect::<Vec<_>>();
     Ok(private(Page {
-        items: request.context().config.public_accounts(),
+        items: current.public_accounts(),
         next_page: None,
         coverage: request
             .context()
@@ -213,9 +280,145 @@ async fn accounts(
             .await
             .map_err(store_error)?
             .into_iter()
-            .filter(|item| request.context().accounts().contains(&item.account_id))
+            .filter(|item| allowed.contains(&item.account_id.as_str()))
             .collect(),
     }))
+}
+
+#[endpoint {method=GET,path="/v1/providers/bayou/utilities",tags=["connections"]}]
+async fn connection_utilities(
+    request: RequestContext<Arc<Context>>,
+) -> Result<PrivateOk<Page<ConnectableUtility>>, HttpError> {
+    authorized(&request)?;
+    Ok(private(Page {
+        items: request
+            .context()
+            .connections
+            .utilities()
+            .await
+            .map_err(connection_error)?,
+        next_page: None,
+        coverage: Vec::new(),
+    }))
+}
+
+#[endpoint {method=GET,path="/v1/connections",tags=["connections"]}]
+async fn connections(
+    request: RequestContext<Arc<Context>>,
+) -> Result<PrivateOk<Page<Connection>>, HttpError> {
+    authorized(&request)?;
+    Ok(private(Page {
+        items: request
+            .context()
+            .connections
+            .list()
+            .await
+            .map_err(connection_error)?,
+        next_page: None,
+        coverage: Vec::new(),
+    }))
+}
+
+#[endpoint {method=POST,path="/v1/connections",tags=["connections"]}]
+async fn connection_start(
+    request: RequestContext<Arc<Context>>,
+    body: TypedBody<CreateConnection>,
+) -> Result<HttpResponseHeaders<HttpResponseAccepted<Connection>, PrivateHeaders>, HttpError> {
+    authorized(&request)?;
+    Ok(HttpResponseHeaders::new(
+        HttpResponseAccepted(
+            request
+                .context()
+                .connections
+                .start(body.into_inner())
+                .await
+                .map_err(connection_error)?,
+        ),
+        PrivateHeaders::new(),
+    ))
+}
+
+#[endpoint {method=GET,path="/v1/connections/{id}",tags=["connections"]}]
+async fn connection_get(
+    request: RequestContext<Arc<Context>>,
+    path: Path<RecordPath>,
+) -> Result<PrivateOk<Connection>, HttpError> {
+    authorized(&request)?;
+    Ok(private(
+        request
+            .context()
+            .connections
+            .get(&path.into_inner().id)
+            .await
+            .map_err(connection_error)?,
+    ))
+}
+
+#[endpoint {method=POST,path="/v1/connections/{id}/refresh",tags=["connections"]}]
+async fn connection_refresh(
+    request: RequestContext<Arc<Context>>,
+    path: Path<RecordPath>,
+    _body: TypedBody<ConnectionAction>,
+) -> Result<PrivateOk<Connection>, HttpError> {
+    authorized(&request)?;
+    Ok(private(
+        request
+            .context()
+            .connections
+            .refresh(&path.into_inner().id)
+            .await
+            .map_err(connection_error)?,
+    ))
+}
+
+#[endpoint {method=POST,path="/v1/connections/{id}/resume",tags=["connections"]}]
+async fn connection_resume(
+    request: RequestContext<Arc<Context>>,
+    path: Path<RecordPath>,
+    _body: TypedBody<ConnectionAction>,
+) -> Result<PrivateOk<Connection>, HttpError> {
+    authorized(&request)?;
+    Ok(private(
+        request
+            .context()
+            .connections
+            .resume(&path.into_inner().id)
+            .await
+            .map_err(connection_error)?,
+    ))
+}
+
+#[endpoint {method=GET,path="/v1/connections/{id}/authorization",tags=["connections"]}]
+async fn connection_authorization(
+    request: RequestContext<Arc<Context>>,
+    path: Path<RecordPath>,
+) -> Result<PrivateOk<ConnectionAuthorization>, HttpError> {
+    authorized(&request)?;
+    Ok(private(
+        request
+            .context()
+            .connections
+            .authorization(&path.into_inner().id)
+            .await
+            .map_err(connection_error)?,
+    ))
+}
+
+#[endpoint {method=POST,path="/v1/connections/{id}/bind",tags=["connections"]}]
+async fn connection_bind(
+    request: RequestContext<Arc<Context>>,
+    path: Path<RecordPath>,
+    body: TypedBody<BindConnection>,
+) -> Result<PrivateOk<Connection>, HttpError> {
+    authorized(&request)?;
+    Ok(private(
+        request
+            .context()
+            .connections
+            .bind(&path.into_inner().id, body.into_inner())
+            .await
+            .map_err(connection_error)?,
+    ))
 }
 #[endpoint {method=GET,path="/v1/summary",tags=["utilities"]}]
 async fn summary(request: RequestContext<Arc<Context>>) -> Result<PrivateOk<Summary>, HttpError> {
@@ -224,7 +427,7 @@ async fn summary(request: RequestContext<Arc<Context>>) -> Result<PrivateOk<Summ
         request
             .context()
             .store
-            .summary(&request.context().accounts())
+            .summary(&request.context().accounts().await?)
             .await
             .map_err(store_error)?,
     ))
@@ -239,7 +442,11 @@ async fn bills(
         request
             .context()
             .store
-            .list("bill", &query.into_inner(), &request.context().accounts())
+            .list(
+                "bill",
+                &query.into_inner(),
+                &request.context().accounts().await?,
+            )
             .await
             .map_err(store_error)?,
     ))
@@ -257,7 +464,7 @@ async fn balances(
             .list(
                 "balance",
                 &query.into_inner(),
-                &request.context().accounts(),
+                &request.context().accounts().await?,
             )
             .await
             .map_err(store_error)?,
@@ -276,7 +483,7 @@ async fn collections(
             .list(
                 "collection",
                 &query.into_inner(),
-                &request.context().accounts(),
+                &request.context().accounts().await?,
             )
             .await
             .map_err(store_error)?,
@@ -292,7 +499,11 @@ async fn usage(
         request
             .context()
             .store
-            .list("usage", &query.into_inner(), &request.context().accounts())
+            .list(
+                "usage",
+                &query.into_inner(),
+                &request.context().accounts().await?,
+            )
             .await
             .map_err(store_error)?,
     ))
@@ -318,7 +529,7 @@ async fn bill_get(
         request
             .context()
             .store
-            .bill(&id, &request.context().accounts())
+            .bill(&id, &request.context().accounts().await?)
             .await
             .map_err(store_error)?,
     ))
@@ -360,7 +571,12 @@ async fn sync_get(
         .job(&id)
         .await
         .map_err(store_error)?;
-    if !request.context().accounts().contains(&job.account_id) {
+    if !request
+        .context()
+        .accounts()
+        .await?
+        .contains(&job.account_id)
+    {
         return Err(fail(
             dropshot::ClientErrorStatusCode::NOT_FOUND,
             "not_found",
@@ -465,6 +681,10 @@ async fn asset(
             "text/javascript; charset=utf-8",
         ),
         "app.css" => (include_str!("../web/app.css"), "text/css; charset=utf-8"),
+        "connections.js" => (
+            include_str!("../web/connections.js"),
+            "text/javascript; charset=utf-8",
+        ),
         "login.js" => (
             include_str!("../web/login.js"),
             "text/javascript; charset=utf-8",
@@ -494,11 +714,19 @@ async fn schema(request: RequestContext<Arc<Context>>) -> Result<Response<Body>,
 
 pub fn description() -> anyhow::Result<ApiDescription<Arc<Context>>> {
     let mut api = ApiDescription::new();
-    let endpoints: [dropshot::ApiEndpoint<Arc<Context>>; 18] = [
+    let endpoints: [dropshot::ApiEndpoint<Arc<Context>>; 26] = [
         system.into(),
         health.into(),
         providers.into(),
         accounts.into(),
+        connection_utilities.into(),
+        connections.into(),
+        connection_start.into(),
+        connection_get.into(),
+        connection_refresh.into(),
+        connection_resume.into(),
+        connection_authorization.into(),
+        connection_bind.into(),
         summary.into(),
         bills.into(),
         bill_get.into(),
