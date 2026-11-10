@@ -22,8 +22,29 @@ ports_description:
 environment:
   UTILITIES_ENABLE_INGRESS: "true"
 options:
-  config_file: /data/config.toml
+  deployment: ""
+  accounts: []
+  wm_token: ""
+  wm_client_id: ""
+  bayou_api_key: ""
 schema:
-  config_file: str
+  deployment: str
+  accounts:
+    - id: str
+      name: str
+      deployment: str
+      provider: list(waste_management|bayou)
+      customer_id: str
+      provider_account: str
+      currency: str
+      services:
+        - id: str
+          name: str
+          provider_service: str
+          kind: list(waste|recycling|electricity|gas|other)
+  wm_token: password
+  wm_client_id: password
+  bayou_api_key: password
+  config_file: str?
 discovery:
   - utilities

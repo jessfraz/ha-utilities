@@ -40,7 +40,7 @@ struct Options {
 }
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let mut options = Options::parse();
+    let options = Options::parse();
     if let Some(path) = options.openapi {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -48,35 +48,7 @@ async fn main() -> anyhow::Result<()> {
         std::fs::write(path, serde_json::to_vec_pretty(&api::openapi()?)?)?;
         return Ok(());
     }
-    if let Some(path) = &options.options {
-        #[derive(serde::Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct AppOptions {
-            config_file: Option<PathBuf>,
-        }
-        let settings: AppOptions = serde_json::from_slice(
-            &std::fs::read(path).map_err(|_| anyhow::anyhow!("app options could not be read"))?,
-        )
-        .map_err(|_| anyhow::anyhow!("app options are invalid"))?;
-        if let Some(path) = settings.config_file {
-            options.config = path;
-        }
-    }
-    let config: Config = if options.config.exists() {
-        toml::from_str(
-            &std::fs::read_to_string(&options.config)
-                .map_err(|_| anyhow::anyhow!("configuration could not be read"))?,
-        )
-        .map_err(|_| anyhow::anyhow!("configuration is invalid"))?
-    } else {
-        Config {
-            deployment: "unconfigured".to_owned(),
-            accounts: Vec::new(),
-            wm: None,
-            bayou: None,
-        }
-    };
-    config.validate()?;
+    let config = Config::load(&options.config, options.options.as_deref())?;
     initialize_token(&options.token_file)?;
     let token = read_secret(&options.token_file)?;
     anyhow::ensure!(

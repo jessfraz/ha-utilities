@@ -22,7 +22,7 @@ base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] }
 getrandom = "0.4"
-ha-app-ui = { path = "../ha-app-kit/packages/ui" }
+ha-app-ui = { git = "https://github.com/jessfraz/ha-app-kit", rev = "72f2a25034baf0d4de862afd9fd72be40be71c5f" }
 http = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 rust_decimal = { version = "1", features = ["serde-with-str"] }

@@ -6,10 +6,11 @@ the reconciled local read model used by the dashboard, CLI, and Assist.
 
 ## Run
 
-Copy [the fictional example](config/example.toml) into a private runtime
-configuration, replace every binding, and add provider credential-file paths.
-Accounts, services, deployment, and currency must be explicit. Keep credentials
-in 1Password and runtime files, never in source control.
+In Home Assistant, use the app's Configuration options for explicit account,
+service, deployment, and currency bindings, plus the WM/Bayou password fields.
+No file editor or SSH is needed. Native installations can use
+[the fictional TOML example](config/example.toml) with runtime credential-file
+paths. Keep credentials in 1Password and runtime storage, never source control.
 
 ```sh
 utilities --config /data/config.toml --database /data/utilities.sqlite3

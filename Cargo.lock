@@ -903,6 +903,7 @@ dependencies = [
 [[package]]
 name = "ha-app-ui"
 version = "0.1.0"
+source = "git+https://github.com/jessfraz/ha-app-kit?rev=72f2a25034baf0d4de862afd9fd72be40be71c5f#72f2a25034baf0d4de862afd9fd72be40be71c5f"
 
 [[package]]
 name = "ha-utilities"

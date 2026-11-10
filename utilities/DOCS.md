@@ -1,10 +1,22 @@
 # Configuration
 
-`config_file` selects a private runtime TOML file. The repository includes a
-fictional format example, not a household configuration. Leave the runtime file
-absent to start without linked providers; the dashboard reports unconfigured
-coverage. Add explicit account/service/deployment/currency bindings and
-1Password-managed credential-file paths before requesting synchronization.
+Use the app's native Configuration options. Set `deployment`, then add each
+account with its explicit local ID, name, deployment, provider, customer ID,
+provider account, currency, and service bindings. Providers are only
+`waste_management` and `bayou`. Each account's deployment must match the global
+deployment. No first-account or first-meter selection is performed.
+
+WM requires both `wm_token` (without the Bearer prefix) and `wm_client_id`.
+Bayou uses `bayou_api_key`. These are password fields; the app keeps derived
+credential files owner-only and never returns their values through its API.
+Configuration options alone suffice; no SSH, file editor, or backup modification
+is needed. Empty defaults start without bound providers. Installing does not
+enroll, link, unlock, or refresh a provider account.
+
+Native installations may still use TOML plus credential-file paths. The optional
+`config_file` option selects that mode explicitly and cannot be mixed with
+nonempty inline bindings or credentials. The repository's example is fictional,
+not a household configuration.
 
 The app generates `/data/api-token` with private permissions. Supervisor
 discovery transfers it to the integration through its authenticated channel;

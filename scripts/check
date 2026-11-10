@@ -13,5 +13,5 @@ uv run --frozen playwright install chromium
 uv run --frozen pytest tests_ha tests_web
 actionlint
 sh -n docker-entrypoint.sh
-bash -n scripts/container-smoke.sh
-shellcheck docker-entrypoint.sh scripts/check scripts/container-smoke.sh
+bash -n scripts/container-smoke.sh scripts/container-options.sh
+shellcheck docker-entrypoint.sh scripts/check scripts/container-smoke.sh scripts/container-options.sh

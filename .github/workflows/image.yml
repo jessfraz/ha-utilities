@@ -88,7 +88,9 @@ jobs:
         env:
           EXPECTED_ARCH: ${{ matrix.arch }}
           RUSTUP_TOOLCHAIN: stable
-        run: scripts/container-smoke.sh ha-utilities:smoke "$EXPECTED_ARCH"
+        run: |
+          scripts/container-smoke.sh ha-utilities:smoke "$EXPECTED_ARCH"
+          scripts/container-options.sh ha-utilities:smoke
       - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4
         if: github.event_name != 'pull_request'
         with:
