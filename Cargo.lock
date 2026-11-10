@@ -907,7 +907,7 @@ source = "git+https://github.com/jessfraz/ha-app-kit?rev=72f2a25034baf0d4de862af
 
 [[package]]
 name = "ha-utilities"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
