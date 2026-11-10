@@ -41,6 +41,7 @@ PY
 chmod 600 "$scratch"/*
 docker volume create "$volume" >/dev/null
 docker create --name "$container" --network none \
+    --cap-drop FOWNER \
     --mount "type=volume,source=$volume,target=/data" "$image" >/dev/null
 docker cp "$scratch/options.json" "$container:/data/options.json"
 

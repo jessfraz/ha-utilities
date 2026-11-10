@@ -13,9 +13,24 @@ if [ "$(id -u)" -eq 0 ]; then
         echo 'Private data mount boundary is unavailable or contains nested mounts' >&2
         exit 1
     fi
-    find -P /data -xdev -exec chown --no-dereference utilities:utilities -- {} +
+    private_entries=$(find -P /data -xdev -printf '%y %D:%i %n\n')
+    if ! printf '%s\n' "$private_entries" | awk '
+        NF != 3 || ($1 != "d" && $1 != "f" && $1 != "l") { invalid = 1 }
+        $1 == "f" || $1 == "l" { seen[$2]++; links[$2] = $3 }
+        END {
+            if (invalid) exit 1
+            for (inode in links) if (seen[inode] != links[inode]) exit 1
+        }
+    '; then
+        echo 'Private data contains unsupported entries or outside hard links' >&2
+        exit 1
+    fi
+    # Own metadata while repairing it. Root cannot chmod app-owned inodes
+    # without CAP_FOWNER, including on an ordinary restart.
+    find -P /data -xdev -exec chown --no-dereference 0:0 -- {} +
     find -P /data -xdev -type d -exec chmod 0700 -- {} +
     find -P /data -xdev -type f -exec chmod 0600 -- {} +
+    find -P /data -xdev -exec chown --no-dereference utilities:utilities -- {} +
     exec gosu utilities "$0" "$@"
 fi
 

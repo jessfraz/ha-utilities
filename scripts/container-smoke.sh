@@ -49,6 +49,7 @@ chmod 600 "$scratch/utilities.sqlite3" "$scratch/config.toml" \
 
 docker volume create "$volume" >/dev/null
 docker create --name "$container" \
+    --cap-drop FOWNER \
     --publish 127.0.0.1::8080 \
     --mount "type=volume,source=$volume,target=/data" \
     "$image" >/dev/null
@@ -186,6 +187,7 @@ docker cp "$container:/data/." "$scratch/app-data"
 docker rm "$container" >/dev/null
 docker volume create "$restore_volume" >/dev/null
 docker create --name "$container" \
+    --cap-drop FOWNER \
     --publish 127.0.0.1::8080 \
     --mount "type=volume,source=$restore_volume,target=/data" \
     --mount "type=volume,source=$outside_volume,target=/outside" \
@@ -217,6 +219,9 @@ if [[ $outside != $'640:0:0\n750:0:0' ]]; then
 fi
 docker exec "$container" sh -c 'test "$(cat /outside/sentinel)" = outside-private-data'
 stop_container
+start_container
+check_state
+stop_container
 
 expect_startup_refusal() {
     local name=$1 reason=$2 running=true logs
@@ -245,6 +250,7 @@ docker run --rm --mount "type=volume,source=$restore_volume,target=/data" \
         chmod 755 /data/owned-nested
     '
 docker create --name "$boundary_container" \
+    --cap-drop FOWNER \
     --mount "type=volume,source=$restore_volume,target=/data" \
     --mount "type=volume,source=$outside_volume,target=/data/external-mount" \
     "$image" >/dev/null
@@ -255,6 +261,7 @@ docker run --rm --mount "type=volume,source=$restore_volume,target=/data" \
         test "$(stat -c "%a" /data/owned-nested)" = 755
     '
 docker create --name "$root_link_container" \
+    --cap-drop FOWNER \
     --mount "type=volume,source=$outside_volume,target=/outside" \
     --entrypoint sh "$image" -c \
     'rmdir /data; ln -s /outside /data; exec /usr/local/bin/docker-entrypoint.sh' >/dev/null
@@ -266,4 +273,49 @@ docker run --rm --mount "type=volume,source=$outside_volume,target=/outside" \
         test "$(stat -c "%a:%u:%g" /outside)" = 750:0:0
     '
 
-echo "Container smoke passed ($expected_arch): UID 10001, root-owned 0644 full restore, files 0600/directories 0700, unchanged credentials, external-link and mount boundaries, and durable bills/collections/usage."
+# Outside aliases can share an inode without crossing a path or mount.
+docker rm "$boundary_container" "$root_link_container" >/dev/null
+docker run --rm --mount "type=volume,source=$outside_volume,target=/outside" \
+    --entrypoint ln "$image" /outside/sentinel /outside/private/outside-alias
+docker create --name "$boundary_container" \
+    --cap-drop FOWNER \
+    --mount "type=volume,source=$outside_volume,target=/data,volume-subpath=private" \
+    "$image" >/dev/null
+expect_startup_refusal "$boundary_container" 'outside hard links'
+docker run --rm --mount "type=volume,source=$outside_volume,target=/outside" \
+    --entrypoint sh "$image" -c '
+        test "$(stat -c "%a:%u:%g" /outside/sentinel)" = 640:0:0
+        test "$(stat -c "%a:%u:%g" /outside/private)" = 750:0:0
+        test "$(cat /outside/sentinel)" = outside-private-data
+        rm /outside/private/outside-alias
+        mkfifo /outside/private/unsupported
+    '
+docker rm "$boundary_container" >/dev/null
+docker create --name "$boundary_container" \
+    --cap-drop FOWNER \
+    --mount "type=volume,source=$outside_volume,target=/data,volume-subpath=private" \
+    "$image" >/dev/null
+expect_startup_refusal "$boundary_container" 'unsupported entries'
+docker run --rm --mount "type=volume,source=$outside_volume,target=/outside" \
+    --entrypoint sh "$image" -c '
+        test "$(stat -c "%a:%u:%g" /outside/private)" = 750:0:0
+        test "$(stat -c "%u:%g" /outside/private/unsupported)" = 0:0
+        rm /outside/private/unsupported
+        printf "internal-private-state\n" > /outside/private/internal-one
+        chmod 644 /outside/private/internal-one
+        ln /outside/private/internal-one /outside/private/internal-two
+    '
+# A crash during atomic publication can leave both legitimate private aliases.
+docker run --rm --name "$root_link_container" \
+    --cap-drop FOWNER \
+    --mount "type=volume,source=$outside_volume,target=/data,volume-subpath=private" \
+    "$image" --help >/dev/null
+docker run --rm --mount "type=volume,source=$outside_volume,target=/outside" \
+    --entrypoint sh "$image" -c '
+        test "$(stat -c "%a:%u:%g:%h" /outside/private/internal-one)" = 600:10001:10001:2
+        test "$(stat -c "%a:%u:%g:%h" /outside/private/internal-two)" = 600:10001:10001:2
+        test "$(cat /outside/private/internal-one)" = internal-private-state
+        test "$(stat -c "%a:%u:%g" /outside/sentinel)" = 640:0:0
+    '
+
+echo "Container smoke passed ($expected_arch): no-FOWNER restore/restart, UID 10001, root-owned 0644 restore, files 0600/directories 0700, unchanged credentials/data, symlink/mount/outside-hardlink refusal, internal hardlinks, and durable bills/collections/usage."
