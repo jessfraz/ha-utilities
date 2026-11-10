@@ -596,6 +596,8 @@ fn map_invoices(
             period_from: None,
             period_to: None,
             total: money(invoice.amount.minor()?, &response.currency),
+            new_charges: None,
+            reported_quantities: vec![],
             outstanding_balance: balance,
             source_status: None,
             observed_at: request.observed_at,
@@ -606,12 +608,8 @@ fn map_invoices(
             // WM reports a payment attached to this invoice, not its settlement status.
             let paid_on = date(&payment.date)?;
             let reference = payment.reference_number.unwrap_or_default();
-            use sha2::{Digest, Sha256};
-            let key = URL_SAFE_NO_PAD.encode(Sha256::digest(format!(
-                "{id}|{paid_on}|{amount}|{reference}"
-            )));
             items.push(Observation::Payment(Payment {
-                id: format!("{}:payment:{key}", request.binding.id),
+                id: payment_id(&request.binding.id, &id, paid_on, amount, &reference),
                 account_id: request.binding.id.clone(),
                 bill_id: Some(id),
                 amount: money(amount, &response.currency),
@@ -622,6 +620,20 @@ fn map_invoices(
         }
     }
     Ok(items)
+}
+
+pub(crate) fn payment_id(
+    account: &str,
+    bill: &str,
+    paid_on: NaiveDate,
+    amount: i64,
+    reference: &str,
+) -> String {
+    use sha2::{Digest, Sha256};
+    let key = URL_SAFE_NO_PAD.encode(Sha256::digest(format!(
+        "{bill}|{paid_on}|{amount}|{reference}"
+    )));
+    format!("{account}:payment:{key}")
 }
 fn map_balance(request: &SyncRequest, response: BalanceResponse) -> Result<Balance, UtilityError> {
     let totals = response

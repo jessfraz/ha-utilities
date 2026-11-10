@@ -357,6 +357,8 @@ impl Bayou {
                 // Bayou returns cents but no currency. Account configuration is
                 // explicit because supported utilities include Canadian bills.
                 total: money(total, &request.binding.currency),
+                new_charges: None,
+                reported_quantities: vec![],
                 // Officially the PREVIOUS cycle's balance, not current due and
                 // absolutely not evidence that the present bill was settled.
                 outstanding_balance: bill

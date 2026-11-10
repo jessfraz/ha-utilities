@@ -35,6 +35,8 @@ pub async fn populated(path: &Path) -> Store {
                     minor_units: 12500 + index,
                     currency: "USD".to_owned(),
                 },
+                new_charges: None,
+                reported_quantities: vec![],
                 outstanding_balance: None,
                 source_status: None,
                 observed_at: now,

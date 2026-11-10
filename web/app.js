@@ -18,6 +18,7 @@ const views = {
 };
 const names = {
   waste_management: 'Waste Management', bayou: 'Bayou',
+  lvmwd: 'LVMWD', superior_propane: 'Superior Propane', starlink: 'Starlink', spectrum: 'Spectrum',
   bills: 'Bills', balances: 'Balances', payments: 'Payments', services: 'Services',
   collections: 'Trash collections', usage: 'Usage',
   complete: 'Available', partial: 'Partial coverage', unavailable: 'Unavailable',
@@ -25,6 +26,14 @@ const names = {
   scheduled: 'Scheduled', completed: 'Completed', exception: 'Exception', unknown: 'Unknown',
   running: 'Syncing', failed: 'Sync failed', interrupted: 'Sync interrupted',
   waste: 'Waste', recycling: 'Recycling', electricity: 'Electricity', gas: 'Gas', water: 'Water', other: 'Other',
+};
+const billingUnits = {
+  hundred_cubic_feet: 'CCF', us_gallon: 'US gal', cubic_meter: 'm³', byte: 'B',
+  gigabyte: 'GB', terabyte: 'TB', count: 'unit', cubic_yard: 'yd³', day: 'day', month: 'month',
+};
+const sourceNames = {
+  invoice: 'Invoice', statement: 'Statement', supporting: 'Supporting document',
+  payment_confirmation: 'Payment confirmation', delivery_ticket: 'Delivery ticket', usage_export: 'Usage export',
 };
 const reasonLabels = {
   not_configured: 'Provider credentials are not configured.',
@@ -52,6 +61,7 @@ const reasonLabels = {
   account_has_no_intervals: 'No interval data is available for this account.',
   no_bound_services: 'No service is explicitly bound to this account.',
   interval_gaps_or_data_not_ready: 'Intervals have gaps or are still processing. They are not continuous energy statistics.',
+  document_import: 'Additional history may be available from the utility.',
   more_pages: 'The sync has more provider data to read.',
   sync_in_progress: 'The sync is still reading provider data.',
   process_interrupted: 'The last sync was interrupted. Saved observations remain available.',
@@ -211,12 +221,12 @@ function requirePage(value) {
   return value;
 }
 
-async function allBindings(path, signal) {
+async function allBindings(path, signal, filters) {
   const items = [];
   const seen = new Set();
   let cursor = null;
   do {
-    const query = new URLSearchParams({ limit: '100' });
+    const query = new URLSearchParams({ limit: '100', ...filters });
     if (cursor) query.set('page', cursor);
     const page = requirePage(await api(`${path}?${query}`, { signal }));
     items.push(...page.items);
@@ -249,8 +259,20 @@ function showNotice(message, kind = 'status') {
   setNotice(notice, kind === 'error' ? '' : message);
 }
 
+function importStatus() {
+  if (!summary?.import_only_accounts || summary.import_only_accounts !== summary.accounts) return null;
+  return summary.last_imported_at ? `Last imported ${timestamp(summary.last_imported_at)}` : 'Imported records';
+}
+
 function updateFreshness() {
   const value = byId('freshness-badge');
+  const imported = importStatus();
+  if (imported) {
+    value.textContent = 'Imported records';
+    value.className = 'badge';
+    shell.setStatus(imported);
+    return;
+  }
   const covered = summary?.coverage ?? [];
   const gaps = covered.some((item) => ['partial', 'unavailable', 'not_configured'].includes(item.state));
   const state = !summary?.last_synced_at ? 'No sync yet' : summary.stale ? 'Data is stale' : gaps ? 'Coverage gaps' : 'Synced';
@@ -357,7 +379,7 @@ function coveragePanel(items) {
   for (const item of items) {
     const row = node('tr');
     const status = cell();
-    status.append(badge(item.state));
+    status.append(badge(item.state, item.reason === 'document_import' ? 'Imported documents' : label(item.state)));
     if (item.reason) status.append(node('small', reasonLabels[item.reason] ?? 'The provider reported a coverage limitation. Check provider configuration and try syncing again.'));
     row.append(cell(accountName(item.account_id)), cell(label(item.capability)), status,
       cell(item.from && item.to ? `${timestamp(item.from)} to ${timestamp(item.to)} (end exclusive)` : 'Not reported'), cell(timestamp(item.checked_at)));
@@ -412,28 +434,33 @@ async function renderOverview(signal, current) {
   }
   const hasCollections = accountsFor('collections').length > 0;
   const upcoming = new URLSearchParams({ from: dateOffset(0), to: dateOffset(30), limit: '5' });
-  const [balances, collections] = await Promise.all([
+  const [balances, collections, bills] = await Promise.all([
     api('v1/balances?limit=10', { signal }).then(requirePage),
     hasCollections ? api(`v1/collections?${upcoming}`, { signal }).then(requirePage) : null,
+    summary.bills ? allBindings('v1/bills', signal, { from: dateOffset(-365), to: dateOffset(0) }) : [],
   ]);
   if (current !== generation) return;
   const fragment = document.createDocumentFragment();
   const metrics = node('section', undefined, 'metrics');
   metrics.setAttribute('aria-label', 'Saved utility data');
-  const values = [[summary.accounts, 'Connected accounts'], [summary.bills, 'Saved bills'], ...(hasCollections ? [[summary.collections, 'Saved trash collections']] : []), [summary.usage_intervals, 'Usage intervals']];
+  const values = [[summary.accounts, 'Utility accounts'], [summary.bills, 'Saved bills'], ...(hasCollections ? [[summary.collections, 'Saved trash collections']] : []), [summary.usage_intervals, 'Usage intervals']];
   for (const [value, title] of values) {
     const metric = node('div', undefined, 'metric');
     metric.append(node('span', count(value), 'metric-value'), node('span', title, 'metric-label'));
     metrics.append(metric);
   }
-  const freshness = node('section', undefined, `freshness${summary.stale ? ' attention' : ''}`);
-  const freshnessText = node('div');
-  freshnessText.append(node('strong', summary.last_synced_at ? `Last synced ${timestamp(summary.last_synced_at)}` : 'No successful sync yet'),
-    node('p', summary.stale ? 'Saved data may be out of date. Coverage below shows which provider results can be relied on.' : 'These are saved provider observations. Coverage and timestamps describe what is known.'));
-  const syncLink = node('button', 'Sync settings', 'text-action');
-  syncLink.type = 'button';
-  syncLink.addEventListener('click', () => navigate('settings'));
-  freshness.append(freshnessText, syncLink);
+  const imported = importStatus();
+  const freshness = node('section', undefined, `freshness${summary.stale && !imported ? ' attention' : ''}`);
+  if (imported) freshness.append(node('strong', imported));
+  else {
+    const freshnessText = node('div');
+    freshnessText.append(node('strong', summary.last_synced_at ? `Last synced ${timestamp(summary.last_synced_at)}` : 'No successful sync yet'),
+      node('p', summary.stale ? 'Saved data may be out of date. Coverage below shows which provider results can be relied on.' : 'Coverage and timestamps describe the saved utility records.'));
+    const syncLink = node('button', 'Sync settings', 'text-action');
+    syncLink.type = 'button';
+    syncLink.addEventListener('click', () => navigate('settings'));
+    freshness.append(freshnessText, syncLink);
+  }
   const columns = node('div', undefined, 'two-column');
   const balancePanel = panel('Reported balances', ['View bills', 'bills']);
   if (!balances.items.length) balancePanel.append(node('p', 'No balances reported. This does not mean nothing is owed.', 'panel-empty'));
@@ -468,8 +495,94 @@ async function renderOverview(signal, current) {
   }
   columns.append(collectionPanel);
   }
-  fragment.append(metrics, freshness, syncStatus(), columns, coveragePanel(summary.coverage));
+  fragment.append(metrics, freshness, syncStatus());
+  const cost = billingTrend(bills);
+  if (cost) fragment.append(cost);
+  const reportedUsage = reportedUsageTrend(bills);
+  if (reportedUsage) fragment.append(reportedUsage);
+  fragment.append(columns, coveragePanel(summary.coverage));
   content.replaceChildren(fragment);
+}
+
+function billingTrend(bills) {
+  const currencies = new Map();
+  for (const { issued_on, new_charges } of bills) {
+    if (!new_charges) continue;
+    const { currency, minor_units } = new_charges;
+    if (!currencies.has(currency)) currencies.set(currency, new Map());
+    const months = currencies.get(currency);
+    const month = issued_on.slice(0, 7);
+    months.set(month, (months.get(month) ?? 0) + minor_units);
+  }
+  if (!currencies.size) return null;
+
+  const section = panel('Monthly utility charges', ['View bills', 'bills']);
+  section.classList.add('billing-trend');
+  const body = node('div', undefined, 'panel-body');
+  body.append(node('p', 'New charges shown on saved bills issued in the past year.', 'muted'));
+  for (const [currency, months] of currencies) {
+    if (currencies.size > 1) body.append(node('h3', currency));
+    body.append(monthlyHistory(months, (minor_units) => money({ currency, minor_units })));
+  }
+  section.append(body);
+  return section;
+}
+
+function monthlyHistory(months, formatAmount) {
+  const dateFormat = new Intl.DateTimeFormat(undefined, { month: 'short', year: 'numeric', timeZone: 'UTC' });
+  const rows = node('ul');
+  const scale = Math.max(...Array.from(months.values(), (value) => Math.abs(Number(value)))) || 1;
+  for (const [month, amount] of Array.from(months).sort(([a], [b]) => a.localeCompare(b))) {
+    const row = node('li');
+    const track = node('div', undefined, 'billing-track');
+    const bar = node('div', undefined, Number(amount) < 0 ? 'billing-bar credit' : 'billing-bar');
+    bar.style.width = `${Math.abs(Number(amount)) / scale * 100}%`;
+    track.setAttribute('aria-hidden', 'true');
+    track.append(bar);
+    row.append(node('span', dateFormat.format(new Date(`${month}-01T00:00:00Z`))), track,
+      node('strong', formatAmount(amount)));
+    rows.append(row);
+  }
+  return rows;
+}
+
+function addReportedQuantities(total, value) {
+  // Reported quantities are nonnegative decimal strings. Preserve their precision in the displayed total.
+  const parts = [total, value].map((item) => item.split('.'));
+  const places = Math.max(...parts.map(([, fraction = '']) => fraction.length));
+  const [left, right] = parts.map(([whole, fraction = '']) => BigInt(whole + fraction.padEnd(places, '0')));
+  const digits = (left + right).toString().padStart(places + 1, '0');
+  if (!places) return digits;
+  const fraction = digits.slice(-places).replace(/0+$/, '');
+  const whole = digits.slice(0, -places);
+  return fraction ? `${whole}.${fraction}` : whole;
+}
+
+function reportedUsageTrend(bills) {
+  const titles = { billed_water: 'Billed water', propane_delivered: 'Propane delivered' };
+  const groups = new Map();
+  for (const { issued_on, reported_quantities = [] } of bills) {
+    for (const { kind, quantity: { value, unit } } of reported_quantities) {
+      if (!Object.hasOwn(titles, kind)) continue;
+      const key = `${kind}:${unit}`;
+      if (!groups.has(key)) groups.set(key, { kind, unit, months: new Map() });
+      const { months } = groups.get(key);
+      const month = issued_on.slice(0, 7);
+      months.set(month, addReportedQuantities(months.get(month) ?? '0', value));
+    }
+  }
+  if (!groups.size) return null;
+
+  const section = panel('Water and propane history');
+  section.classList.add('billing-trend');
+  const body = node('div', undefined, 'panel-body');
+  body.append(node('p', 'Quantities from saved bills issued in the past year, grouped by bill issue month.', 'muted'));
+  for (const { kind, unit, months } of groups.values()) {
+    body.append(node('h3', `${titles[kind]} · ${billingUnits[unit] ?? label(unit)}`),
+      monthlyHistory(months, (value) => quantity({ value, unit })));
+  }
+  section.append(body);
+  return section;
 }
 
 function initialFilters(type) {
@@ -642,8 +755,20 @@ async function openBill(id) {
   body.replaceChildren(node('p', 'Loading bill…', 'muted'));
   if (!detail.open) detail.showModal();
   try {
-    const bill = await api(`v1/bills/${encodeURIComponent(id)}`, { signal: controller.signal });
+    const path = `v1/bills/${encodeURIComponent(id)}`;
+    const options = { signal: controller.signal };
+    const [bill, imported] = await Promise.all([
+      api(path, options),
+      api(`${path}/details`, options).catch((error) => {
+        if (error instanceof ApiError && error.status === 404) return null;
+        throw error;
+      }),
+    ]);
     if (controller.signal.aborted || !detail.open) return;
+    if (imported) {
+      body.replaceChildren(importedBill(bill, imported));
+      return;
+    }
     const heading = node('p', accountName(bill.account_id), 'muted');
     const total = node('p', money(bill.total), 'detail-total');
     const fields = node('dl');
@@ -670,6 +795,153 @@ async function openBill(id) {
   }
 }
 
+function billingPeriod(period) {
+  if (!period) return null;
+  const end = new Date(`${period.end_exclusive}T00:00:00Z`);
+  end.setUTCDate(end.getUTCDate() - 1);
+  return `${calendarDate(period.start)} – ${calendarDate(end.toISOString().slice(0, 10))}`;
+}
+
+function quantity(value) {
+  return value ? `${value.value} ${billingUnits[value.unit] ?? label(value.unit)}` : null;
+}
+
+function detailFields(entries) {
+  const fields = node('dl', undefined, 'billing-fields');
+  for (const [name, value] of entries) {
+    if (value != null) fields.append(node('dt', name), node('dd', value));
+  }
+  return fields;
+}
+
+function documentLinks(sources) {
+  const list = node('ul', undefined, 'billing-documents');
+  for (const source of sources) {
+    if (!/^[a-f0-9]{64}$/.test(source.sha256)) continue;
+    const name = sourceNames[source.role] ?? 'Source document';
+    const item = node('li');
+    const link = node('a', name);
+    link.href = `v1/documents/${source.sha256}`;
+    link.download = '';
+    item.append(link);
+    if (source.pages.length) {
+      item.append(node('span', `${source.pages.length === 1 ? 'Page' : 'Pages'} ${source.pages.join(', ')}`));
+    }
+    list.append(item);
+  }
+  return list;
+}
+
+function billService(service) {
+  const titles = { water: 'Water', internet: 'Internet', propane: 'Propane', waste: 'Waste', recycling: 'Recycling' };
+  const facts = {
+    water: [
+      ['Billed use', quantity(service.billed_volume)], ['Current budget', quantity(service.current_budget)],
+      ['Next estimated budget', quantity(service.next_estimated_budget)], ['Meter size', service.meter_size],
+      ['Reference evapotranspiration', service.eto_inches == null ? null : `${service.eto_inches} in`],
+    ],
+    internet: [
+      ['Plan', service.plan], ['Service period', billingPeriod(service.period)],
+      ['Allowance', quantity(service.allowance)], ['Overage', quantity(service.overage)],
+    ],
+    propane: [
+      ['Delivery date', service.delivery_on ? calendarDate(service.delivery_on) : null],
+      ['Delivered volume', quantity(service.delivered_volume)],
+    ],
+    waste: [
+      ['Container size', service.container_size], ['Pickup frequency', service.pickup_frequency],
+      ['Service period', billingPeriod(service.period)],
+    ],
+  };
+  const fields = detailFields(facts[service.kind === 'recycling' ? 'waste' : service.kind] ?? []);
+  const servicePanel = panel(titles[service.kind] ?? 'Service');
+  if (fields.childElementCount) servicePanel.append(fields);
+  if (service.meter_reads?.length) {
+    const { wrapper, body } = table(['Reading date', { text: 'Meter reading', numeric: true }, 'Quality'], 'Water meter readings');
+    for (const read of service.meter_reads) {
+      const row = node('tr');
+      row.append(cell(calendarDate(read.on)), cell(read.register, true), cell(label(read.quality)));
+      body.append(row);
+    }
+    servicePanel.append(wrapper);
+  }
+  return servicePanel.childElementCount > 1 ? servicePanel : null;
+}
+
+function importedBill(bill, { currency, bill: { record }, related }) {
+  const amount = (minor_units) => minor_units == null ? null : money({ currency, minor_units });
+  const selectedServices = record.scope === 'selected_services';
+  const sheet = node('article', undefined, 'imported-bill');
+  sheet.append(node('h3', accountName(bill.account_id), 'billing-account'));
+  const totals = node('dl', undefined, 'billing-totals');
+  for (const [title, value] of [
+    ['Amount due', record.totals.amount_due_minor],
+    [selectedServices ? 'New charges for selected services' : 'New charges', record.totals.new_charges_minor],
+  ]) {
+    if (value == null) continue;
+    const metric = node('div');
+    metric.append(node('dt', title), node('dd', amount(value)));
+    totals.append(metric);
+  }
+  sheet.append(totals);
+  if (selectedServices) {
+    sheet.append(node('p', 'This bill omits account-wide totals and payments.', 'muted'));
+  }
+  sheet.append(detailFields([
+    ['Issued', calendarDate(record.issued_on)], ['Due', record.due_on ? calendarDate(record.due_on) : null],
+    ['Billing period', billingPeriod(record.period)], ['Previous balance', amount(record.totals.previous_balance_minor)],
+    ['Payments received', amount(record.totals.payments_received_minor)], ['Adjustments', amount(record.totals.adjustments_minor)],
+  ]));
+
+  if (record.charges.length) {
+    const section = panel('Charges');
+    const { wrapper, body } = table([
+      'Description', { text: 'Quantity', numeric: true }, { text: 'Rate', numeric: true }, { text: 'Amount', numeric: true },
+    ], 'Bill charges', 'billing-charges');
+    for (const line of record.charges) {
+      const row = node('tr');
+      const description = cell(line.label);
+      if (line.period) description.append(node('small', billingPeriod(line.period)));
+      const rate = line.rate ? `${currency} ${line.rate.amount} / ${billingUnits[line.rate.per] ?? label(line.rate.per)}` : '—';
+      row.append(description, cell(quantity(line.quantity) ?? '—', true), cell(rate, true), cell(amount(line.amount_minor), true));
+      body.append(row);
+    }
+    section.append(wrapper);
+    sheet.append(section);
+  }
+  for (const service of record.services) {
+    const section = billService(service);
+    if (section) sheet.append(section);
+  }
+
+  for (const [kind, title] of [['payment', 'Related payments'], ['propane_delivery', 'Related deliveries']]) {
+    const items = related.map((item) => item.record).filter((item) => item.kind === kind);
+    if (!items.length) continue;
+    const section = panel(title);
+    const list = node('ul', undefined, 'record-list billing-related');
+    for (const item of items) {
+      const isPayment = kind === 'payment';
+      const row = node('li');
+      const description = node('div');
+      description.append(node('strong', calendarDate(isPayment ? item.paid_on : item.delivered_on)));
+      if (isPayment) description.append(node('p', label(item.status)));
+      description.append(documentLinks(item.sources));
+      row.append(description, node('strong', isPayment ? amount(item.amount_minor) : quantity(item.volume), 'amount'));
+      list.append(row);
+    }
+    section.append(list);
+    sheet.append(section);
+  }
+
+  const originals = documentLinks(record.sources);
+  if (originals.childElementCount) {
+    const section = panel('Original documents');
+    section.append(originals);
+    sheet.append(section);
+  }
+  return sheet;
+}
+
 function renderSettings() {
   const fragment = document.createDocumentFragment();
   fragment.append(connectionManager.section());
@@ -678,13 +950,21 @@ function renderSettings() {
   for (const provider of providers) {
     const card = node('article', undefined, 'panel');
     const heading = node('div', undefined, 'section-heading');
-    heading.append(node('h2', provider.name), badge(provider.configured ? 'complete' : 'not_configured', provider.configured ? provider.id === 'bayou' ? 'API key configured' : 'Credentials configured' : 'Not configured'));
-    const description = provider.configured ? 'Credentials are present. A successful sync is still required to verify account access and data coverage.'
-      : provider.id === 'waste_management' ? 'A WM-issued token and ClientId are required. Residential eligibility and API pricing must be confirmed with WM.'
-      : 'Add a Bayou API key in the app configuration. Then connect your utility above to choose the accounts and meters to use.';
-    const providerDescription = provider.id === 'bayou' && provider.configured
-      ? 'The API key is configured. Connect your utility above, sign in through Bayou, and choose its accounts and meters. A key alone does not connect a utility account.' : description;
-    card.append(heading, node('p', providerDescription));
+    heading.append(node('h2', provider.name));
+    if (provider.id === 'waste_management' || provider.id === 'bayou') {
+      heading.append(badge(provider.configured ? 'complete' : 'not_configured', provider.configured ? provider.id === 'bayou' ? 'API key configured' : 'Credentials configured' : 'Not configured'));
+      const description = provider.id === 'bayou'
+        ? provider.configured
+          ? 'The API key is configured. Connect your utility above, sign in through Bayou, and choose its accounts and meters. A key alone does not connect a utility account.'
+          : 'Add a Bayou API key in the app configuration. Then connect your utility above to choose the accounts and meters to use.'
+        : provider.configured
+          ? 'Credentials are present. A successful sync is still required to verify account access and data coverage.'
+          : 'A WM-issued token and ClientId are required. Residential eligibility and API pricing must be confirmed with WM.';
+      card.append(heading, node('p', description));
+    } else {
+      heading.append(badge('complete', 'Document imports'));
+      card.append(heading);
+    }
     const capabilities = node('div', undefined, 'capabilities');
     capabilities.setAttribute('aria-label', 'Supported data');
     for (const capability of provider.capabilities) capabilities.append(node('span', label(capability)));
@@ -713,9 +993,13 @@ function renderSettings() {
   const sync = panel('Sync provider data');
   sync.classList.add('settings-section');
   const body = node('div', undefined, 'panel-body');
-  body.append(node('p', 'Fetch bills, collections, and usage for one bound account. This only reads provider data. It cannot pay a bill, book a pickup, or change a service.', 'muted'));
-  if (accounts.length) body.append(syncForm());
-  else body.append(node('p', 'Sync is unavailable until an account is configured.', 'muted'));
+  const syncAccounts = accounts.filter((account) => !account.import_only);
+  if (syncAccounts.length) {
+    body.append(node('p', 'Fetch bills, collections, and usage for one bound account. This only reads provider data. It cannot pay a bill, book a pickup, or change a service.', 'muted'),
+      syncForm(syncAccounts));
+  } else {
+    body.append(node('p', 'Connect an account to a utility provider to use sync.', 'muted'));
+  }
   body.append(syncStatus());
   sync.append(body);
   fragment.append(bindings, sync, coveragePanel(summary.coverage));
@@ -735,10 +1019,10 @@ function renderSyncStatus(status) {
   status.hidden = syncJobs.length === 0;
 }
 
-function syncForm() {
+function syncForm(syncAccounts) {
   const wrapper = node('div');
   const form = node('form', undefined, 'sync-form');
-  const account = selectField('Account to sync', 'account', [['', 'Choose an account'], ...accounts.map((item) => [item.id, item.name])], '', true);
+  const account = selectField('Account to sync', 'account', [['', 'Choose an account'], ...syncAccounts.map((item) => [item.id, item.name])], '', true);
   const [defaultFrom, defaultTo] = defaultSyncDates();
   const from = dateField('From', 'from', defaultFrom);
   const to = dateField('To', 'to', defaultTo);
@@ -752,11 +1036,11 @@ function syncForm() {
   submit.setAttribute('aria-describedby', availability.id);
   let submitting = false;
   function canSync() {
-    const binding = accounts.find((item) => item.id === account.select.value);
+    const binding = syncAccounts.find((item) => item.id === account.select.value);
     return !!binding && providers.some((provider) => provider.id === binding.provider && provider.configured);
   }
   function updateAvailability() {
-    const binding = accounts.find((item) => item.id === account.select.value);
+    const binding = syncAccounts.find((item) => item.id === account.select.value);
     const running = syncJobs.some((job) => job.account_id === binding?.id && job.state === 'running');
     submit.disabled = submitting || running || !canSync();
     availability.textContent = submitting ? 'Starting sync…' : running ? 'This account is already syncing.'

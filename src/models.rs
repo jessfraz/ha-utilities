@@ -9,6 +9,23 @@ use serde::{Deserialize, Serialize};
 pub enum ProviderId {
     WasteManagement,
     Bayou,
+    Lvmwd,
+    SuperiorPropane,
+    Starlink,
+    Spectrum,
+}
+
+impl ProviderId {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::WasteManagement => "Waste Management",
+            Self::Bayou => "Bayou",
+            Self::Lvmwd => "LVMWD",
+            Self::SuperiorPropane => "Superior Propane",
+            Self::Starlink => "Starlink",
+            Self::Spectrum => "Spectrum",
+        }
+    }
 }
 
 #[derive(JsonSchema, Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -38,6 +55,8 @@ pub enum ServiceKind {
     Electricity,
     Gas,
     Water,
+    Propane,
+    Internet,
     Other,
 }
 
@@ -47,6 +66,8 @@ pub struct Account {
     pub name: String,
     pub provider: ProviderId,
     pub services: Vec<Service>,
+    #[serde(default)]
+    pub import_only: bool,
 }
 
 #[derive(JsonSchema, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -208,10 +229,28 @@ pub struct Bill {
     pub period_to: Option<NaiveDate>,
     /// The whole provider account bill, including meters not selected for usage.
     pub total: Money,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_charges: Option<Money>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reported_quantities: Vec<ReportedQuantity>,
     pub outstanding_balance: Option<Money>,
     /// Source status only. Absence of a balance does not mean paid.
     pub source_status: Option<String>,
     pub observed_at: DateTime<Utc>,
+}
+
+#[derive(JsonSchema, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ReportedQuantity {
+    pub kind: ReportedQuantityKind,
+    pub service_id: String,
+    pub quantity: crate::imports::Quantity,
+}
+
+#[derive(JsonSchema, Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReportedQuantityKind {
+    BilledWater,
+    PropaneDelivered,
 }
 
 #[derive(JsonSchema, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -264,6 +303,9 @@ pub enum UsageUnit {
     Ccf,
     Gallon,
     CubicMeter,
+    Byte,
+    Gigabyte,
+    Terabyte,
 }
 
 #[derive(JsonSchema, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -339,6 +381,9 @@ pub struct Summary {
     pub usage_intervals: u64,
     pub coverage: Vec<Coverage>,
     pub last_synced_at: Option<DateTime<Utc>>,
+    pub last_imported_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub import_only_accounts: usize,
     pub stale: bool,
 }
 

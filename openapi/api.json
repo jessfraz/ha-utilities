@@ -18,6 +18,10 @@
           "id": {
             "type": "string"
           },
+          "import_only": {
+            "default": false,
+            "type": "boolean"
+          },
           "name": {
             "type": "string"
           },
@@ -85,6 +89,14 @@
             "format": "date",
             "type": "string"
           },
+          "new_charges": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/Money"
+              }
+            ],
+            "nullable": true
+          },
           "observed_at": {
             "format": "date-time",
             "type": "string"
@@ -110,6 +122,12 @@
           "provider": {
             "$ref": "#/components/schemas/ProviderId"
           },
+          "reported_quantities": {
+            "items": {
+              "$ref": "#/components/schemas/ReportedQuantity"
+            },
+            "type": "array"
+          },
           "source_status": {
             "description": "Source status only. Absence of a balance does not mean paid.",
             "nullable": true,
@@ -132,6 +150,127 @@
           "provider",
           "total"
         ],
+        "type": "object"
+      },
+      "BillDetails": {
+        "properties": {
+          "bill": {
+            "$ref": "#/components/schemas/ImportedRecord"
+          },
+          "currency": {
+            "type": "string"
+          },
+          "related": {
+            "items": {
+              "$ref": "#/components/schemas/ImportedRecord"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "bill",
+          "currency",
+          "related"
+        ],
+        "type": "object"
+      },
+      "BillReference": {
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "enum": [
+                  "invoice_number"
+                ],
+                "type": "string"
+              },
+              "value": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "value"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "enum": [
+                  "statement_number"
+                ],
+                "type": "string"
+              },
+              "value": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "value"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "enum": [
+                  "statement_cycle"
+                ],
+                "type": "string"
+              },
+              "value": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "value"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "BillScope": {
+        "enum": [
+          "account",
+          "selected_services"
+        ],
+        "type": "string"
+      },
+      "BillTotals": {
+        "additionalProperties": false,
+        "properties": {
+          "adjustments_minor": {
+            "format": "int64",
+            "nullable": true,
+            "type": "integer"
+          },
+          "amount_due_minor": {
+            "format": "int64",
+            "nullable": true,
+            "type": "integer"
+          },
+          "new_charges_minor": {
+            "format": "int64",
+            "nullable": true,
+            "type": "integer"
+          },
+          "payments_received_minor": {
+            "format": "int64",
+            "nullable": true,
+            "type": "integer"
+          },
+          "previous_balance_minor": {
+            "format": "int64",
+            "nullable": true,
+            "type": "integer"
+          }
+        },
         "type": "object"
       },
       "BindConnection": {
@@ -159,6 +298,70 @@
           "usage"
         ],
         "type": "string"
+      },
+      "ChargeKind": {
+        "enum": [
+          "usage",
+          "service",
+          "tax",
+          "fee",
+          "credit",
+          "adjustment",
+          "equipment",
+          "installation",
+          "delivery",
+          "other"
+        ],
+        "type": "string"
+      },
+      "ChargeLine": {
+        "additionalProperties": false,
+        "properties": {
+          "amount_minor": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/ChargeKind"
+          },
+          "label": {
+            "type": "string"
+          },
+          "period": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/Period"
+              }
+            ],
+            "nullable": true
+          },
+          "quantity": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/Quantity"
+              }
+            ],
+            "nullable": true
+          },
+          "rate": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/UnitRate"
+              }
+            ],
+            "nullable": true
+          },
+          "service_id": {
+            "nullable": true,
+            "type": "string"
+          }
+        },
+        "required": [
+          "amount_minor",
+          "kind",
+          "label"
+        ],
+        "type": "object"
       },
       "Collection": {
         "properties": {
@@ -587,6 +790,391 @@
         ],
         "type": "object"
       },
+      "ImportAccount": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "provider": {
+            "$ref": "#/components/schemas/ProviderId"
+          },
+          "provider_account_sha256": {
+            "default": null,
+            "nullable": true,
+            "type": "string"
+          },
+          "services": {
+            "items": {
+              "$ref": "#/components/schemas/Service"
+            },
+            "type": "array"
+          },
+          "start_on": {
+            "format": "date",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "provider",
+          "services",
+          "start_on"
+        ],
+        "type": "object"
+      },
+      "ImportReceipt": {
+        "properties": {
+          "corrected": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "enriched": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "evidence_added": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "inserted": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "replayed": {
+            "type": "boolean"
+          },
+          "unchanged": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "corrected",
+          "enriched",
+          "evidence_added",
+          "inserted",
+          "replayed",
+          "unchanged"
+        ],
+        "type": "object"
+      },
+      "ImportRecord": {
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "charges": {
+                "default": [],
+                "items": {
+                  "$ref": "#/components/schemas/ChargeLine"
+                },
+                "type": "array"
+              },
+              "due_on": {
+                "format": "date",
+                "nullable": true,
+                "type": "string"
+              },
+              "issued_on": {
+                "format": "date",
+                "type": "string"
+              },
+              "kind": {
+                "enum": [
+                  "bill"
+                ],
+                "type": "string"
+              },
+              "period": {
+                "allOf": [
+                  {
+                    "$ref": "#/components/schemas/Period"
+                  }
+                ],
+                "nullable": true
+              },
+              "reference": {
+                "$ref": "#/components/schemas/BillReference"
+              },
+              "replaces_revision": {
+                "nullable": true,
+                "type": "string"
+              },
+              "scope": {
+                "allOf": [
+                  {
+                    "$ref": "#/components/schemas/BillScope"
+                  }
+                ],
+                "default": "account"
+              },
+              "services": {
+                "default": [],
+                "items": {
+                  "$ref": "#/components/schemas/ServiceDetail"
+                },
+                "type": "array"
+              },
+              "sources": {
+                "items": {
+                  "$ref": "#/components/schemas/SourceRef"
+                },
+                "type": "array"
+              },
+              "totals": {
+                "$ref": "#/components/schemas/BillTotals"
+              }
+            },
+            "required": [
+              "issued_on",
+              "kind",
+              "reference",
+              "sources",
+              "totals"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "amount_minor": {
+                "format": "int64",
+                "type": "integer"
+              },
+              "bill": {
+                "allOf": [
+                  {
+                    "$ref": "#/components/schemas/BillReference"
+                  }
+                ],
+                "nullable": true
+              },
+              "kind": {
+                "enum": [
+                  "payment"
+                ],
+                "type": "string"
+              },
+              "paid_on": {
+                "format": "date",
+                "type": "string"
+              },
+              "reference": {
+                "type": "string"
+              },
+              "replaces_revision": {
+                "nullable": true,
+                "type": "string"
+              },
+              "sources": {
+                "items": {
+                  "$ref": "#/components/schemas/SourceRef"
+                },
+                "type": "array"
+              },
+              "status": {
+                "$ref": "#/components/schemas/PaymentStatus"
+              }
+            },
+            "required": [
+              "amount_minor",
+              "kind",
+              "paid_on",
+              "reference",
+              "sources",
+              "status"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "end": {
+                "format": "date-time",
+                "type": "string"
+              },
+              "kind": {
+                "enum": [
+                  "meter_interval"
+                ],
+                "type": "string"
+              },
+              "quality": {
+                "$ref": "#/components/schemas/Quality"
+              },
+              "quantity": {
+                "$ref": "#/components/schemas/Quantity"
+              },
+              "replaces_revision": {
+                "nullable": true,
+                "type": "string"
+              },
+              "service_id": {
+                "type": "string"
+              },
+              "sources": {
+                "items": {
+                  "$ref": "#/components/schemas/SourceRef"
+                },
+                "type": "array"
+              },
+              "start": {
+                "format": "date-time",
+                "type": "string"
+              }
+            },
+            "required": [
+              "end",
+              "kind",
+              "quality",
+              "quantity",
+              "service_id",
+              "sources",
+              "start"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "bill": {
+                "allOf": [
+                  {
+                    "$ref": "#/components/schemas/BillReference"
+                  }
+                ],
+                "nullable": true
+              },
+              "delivered_on": {
+                "format": "date",
+                "type": "string"
+              },
+              "kind": {
+                "enum": [
+                  "propane_delivery"
+                ],
+                "type": "string"
+              },
+              "replaces_revision": {
+                "nullable": true,
+                "type": "string"
+              },
+              "service_id": {
+                "type": "string"
+              },
+              "sources": {
+                "items": {
+                  "$ref": "#/components/schemas/SourceRef"
+                },
+                "type": "array"
+              },
+              "ticket": {
+                "type": "string"
+              },
+              "volume": {
+                "$ref": "#/components/schemas/Quantity"
+              }
+            },
+            "required": [
+              "delivered_on",
+              "kind",
+              "service_id",
+              "sources",
+              "ticket",
+              "volume"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "amount_minor": {
+                "format": "int64",
+                "type": "integer"
+              },
+              "as_of": {
+                "format": "date-time",
+                "type": "string"
+              },
+              "kind": {
+                "enum": [
+                  "balance_snapshot"
+                ],
+                "type": "string"
+              },
+              "replaces_revision": {
+                "nullable": true,
+                "type": "string"
+              },
+              "sources": {
+                "items": {
+                  "$ref": "#/components/schemas/SourceRef"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "amount_minor",
+              "as_of",
+              "kind",
+              "sources"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "ImportRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "account": {
+            "$ref": "#/components/schemas/ImportAccount"
+          },
+          "currency": {
+            "type": "string"
+          },
+          "records": {
+            "items": {
+              "$ref": "#/components/schemas/ImportRecord"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "account",
+          "currency",
+          "records"
+        ],
+        "type": "object"
+      },
+      "ImportedRecord": {
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "record": {
+            "$ref": "#/components/schemas/ImportRecord"
+          },
+          "revision": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "record",
+          "revision"
+        ],
+        "type": "object"
+      },
       "Login": {
         "additionalProperties": false,
         "properties": {
@@ -596,6 +1184,27 @@
         },
         "required": [
           "token"
+        ],
+        "type": "object"
+      },
+      "MeterRead": {
+        "additionalProperties": false,
+        "properties": {
+          "on": {
+            "format": "date",
+            "type": "string"
+          },
+          "quality": {
+            "$ref": "#/components/schemas/Quality"
+          },
+          "register": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "on",
+          "quality",
+          "register"
         ],
         "type": "object"
       },
@@ -815,10 +1424,42 @@
         ],
         "type": "object"
       },
+      "PaymentStatus": {
+        "enum": [
+          "confirmed",
+          "reported",
+          "pending",
+          "failed",
+          "reversed"
+        ],
+        "type": "string"
+      },
+      "Period": {
+        "additionalProperties": false,
+        "properties": {
+          "end_exclusive": {
+            "format": "date",
+            "type": "string"
+          },
+          "start": {
+            "format": "date",
+            "type": "string"
+          }
+        },
+        "required": [
+          "end_exclusive",
+          "start"
+        ],
+        "type": "object"
+      },
       "ProviderId": {
         "enum": [
           "waste_management",
-          "bayou"
+          "bayou",
+          "lvmwd",
+          "superior_propane",
+          "starlink",
+          "spectrum"
         ],
         "type": "string"
       },
@@ -848,6 +1489,71 @@
         ],
         "type": "object"
       },
+      "Quality": {
+        "enum": [
+          "actual",
+          "estimated",
+          "unknown"
+        ],
+        "type": "string"
+      },
+      "Quantity": {
+        "additionalProperties": false,
+        "properties": {
+          "unit": {
+            "$ref": "#/components/schemas/QuantityUnit"
+          },
+          "value": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "unit",
+          "value"
+        ],
+        "type": "object"
+      },
+      "QuantityUnit": {
+        "enum": [
+          "hundred_cubic_feet",
+          "us_gallon",
+          "cubic_meter",
+          "byte",
+          "gigabyte",
+          "terabyte",
+          "count",
+          "cubic_yard",
+          "day",
+          "month"
+        ],
+        "type": "string"
+      },
+      "ReportedQuantity": {
+        "properties": {
+          "kind": {
+            "$ref": "#/components/schemas/ReportedQuantityKind"
+          },
+          "quantity": {
+            "$ref": "#/components/schemas/Quantity"
+          },
+          "service_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "quantity",
+          "service_id"
+        ],
+        "type": "object"
+      },
+      "ReportedQuantityKind": {
+        "enum": [
+          "billed_water",
+          "propane_delivered"
+        ],
+        "type": "string"
+      },
       "Service": {
         "properties": {
           "id": {
@@ -867,6 +1573,221 @@
         ],
         "type": "object"
       },
+      "ServiceDetail": {
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "billed_volume": {
+                "allOf": [
+                  {
+                    "$ref": "#/components/schemas/Quantity"
+                  }
+                ],
+                "nullable": true
+              },
+              "current_budget": {
+                "allOf": [
+                  {
+                    "$ref": "#/components/schemas/Quantity"
+                  }
+                ],
+                "nullable": true
+              },
+              "eto_inches": {
+                "nullable": true,
+                "type": "string"
+              },
+              "kind": {
+                "enum": [
+                  "water"
+                ],
+                "type": "string"
+              },
+              "meter_reads": {
+                "default": [],
+                "items": {
+                  "$ref": "#/components/schemas/MeterRead"
+                },
+                "type": "array"
+              },
+              "meter_size": {
+                "nullable": true,
+                "type": "string"
+              },
+              "next_estimated_budget": {
+                "allOf": [
+                  {
+                    "$ref": "#/components/schemas/Quantity"
+                  }
+                ],
+                "nullable": true
+              },
+              "service_id": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "service_id"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "allowance": {
+                "allOf": [
+                  {
+                    "$ref": "#/components/schemas/Quantity"
+                  }
+                ],
+                "nullable": true
+              },
+              "kind": {
+                "enum": [
+                  "internet"
+                ],
+                "type": "string"
+              },
+              "overage": {
+                "allOf": [
+                  {
+                    "$ref": "#/components/schemas/Quantity"
+                  }
+                ],
+                "nullable": true
+              },
+              "period": {
+                "allOf": [
+                  {
+                    "$ref": "#/components/schemas/Period"
+                  }
+                ],
+                "nullable": true
+              },
+              "plan": {
+                "nullable": true,
+                "type": "string"
+              },
+              "service_id": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "service_id"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "delivered_volume": {
+                "allOf": [
+                  {
+                    "$ref": "#/components/schemas/Quantity"
+                  }
+                ],
+                "nullable": true
+              },
+              "delivery_on": {
+                "format": "date",
+                "nullable": true,
+                "type": "string"
+              },
+              "kind": {
+                "enum": [
+                  "propane"
+                ],
+                "type": "string"
+              },
+              "service_id": {
+                "type": "string"
+              },
+              "ticket": {
+                "nullable": true,
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "service_id"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "container_size": {
+                "nullable": true,
+                "type": "string"
+              },
+              "kind": {
+                "enum": [
+                  "waste"
+                ],
+                "type": "string"
+              },
+              "period": {
+                "allOf": [
+                  {
+                    "$ref": "#/components/schemas/Period"
+                  }
+                ],
+                "nullable": true
+              },
+              "pickup_frequency": {
+                "nullable": true,
+                "type": "string"
+              },
+              "service_id": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "service_id"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "container_size": {
+                "nullable": true,
+                "type": "string"
+              },
+              "kind": {
+                "enum": [
+                  "recycling"
+                ],
+                "type": "string"
+              },
+              "period": {
+                "allOf": [
+                  {
+                    "$ref": "#/components/schemas/Period"
+                  }
+                ],
+                "nullable": true
+              },
+              "pickup_frequency": {
+                "nullable": true,
+                "type": "string"
+              },
+              "service_id": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "service_id"
+            ],
+            "type": "object"
+          }
+        ]
+      },
       "ServiceKind": {
         "enum": [
           "waste",
@@ -874,7 +1795,45 @@
           "electricity",
           "gas",
           "water",
+          "propane",
+          "internet",
           "other"
+        ],
+        "type": "string"
+      },
+      "SourceRef": {
+        "additionalProperties": false,
+        "properties": {
+          "pages": {
+            "default": [],
+            "items": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "role": {
+            "$ref": "#/components/schemas/SourceRole"
+          },
+          "sha256": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "role",
+          "sha256"
+        ],
+        "type": "object"
+      },
+      "SourceRole": {
+        "enum": [
+          "invoice",
+          "statement",
+          "supporting",
+          "payment_confirmation",
+          "delivery_ticket",
+          "usage_export"
         ],
         "type": "string"
       },
@@ -900,6 +1859,17 @@
               "$ref": "#/components/schemas/Coverage"
             },
             "type": "array"
+          },
+          "import_only_accounts": {
+            "default": 0,
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "last_imported_at": {
+            "format": "date-time",
+            "nullable": true,
+            "type": "string"
           },
           "last_synced_at": {
             "format": "date-time",
@@ -1023,6 +1993,22 @@
         ],
         "type": "object"
       },
+      "UnitRate": {
+        "additionalProperties": false,
+        "properties": {
+          "amount": {
+            "type": "string"
+          },
+          "per": {
+            "$ref": "#/components/schemas/QuantityUnit"
+          }
+        },
+        "required": [
+          "amount",
+          "per"
+        ],
+        "type": "object"
+      },
       "Usage": {
         "properties": {
           "account_id": {
@@ -1072,7 +2058,10 @@
           "Therm",
           "Ccf",
           "Gallon",
-          "CubicMeter"
+          "CubicMeter",
+          "Byte",
+          "Gigabyte",
+          "Terabyte"
         ],
         "type": "string"
       }
@@ -1081,7 +2070,7 @@
   "info": {
     "description": "Local utility observations and explicit coverage. Bearer owner credential or authenticated HA bridge. Sync reads providers only; no payments or service changes.",
     "title": "Utilities API",
-    "version": "0.1.5"
+    "version": "0.1.6"
   },
   "openapi": "3.0.3",
   "paths": {
@@ -1478,6 +2467,51 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/Bill"
+                }
+              }
+            },
+            "description": "successful operation",
+            "headers": {
+              "cache-control": {
+                "required": true,
+                "schema": {
+                  "type": "string"
+                },
+                "style": "simple"
+              }
+            }
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "tags": [
+          "utilities"
+        ]
+      }
+    },
+    "/v1/bills/{id}/details": {
+      "get": {
+        "operationId": "bill_details",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BillDetails"
                 }
               }
             },
@@ -1926,6 +2960,117 @@
         ]
       }
     },
+    "/v1/documents/{sha256}": {
+      "get": {
+        "operationId": "document_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "sha256",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "default": {
+            "content": {
+              "*/*": {
+                "schema": {}
+              }
+            },
+            "description": ""
+          }
+        },
+        "tags": [
+          "imports"
+        ]
+      },
+      "put": {
+        "operationId": "document_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "sha256",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/octet-stream": {
+              "schema": {
+                "format": "binary",
+                "type": "string"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "resource updated"
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "tags": [
+          "imports"
+        ]
+      }
+    },
+    "/v1/imports": {
+      "post": {
+        "operationId": "import_records",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ImportRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ImportReceipt"
+                }
+              }
+            },
+            "description": "successful operation",
+            "headers": {
+              "cache-control": {
+                "required": true,
+                "schema": {
+                  "type": "string"
+                },
+                "style": "simple"
+              }
+            }
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "tags": [
+          "imports"
+        ]
+      }
+    },
     "/v1/providers": {
       "get": {
         "operationId": "providers",
@@ -2286,6 +3431,9 @@
   "tags": [
     {
       "name": "connections"
+    },
+    {
+      "name": "imports"
     },
     {
       "name": "sync"

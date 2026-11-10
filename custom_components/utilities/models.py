@@ -213,7 +213,17 @@ class Usage:
     start: datetime
     end: datetime
     quantity: Decimal
-    unit: Literal["Wh", "KWh", "Therm", "Ccf", "Gallon", "CubicMeter"]
+    unit: Literal[
+        "Wh",
+        "KWh",
+        "Therm",
+        "Ccf",
+        "Gallon",
+        "CubicMeter",
+        "Byte",
+        "Gigabyte",
+        "Terabyte",
+    ]
 
     @classmethod
     def parse(cls, value: object) -> Usage:
@@ -232,12 +242,33 @@ class Usage:
             or quantity < 0
             or start >= end
             or not isinstance(unit, str)
-            or unit not in {"Wh", "KWh", "Therm", "Ccf", "Gallon", "CubicMeter"}
+            or unit
+            not in {
+                "Wh",
+                "KWh",
+                "Therm",
+                "Ccf",
+                "Gallon",
+                "CubicMeter",
+                "Byte",
+                "Gigabyte",
+                "Terabyte",
+            }
         ):
             raise ValueError("Invalid usage interval")
         # Match narrows the closed unit vocabulary without casts.
         match unit:
-            case "Wh" | "KWh" | "Therm" | "Ccf" | "Gallon" | "CubicMeter":
+            case (
+                "Wh"
+                | "KWh"
+                | "Therm"
+                | "Ccf"
+                | "Gallon"
+                | "CubicMeter"
+                | "Byte"
+                | "Gigabyte"
+                | "Terabyte"
+            ):
                 return cls(
                     text(row.get("id"), max_length=500),
                     text(row.get("account_id")),

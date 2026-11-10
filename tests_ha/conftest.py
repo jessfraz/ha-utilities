@@ -62,6 +62,7 @@ class Received:
     query: dict[str, str]
     body: bytes
     authorization: str | None
+    content_type: str | None
 
 
 @dataclass(slots=True)
@@ -102,6 +103,7 @@ class Backend:
                 dict(request.query),
                 await request.read(),
                 request.headers.get("Authorization"),
+                request.headers.get("Content-Type"),
             )
         )
         if gate := self.gates.get(request.path):

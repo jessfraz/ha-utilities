@@ -3,20 +3,39 @@ use clap::{Args, Parser, Subcommand};
 use ha_utilities::{
     client::{Client, ClientError, Transport},
     config::read_secret,
+    imports::{ImportReceipt, ImportRequest, MAX_DOCUMENT_BYTES, MAX_IMPORT_REQUEST_BYTES, digest},
     models::{
         BindConnection, ConnectionProvider, ConnectionSelection, CreateConnection, ListQuery,
         SyncInput,
     },
 };
-use serde::Serialize;
-use std::path::PathBuf;
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::BTreeSet,
+    fs::{self, File},
+    io::Read,
+    path::{Component, Path, PathBuf},
+};
+
+const MAX_MANIFEST_BYTES: usize = 8 * 1024 * 1024;
+const MAX_BUNDLE_ENTRIES: usize = 1024;
 
 #[derive(Parser)]
 #[command(
     version,
-    about = "Read utility bills, collections, and usage from a local Utilities service"
+    about = "Read utility data and import sourced records into a local Utilities service"
 )]
 struct Cli {
+    #[command(flatten)]
+    client: ClientOptions,
+    #[arg(long, global = true)]
+    json: bool,
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Args)]
+struct ClientOptions {
     #[arg(
         long,
         help = "Origin. Defaults to UTILITIES_URL or HOME_ASSISTANT_URL for the selected transport",
@@ -31,10 +50,6 @@ struct Cli {
         help = "Credential file overriding the selected transport environment"
     )]
     token_file: Option<PathBuf>,
-    #[arg(long, global = true)]
-    json: bool,
-    #[command(subcommand)]
-    command: Command,
 }
 #[derive(Subcommand)]
 enum Command {
@@ -73,6 +88,14 @@ enum Command {
     Connections {
         #[command(subcommand)]
         command: Connections,
+    },
+    /// Import typed utility records and their source documents from a bundle.
+    Ingest {
+        /// Directory containing manifest.json and its relative source paths.
+        bundle: PathBuf,
+        /// Validate the manifest and source hashes locally.
+        #[arg(long)]
+        check: bool,
     },
 }
 
@@ -201,7 +224,7 @@ fn variable(name: &str) -> Result<Option<String>, ClientError> {
     }
 }
 
-fn configured_client(cli: &Cli) -> Result<Client, ClientError> {
+fn configured_client(cli: &ClientOptions) -> Result<Client, ClientError> {
     let url = match &cli.url {
         Some(url) => url.clone(),
         None => match cli.transport {
@@ -228,84 +251,240 @@ fn configured_client(cli: &Cli) -> Result<Client, ClientError> {
     Client::new(&url, cli.transport, &token)
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BundleManifest {
+    documents: Vec<BundleDocument>,
+    imports: Vec<ImportRequest>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BundleDocument {
+    sha256: String,
+    path: PathBuf,
+}
+
+#[derive(Serialize)]
+struct BundleResult {
+    check_only: bool,
+    documents: usize,
+    requests: usize,
+    receipts: Vec<ImportReceipt>,
+}
+
+fn bundle_file(root: &Path, relative: &Path, limit: usize) -> Result<Vec<u8>, ClientError> {
+    let invalid_path = || ClientError::new("invalid_bundle_path", None);
+    let mut path = root.to_path_buf();
+    let mut components = relative.components().peekable();
+    if !fs::symlink_metadata(root).is_ok_and(|metadata| metadata.is_dir()) {
+        return Err(invalid_path());
+    }
+    while let Some(component) = components.next() {
+        let Component::Normal(name) = component else {
+            return Err(invalid_path());
+        };
+        path.push(name);
+        let expected = fs::symlink_metadata(&path).map_err(|_| invalid_path())?;
+        if components.peek().is_some() {
+            if !expected.is_dir() {
+                return Err(invalid_path());
+            }
+            continue;
+        }
+        if !expected.is_file() {
+            return Err(invalid_path());
+        }
+        let canonical = path.canonicalize().map_err(|_| invalid_path())?;
+        if !canonical.starts_with(root) {
+            return Err(invalid_path());
+        }
+        let file = File::open(canonical).map_err(|_| invalid_path())?;
+        let actual = file.metadata().map_err(|_| invalid_path())?;
+        if !actual.is_file() {
+            return Err(invalid_path());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if (expected.dev(), expected.ino()) != (actual.dev(), actual.ino()) {
+                return Err(invalid_path());
+            }
+        }
+        let mut bytes = Vec::new();
+        file.take((limit as u64) + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| ClientError::new("bundle_read_failed", None))?;
+        if bytes.len() > limit {
+            return Err(ClientError::new("bundle_file_too_large", None));
+        }
+        return Ok(bytes);
+    }
+    Err(invalid_path())
+}
+
+fn document_bytes(root: &Path, document: &BundleDocument) -> Result<Vec<u8>, ClientError> {
+    let bytes = bundle_file(root, &document.path, MAX_DOCUMENT_BYTES)?;
+    if bytes.is_empty() || digest(&bytes) != document.sha256 {
+        return Err(ClientError::new("invalid_document_digest", None));
+    }
+    Ok(bytes)
+}
+
+async fn ingest(
+    bundle: &Path,
+    check_only: bool,
+    options: &ClientOptions,
+    json: bool,
+) -> Result<(), ClientError> {
+    let bundle: PathBuf = bundle.components().collect();
+    if !fs::symlink_metadata(&bundle).is_ok_and(|metadata| metadata.is_dir()) {
+        return Err(ClientError::new("invalid_bundle_path", None));
+    }
+    let root = bundle
+        .canonicalize()
+        .map_err(|_| ClientError::new("invalid_bundle_path", None))?;
+    let manifest: BundleManifest = serde_json::from_slice(&bundle_file(
+        &root,
+        Path::new("manifest.json"),
+        MAX_MANIFEST_BYTES,
+    )?)
+    .map_err(|_| ClientError::new("invalid_bundle_manifest", None))?;
+    if manifest.imports.is_empty()
+        || manifest.imports.len() > MAX_BUNDLE_ENTRIES
+        || manifest.documents.len() > MAX_BUNDLE_ENTRIES
+    {
+        return Err(ClientError::new("invalid_bundle_manifest", None));
+    }
+    let mut referenced = BTreeSet::new();
+    for input in &manifest.imports {
+        input
+            .validate()
+            .map_err(|_| ClientError::new("invalid_import", None))?;
+        let body =
+            serde_json::to_vec(input).map_err(|_| ClientError::new("invalid_import", None))?;
+        if body.len() > MAX_IMPORT_REQUEST_BYTES {
+            return Err(ClientError::new("request_too_large", None));
+        }
+        referenced.extend(input.document_digests());
+    }
+    let declared: BTreeSet<_> = manifest
+        .documents
+        .iter()
+        .map(|document| document.sha256.as_str())
+        .collect();
+    if declared.len() != manifest.documents.len() || declared != referenced {
+        return Err(ClientError::new("invalid_bundle_documents", None));
+    }
+    for document in &manifest.documents {
+        document_bytes(&root, document)?;
+    }
+    let mut result = BundleResult {
+        check_only,
+        documents: manifest.documents.len(),
+        requests: manifest.imports.len(),
+        receipts: Vec::new(),
+    };
+    if !check_only {
+        let client = configured_client(options)?;
+        for document in &manifest.documents {
+            // Recheck bytes after preflight so a changed bundle cannot send stale evidence.
+            let bytes = document_bytes(&root, document)?;
+            client.upload_document(&document.sha256, bytes).await?;
+        }
+        for input in &manifest.imports {
+            result.receipts.push(client.import(input).await?);
+        }
+    }
+    print(&result, json)
+}
+
 async fn run(cli: Cli) -> Result<(), ClientError> {
-    let client = configured_client(&cli)?;
+    let client = || configured_client(&cli.client);
     match cli.command {
-        Command::Health => print(&client.health().await?, cli.json),
-        Command::System => print(&client.system().await?, cli.json),
-        Command::Summary => print(&client.summary().await?, cli.json),
-        Command::Providers { .. } => print(&client.providers().await?, cli.json),
-        Command::Accounts { .. } => print(&client.accounts().await?, cli.json),
+        Command::Ingest { bundle, check } => ingest(&bundle, check, &cli.client, cli.json).await,
+        Command::Health => print(&client()?.health().await?, cli.json),
+        Command::System => print(&client()?.system().await?, cli.json),
+        Command::Summary => print(&client()?.summary().await?, cli.json),
+        Command::Providers { .. } => print(&client()?.providers().await?, cli.json),
+        Command::Accounts { .. } => print(&client()?.accounts().await?, cli.json),
         Command::Bills {
             command: Bills::List(filters),
-        } => print(&client.bills(&filters.into()).await?, cli.json),
+        } => print(&client()?.bills(&filters.into()).await?, cli.json),
         Command::Bills {
             command: Bills::Get { id },
-        } => print(&client.bill(&id).await?, cli.json),
+        } => print(&client()?.bill(&id).await?, cli.json),
         Command::Balances {
             command: Lists::List(filters),
-        } => print(&client.balances(&filters.into()).await?, cli.json),
+        } => print(&client()?.balances(&filters.into()).await?, cli.json),
         Command::Collections {
             command: Lists::List(filters),
-        } => print(&client.collections(&filters.into()).await?, cli.json),
+        } => print(&client()?.collections(&filters.into()).await?, cli.json),
         Command::Usage {
             command: Lists::List(filters),
-        } => print(&client.usage(&filters.into()).await?, cli.json),
+        } => print(&client()?.usage(&filters.into()).await?, cli.json),
         Command::Sync {
             command: Sync::Request { account, from, to },
         } => print(
-            &client
+            &client()?
                 .sync_request(&SyncInput { account, from, to })
                 .await?,
             cli.json,
         ),
         Command::Sync {
             command: Sync::Get { id },
-        } => print(&client.sync_get(&id).await?, cli.json),
-        Command::Connections { command } => match command {
-            Connections::Utilities => print(&client.connection_utilities().await?, cli.json),
-            Connections::List => print(&client.connections().await?, cli.json),
-            Connections::Get { id } => print(&client.connection(&id).await?, cli.json),
-            Connections::Start {
-                utility,
-                currency,
-                name,
-                accept_provider_settings,
-                request_id,
-            } => print(
-                &client
-                    .connection_start(&CreateConnection {
-                        provider: ConnectionProvider::Bayou,
-                        request_id: request_id.unwrap_or_else(uuid::Uuid::now_v7).to_string(),
-                        utility_id: utility,
-                        currency,
-                        name,
-                        accept_provider_settings,
-                    })
-                    .await?,
-                cli.json,
-            ),
-            Connections::Refresh { id } => print(&client.connection_refresh(&id).await?, cli.json),
-            Connections::Resume { id } => print(&client.connection_resume(&id).await?, cli.json),
-            Connections::Authorize { id } => {
-                print(&client.connection_authorization(&id).await?, cli.json)
+        } => print(&client()?.sync_get(&id).await?, cli.json),
+        Command::Connections { command } => {
+            let client = client()?;
+            match command {
+                Connections::Utilities => print(&client.connection_utilities().await?, cli.json),
+                Connections::List => print(&client.connections().await?, cli.json),
+                Connections::Get { id } => print(&client.connection(&id).await?, cli.json),
+                Connections::Start {
+                    utility,
+                    currency,
+                    name,
+                    accept_provider_settings,
+                    request_id,
+                } => print(
+                    &client
+                        .connection_start(&CreateConnection {
+                            provider: ConnectionProvider::Bayou,
+                            request_id: request_id.unwrap_or_else(uuid::Uuid::now_v7).to_string(),
+                            utility_id: utility,
+                            currency,
+                            name,
+                            accept_provider_settings,
+                        })
+                        .await?,
+                    cli.json,
+                ),
+                Connections::Refresh { id } => {
+                    print(&client.connection_refresh(&id).await?, cli.json)
+                }
+                Connections::Resume { id } => {
+                    print(&client.connection_resume(&id).await?, cli.json)
+                }
+                Connections::Authorize { id } => {
+                    print(&client.connection_authorization(&id).await?, cli.json)
+                }
+                Connections::Bind {
+                    id,
+                    account,
+                    meters,
+                } => print(
+                    &client
+                        .connection_bind(
+                            &id,
+                            &BindConnection {
+                                accounts: vec![ConnectionSelection { account, meters }],
+                            },
+                        )
+                        .await?,
+                    cli.json,
+                ),
             }
-            Connections::Bind {
-                id,
-                account,
-                meters,
-            } => print(
-                &client
-                    .connection_bind(
-                        &id,
-                        &BindConnection {
-                            accounts: vec![ConnectionSelection { account, meters }],
-                        },
-                    )
-                    .await?,
-                cli.json,
-            ),
-        },
+        }
     }
 }
 #[tokio::main]
