@@ -1,6 +1,6 @@
 [package]
 name = "ha-utilities"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2024"
 license = "MIT"
 description = "Read-only utility billing, collections, and usage for Home Assistant"
@@ -22,7 +22,7 @@ base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] }
 getrandom = "0.4"
-ha-app-ui = { git = "https://github.com/jessfraz/ha-app-kit", tag = "v0.1.2" }
+ha-app-ui = { git = "https://github.com/jessfraz/ha-app-kit", tag = "v0.1.3" }
 http = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 rust_decimal = { version = "1", features = ["serde-with-str"] }
@@ -42,4 +42,5 @@ url = "2"
 uuid = { version = "1", features = ["serde", "v7"] }
 
 [dev-dependencies]
+ha-app-kit-ha = { git = "https://github.com/jessfraz/ha-app-kit", tag = "v0.1.3" }
 tempfile = "3"

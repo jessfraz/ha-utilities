@@ -22,16 +22,13 @@ jobs:
         env:
           TAG: ${{ github.ref_name }}
         run: |
+          python3 scripts/build-integration --output dist
           python3 - <<'PY'
-          import hashlib, json, os, pathlib, tomllib, zipfile
+          import hashlib, json, os, pathlib, tomllib
           root = pathlib.Path('custom_components/utilities')
           version = tomllib.loads(pathlib.Path('Cargo.toml').read_text())['package']['version']
           assert os.environ['TAG'] == f'v{version}'
           assert json.loads((root / 'manifest.json').read_text())['version'] == version
-          with zipfile.ZipFile('dist/utilities.zip', 'w', zipfile.ZIP_DEFLATED) as archive:
-              for path in sorted(root.rglob('*')):
-                  if path.is_file() and '__pycache__' not in path.parts and path.suffix != '.pyc':
-                      archive.write(path, path.relative_to(root))
           files = [path for path in pathlib.Path('dist').iterdir() if path.is_file()]
           pathlib.Path('dist/SHA256SUMS').write_text(''.join(
               f'{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}\n' for path in sorted(files)

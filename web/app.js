@@ -149,7 +149,7 @@ function accountsFor(capability) {
 }
 
 class ApiError extends Error {
-  constructor(status) {
+  constructor(status, code) {
     super(status === 401 ? 'This session has expired. Sign in again to refresh saved data.'
       : status === 403 ? 'This user does not have permission for this action.'
       : status === 404 ? 'This record is no longer available.'
@@ -159,6 +159,7 @@ class ApiError extends Error {
       : 'Utilities could not load this data. Previously saved records have not changed.');
     this.name = 'ApiError';
     this.status = status;
+    this.code = code;
   }
 }
 
@@ -174,7 +175,18 @@ async function api(path, { signal, body } = {}) {
     if (error.name === 'AbortError') throw error;
     throw new ApiError(0);
   }
-  if (!response.ok) throw new ApiError(response.status);
+  if (!response.ok) {
+    let code;
+    if (response.status === 503) {
+      try {
+        const payload = await response.json();
+        if (typeof payload?.error_code === 'string') code = payload.error_code;
+      } catch (error) {
+        if (error.name === 'AbortError') throw error;
+      }
+    }
+    throw new ApiError(response.status, code);
+  }
   try { return await response.json(); }
   catch { throw new ApiError(502); }
 }

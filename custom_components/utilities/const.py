@@ -1,6 +1,7 @@
 """Utilities adapter constants."""
 
 DOMAIN = "utilities"
+CONF_ADDON_SLUG = "addon_slug"
 CONF_BACKEND_URL = "backend_url"
 CONF_TOKEN = "token"
 MAX_REQUEST_BYTES = 4096

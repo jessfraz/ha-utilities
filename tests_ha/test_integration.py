@@ -9,6 +9,7 @@ from homeassistant.config_entries import SOURCE_USER, ConfigEntryState
 from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
 from homeassistant.helpers import issue_registry as ir
+from homeassistant.loader import async_get_integration
 from homeassistant.util import dt as dt_util
 from pytest_homeassistant.common import MockUser
 from pytest_homeassistant.typing import ClientSessionGenerator
@@ -120,6 +121,30 @@ async def test_coverage_repairs_never_report_current(
     assert registry.async_get_issue(DOMAIN, f"{entry.entry_id}_{issue}") is not None
     assert await hass.config_entries.async_unload(entry.entry_id)
     assert registry.async_get_issue(DOMAIN, f"{entry.entry_id}_{issue}") is None
+
+
+async def test_version_repair_waits_for_loaded_version_parity(
+    hass: HomeAssistant, entry: UtilitiesConfigEntry, backend: Backend
+) -> None:
+    registry = ir.async_get(hass)
+    issue_id = f"{entry.entry_id}_version_mismatch"
+    issue = registry.async_get_issue(DOMAIN, issue_id)
+    assert issue is not None and issue.is_fixable and issue.is_persistent
+    assert issue.config_entry_id == entry.entry_id
+
+    backend.responses["/v1/system"] = (503, b"{}", {})
+    await entry.runtime_data.async_refresh()
+    assert registry.async_get_issue(DOMAIN, issue_id) is not None
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    assert registry.async_get_issue(DOMAIN, issue_id) is not None
+
+    del backend.responses["/v1/system"]
+    integration = await async_get_integration(hass, DOMAIN)
+    backend.version = str(integration.version)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done(wait_background_tasks=True)
+    assert registry.async_get_issue(DOMAIN, issue_id) is None
 
 
 async def test_bridge_allows_reads_and_admin_sync_only(

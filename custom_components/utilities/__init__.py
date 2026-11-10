@@ -6,12 +6,13 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.typing import ConfigType
-from homeassistant.loader import async_get_integration
 
+from ._app_kit.repairs import VersionRepairs
 from .client import UtilitiesClient
 from .const import CONF_BACKEND_URL, CONF_TOKEN, DOMAIN
 from .coordinator import UtilitiesCoordinator
 from .http import UtilitiesView
+from .repairs import VERSION_REPAIR
 
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 PLATFORMS = [Platform.SENSOR, Platform.CALENDAR]
@@ -31,12 +32,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: UtilitiesConfigEntry) ->
         entry.data[CONF_BACKEND_URL],
         entry.data[CONF_TOKEN],
     )
-    integration = await async_get_integration(hass, DOMAIN)
-    coordinator = UtilitiesCoordinator(hass, entry, client, str(integration.version))
+    coordinator = UtilitiesCoordinator(hass, entry, client)
     await coordinator.async_config_entry_first_refresh()
     entry.runtime_data = coordinator
     entry.async_on_unload(coordinator.stop)
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    coordinator.version_repairs = VersionRepairs(hass, entry, VERSION_REPAIR)
+    coordinator.version_repairs.async_start()
     return True
 
 
