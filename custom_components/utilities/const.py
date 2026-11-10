@@ -1,0 +1,10 @@
+"""Utilities adapter constants."""
+
+DOMAIN = "utilities"
+CONF_BACKEND_URL = "backend_url"
+CONF_TOKEN = "token"
+MAX_REQUEST_BYTES = 4096
+MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+REQUEST_TIMEOUT_SECONDS = 30
+MAX_CALENDAR_ROWS = 2000
+MAX_USAGE_ROWS = 10000

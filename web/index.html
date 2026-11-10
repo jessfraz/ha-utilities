@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <meta name="color-scheme" content="light dark">
+    <title>Utilities</title>
+    <link rel="stylesheet" href="assets/shell.css">
+    <link rel="stylesheet" href="assets/app.css">
+    <script type="module" src="assets/app.js"></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+    <header id="header"></header>
+    <main id="main" tabindex="-1">
+      <nav class="view-switch" aria-label="Utilities views">
+        <button type="button" data-view="overview" aria-pressed="true">Overview</button>
+        <button type="button" data-view="bills" aria-pressed="false">Bills</button>
+        <button type="button" data-view="collections" aria-pressed="false">Collections</button>
+        <button type="button" data-view="usage" aria-pressed="false">Usage</button>
+        <button type="button" data-view="settings" aria-pressed="false">Settings</button>
+      </nav>
+      <div class="page-heading">
+        <div>
+          <h1 id="page-title">Overview</h1>
+          <p id="page-description" class="muted">Bills, collections, and meter data. In one place.</p>
+        </div>
+        <span class="badge" id="freshness-badge">Connecting</span>
+      </div>
+      <p id="notice" role="status" aria-live="polite" aria-atomic="true"></p>
+      <p id="error" class="notice error" role="alert" aria-atomic="true"></p>
+      <a id="sign-in-again" class="reconnect-link" href="login" hidden>Sign in again</a>
+      <button id="retry" type="button" class="quiet" hidden>Try again</button>
+      <div id="content" aria-busy="true"></div>
+    </main>
+    <footer id="footer"></footer>
+    <dialog id="bill-detail" aria-labelledby="bill-detail-title">
+      <div class="dialog-heading">
+        <h2 id="bill-detail-title">Bill details</h2>
+        <button type="button" id="close-detail" class="quiet" aria-label="Close bill details">Close</button>
+      </div>
+      <div id="bill-detail-content"></div>
+    </dialog>
+    <noscript><p class="notice">JavaScript is required to view Utilities. The CLI remains available.</p></noscript>
+  </body>
+</html>

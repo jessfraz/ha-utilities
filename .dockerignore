@@ -1,0 +1,11 @@
+.git
+.venv
+target
+local
+node_modules
+__pycache__
+.pytest_cache
+.ruff_cache
+*.sqlite3*
+dist
+config/local.toml

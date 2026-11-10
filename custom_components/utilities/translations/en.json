@@ -1,0 +1,96 @@
+{
+  "title": "Utilities",
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect Utilities",
+        "description": "Connect the local Utilities service. Provider accounts and credentials stay in its runtime configuration; this integration does not enroll or link accounts.",
+        "data": {
+          "backend_url": "Service URL",
+          "token": "Service credential"
+        }
+      },
+      "reauth_confirm": {
+        "title": "Reconnect Utilities",
+        "description": "Connect the local Utilities service. Provider accounts and credentials stay in its runtime configuration; this integration does not enroll or link accounts.",
+        "data": {
+          "backend_url": "Service URL",
+          "token": "Service credential"
+        }
+      },
+      "hassio_confirm": {
+        "title": "Connect Utilities app",
+        "description": "Connect the discovered local Utilities app. This does not link or enroll any utility provider account."
+      }
+    },
+    "error": {
+      "invalid_url": "Enter an HTTP or HTTPS origin without credentials, path, query, or fragment.",
+      "invalid_auth": "The Utilities service rejected its credential.",
+      "cannot_connect": "Cannot read the Utilities service. Check the URL, credential, and running app."
+    },
+    "abort": {
+      "single_instance_allowed": "Only one Utilities service can be connected.",
+      "reauth_successful": "The service credential was updated.",
+      "invalid_discovery": "The discovered Utilities service could not be verified.",
+      "cannot_connect": "Cannot verify the discovered Utilities service."
+    }
+  },
+  "entity": {
+    "sensor": {
+      "accounts": {
+        "name": "Accounts"
+      },
+      "bills": {
+        "name": "Bills"
+      },
+      "collections": {
+        "name": "Collections"
+      },
+      "usage_intervals": {
+        "name": "Usage intervals"
+      },
+      "last_synced_at": {
+        "name": "Last synchronized"
+      },
+      "data_status": {
+        "name": "Data status",
+        "state": {
+          "current": "Current",
+          "stale": "Stale",
+          "incomplete": "Incomplete"
+        }
+      }
+    },
+    "calendar": {
+      "collections": {
+        "name": "Collections"
+      }
+    }
+  },
+  "issues": {
+    "version_mismatch": {
+      "title": "Update the Utilities integration",
+      "description": "The Utilities app and integration versions differ. Install the matching integration release, then reload it."
+    },
+    "provider_credentials": {
+      "title": "Utility provider access is not configured",
+      "description": "Configure the approved provider credentials and explicit account/service bindings in the Utilities app. Public API documentation does not establish household eligibility. No accounts have been linked automatically."
+    },
+    "provider_auth": {
+      "title": "Utility provider access needs attention",
+      "description": "A provider rejected access. Review the provider connection in Utilities; do not assume an empty result means no bills or usage. No reauthentication or account-factor changes were attempted."
+    },
+    "coverage_incomplete": {
+      "title": "Utility coverage is incomplete",
+      "description": "Some utility data is unavailable or only partially read. Check Utilities Settings and its coverage reasons before relying on bills, collections, or usage."
+    },
+    "stale_data": {
+      "title": "Utility data is stale",
+      "description": "Utilities has no recent successful sync. Saved records remain historical data, not current provider state. Check provider coverage and request a sync when access is available."
+    },
+    "energy_statistics": {
+      "title": "Utility Energy statistics are incomplete",
+      "description": "Electricity intervals could not be appended safely. Energy import requires fresh, complete coverage, correct Wh or kWh units, and continuous complete hours. Daily totals, missing intervals, and other units are not converted into invented hourly usage."
+    }
+  }
+}

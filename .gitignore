@@ -1,0 +1,13 @@
+/target/
+/.venv/
+/.pytest_cache/
+/.ruff_cache/
+__pycache__/
+*.pyc
+*.sqlite3*
+/local/
+/config/local.toml
+/node_modules/
+/test-results/
+/playwright-report/
+/dist/

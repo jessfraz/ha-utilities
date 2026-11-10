@@ -1,0 +1,45 @@
+[package]
+name = "ha-utilities"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Read-only utility billing, collections, and usage for Home Assistant"
+repository = "https://github.com/jessfraz/ha-utilities"
+default-run = "utilities"
+
+[[bin]]
+name = "utilities"
+path = "src/main.rs"
+
+[[bin]]
+name = "ha-utilities"
+path = "src/bin/ha-utilities.rs"
+
+[dependencies]
+anyhow = "1"
+dropshot = "0.18"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive", "env"] }
+getrandom = "0.4"
+ha-app-ui = { path = "../ha-app-kit/packages/ui" }
+http = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+rust_decimal = { version = "1", features = ["serde-with-str"] }
+schemars = { version = "0.8", features = ["chrono", "uuid1"] }
+semver = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+slog = "2"
+# The registry release does not yet include the RUSTSEC-2026-0459 SQLite fix.
+sqlx = { version = "0.9", git = "https://github.com/transact-rs/sqlx", rev = "10462fa4414c6c7f1ed1d39bb31678e3b726878c", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros"] }
+subtle = "2"
+thiserror = "2"
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+toml = "1"
+url = "2"
+uuid = { version = "1", features = ["serde", "v7"] }
+
+[dev-dependencies]
+tempfile = "3"

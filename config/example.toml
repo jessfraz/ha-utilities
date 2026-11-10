@@ -1,0 +1,22 @@
+# Fictional, unconnected example. Provider credentials are runtime file paths.
+deployment = "demo"
+
+[[accounts]]
+id = "demo-wm"
+name = "Waste service"
+deployment = "demo"
+provider = "waste_management"
+customer_id = "900000001"
+provider_account = "900000001"
+currency = "USD"
+services = [{ id = "demo-waste", name = "Waste collection", provider_service = "demo-bin", kind = "waste" }]
+
+[[accounts]]
+id = "demo-energy"
+name = "Energy service"
+deployment = "demo"
+provider = "bayou"
+customer_id = "900000002"
+provider_account = "DEMO-ACCOUNT"
+currency = "USD"
+services = [{ id = "demo-electric", name = "Electricity", provider_service = "DEMO-METER", kind = "electricity" }]

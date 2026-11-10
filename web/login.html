@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <meta name="color-scheme" content="light dark">
+    <title>Sign in · Utilities</title>
+    <link rel="stylesheet" href="assets/shell.css">
+    <link rel="stylesheet" href="assets/app.css">
+    <script type="module" src="assets/login.js"></script>
+  </head>
+  <body>
+    <header id="header"></header>
+    <main class="login-main">
+      <section class="panel login-panel" aria-labelledby="login-title">
+        <div class="panel-body">
+          <h1 id="login-title">Sign in to Utilities</h1>
+          <p class="muted">Use your Utilities API token. Home Assistant users can open the app from its sidebar.</p>
+          <p id="notice" role="status" aria-live="polite" aria-atomic="true"></p>
+          <p id="error" class="notice error" role="alert" aria-atomic="true"></p>
+          <form id="login-form">
+            <label>API token
+              <input type="password" name="token" id="token" autocomplete="current-password" maxlength="8192" required>
+            </label>
+            <button type="submit">Sign in</button>
+          </form>
+          <p class="login-note">The token is sent only to this server. A session cookie keeps this browser signed in; tokens never appear in URLs, local storage, or session storage.</p>
+        </div>
+      </section>
+    </main>
+    <footer id="footer"></footer>
+    <noscript><p class="notice">JavaScript is required to sign in. The CLI remains available.</p></noscript>
+  </body>
+</html>
