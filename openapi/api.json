@@ -2032,6 +2032,43 @@
       }
     },
     "/v1/sync": {
+      "get": {
+        "operationId": "sync_latest",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/SyncJob"
+                  },
+                  "title": "Array_of_SyncJob",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "successful operation",
+            "headers": {
+              "cache-control": {
+                "required": true,
+                "schema": {
+                  "type": "string"
+                },
+                "style": "simple"
+              }
+            }
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "tags": [
+          "sync"
+        ]
+      },
       "post": {
         "operationId": "sync_request",
         "requestBody": {

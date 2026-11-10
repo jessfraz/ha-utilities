@@ -68,7 +68,9 @@ let generation = 0;
 let viewController = null;
 let detailController = null;
 let syncTimer = null;
-let activeSync = null;
+let syncPollController = null;
+let syncJobs = [];
+let updateSyncForm = null;
 let loadController = null;
 const listState = new Map();
 const refresh = node('button', 'Refresh');
@@ -121,10 +123,22 @@ function money(value) {
   }
 }
 function count(value) { return new Intl.NumberFormat().format(value); }
+function dateInputValue(date) {
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+}
 function dateOffset(days) {
   const date = new Date();
   date.setDate(date.getDate() + days);
-  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+  return dateInputValue(date);
+}
+function defaultSyncDates() {
+  const today = new Date();
+  const from = new Date(today);
+  from.setDate(1);
+  from.setMonth(from.getMonth() - 3);
+  const lastDay = new Date(from.getFullYear(), from.getMonth() + 1, 0).getDate();
+  from.setDate(Math.min(today.getDate(), lastDay));
+  return [dateInputValue(from), dateInputValue(today)];
 }
 function badge(value, text = label(value)) {
   return node('span', text, `badge${['complete', 'completed'].includes(value) ? ' good' : ['partial', 'unavailable', 'exception', 'failed', 'interrupted'].includes(value) ? ' attention' : ''}`);
@@ -260,16 +274,18 @@ async function load() {
   retry.hidden = true;
   showNotice(ready ? 'Refreshing local data…' : 'Connecting to Utilities…');
   try {
-    const [system, nextHealth, nextSummary, nextAccounts, nextProviders] = await Promise.all([
+    const [system, nextHealth, nextSummary, nextAccounts, nextProviders, nextJobs] = await Promise.all([
       api('v1/system', { signal: controller.signal }), api('health', { signal: controller.signal }),
       api('v1/summary', { signal: controller.signal }),
       allBindings('v1/accounts', controller.signal), allBindings('v1/providers', controller.signal),
+      api('v1/sync', { signal: controller.signal }),
     ]);
     if (controller.signal.aborted) return;
     accounts = nextAccounts;
     providers = nextProviders;
     summary = nextSummary;
     health = nextHealth;
+    syncJobs = nextJobs;
     if (!Array.isArray(summary.coverage) || !Array.isArray(health.coverage)) throw new ApiError(502);
     ready = true;
     signInAgain.hidden = true;
@@ -277,7 +293,7 @@ async function load() {
     updateFreshness();
     showNotice('');
     await renderView();
-    if (activeSync?.state === 'running') pollSync(activeSync.id);
+    pollSync();
   } catch (error) {
     if (error.name !== 'AbortError' && ready && !(error instanceof ApiError && [401, 403].includes(error.status))) markConnectionLost();
     showError(error);
@@ -452,7 +468,7 @@ async function renderOverview(signal, current) {
   }
   columns.append(collectionPanel);
   }
-  fragment.append(metrics, freshness, columns, coveragePanel(summary.coverage));
+  fragment.append(metrics, freshness, syncStatus(), columns, coveragePanel(summary.coverage));
   content.replaceChildren(fragment);
 }
 
@@ -700,17 +716,32 @@ function renderSettings() {
   body.append(node('p', 'Fetch bills, collections, and usage for one bound account. This only reads provider data. It cannot pay a bill, book a pickup, or change a service.', 'muted'));
   if (accounts.length) body.append(syncForm());
   else body.append(node('p', 'Sync is unavailable until an account is configured.', 'muted'));
+  body.append(syncStatus());
   sync.append(body);
   fragment.append(bindings, sync, coveragePanel(summary.coverage));
   content.replaceChildren(fragment);
+}
+
+function syncStatus() {
+  const status = node('div', undefined, 'sync-status');
+  status.id = 'sync-status';
+  status.setAttribute('role', 'status');
+  renderSyncStatus(status);
+  return status;
+}
+
+function renderSyncStatus(status) {
+  status.replaceChildren(...syncJobs.map((job) => node('p', syncDescription(job))));
+  status.hidden = syncJobs.length === 0;
 }
 
 function syncForm() {
   const wrapper = node('div');
   const form = node('form', undefined, 'sync-form');
   const account = selectField('Account to sync', 'account', [['', 'Choose an account'], ...accounts.map((item) => [item.id, item.name])], '', true);
-  const from = dateField('From', 'from', dateOffset(-30));
-  const to = dateField('To', 'to', dateOffset(0));
+  const [defaultFrom, defaultTo] = defaultSyncDates();
+  const from = dateField('From', 'from', defaultFrom);
+  const to = dateField('To', 'to', defaultTo);
   const submit = node('button', 'Sync account');
   submit.type = 'submit';
   form.append(account.field, from.field, to.field, submit);
@@ -719,66 +750,81 @@ function syncForm() {
   availability.setAttribute('role', 'status');
   availability.setAttribute('aria-live', 'polite');
   submit.setAttribute('aria-describedby', availability.id);
-  const status = node('p', '', 'sync-status');
-  status.id = 'sync-status';
-  status.setAttribute('role', 'status'); status.setAttribute('aria-live', 'polite');
-  if (activeSync) status.textContent = syncDescription(activeSync);
+  let submitting = false;
   function canSync() {
     const binding = accounts.find((item) => item.id === account.select.value);
     return !!binding && providers.some((provider) => provider.id === binding.provider && provider.configured);
   }
   function updateAvailability() {
     const binding = accounts.find((item) => item.id === account.select.value);
-    const running = activeSync?.state === 'running';
-    submit.disabled = running || !canSync();
-    availability.textContent = running ? 'A sync is already running. Wait for it to finish.'
+    const running = syncJobs.some((job) => job.account_id === binding?.id && job.state === 'running');
+    submit.disabled = submitting || running || !canSync();
+    availability.textContent = submitting ? 'Starting sync…' : running ? 'This account is already syncing.'
       : !binding ? 'Choose an account to sync.'
       : !canSync() ? `${label(binding.provider)} credentials are not configured.` : '';
   }
   account.select.addEventListener('change', updateAvailability);
+  updateSyncForm = updateAvailability;
   updateAvailability();
   from.input.addEventListener('input', () => setDateValidity(from.input, to.input));
   to.input.addEventListener('input', () => setDateValidity(from.input, to.input));
   form.addEventListener('submit', async (event) => {
     event.preventDefault();
     setDateValidity(from.input, to.input);
-    if (!form.reportValidity() || activeSync?.state === 'running' || !canSync()) return;
-    submit.disabled = true;
-    status.textContent = 'Requesting a read-only sync…';
+    if (!form.reportValidity() || submit.disabled || !canSync()) return;
+    submitting = true;
+    updateAvailability();
     showNotice(''); retry.hidden = true;
     try {
-      activeSync = await api('v1/sync', { body: { account: account.select.value, from: from.input.value, to: to.input.value } });
-      status.textContent = syncDescription(activeSync);
-      pollSync(activeSync.id);
+      const job = await api('v1/sync', { body: { account: account.select.value, from: from.input.value, to: to.input.value } });
+      syncJobs = [...syncJobs.filter((item) => item.account_id !== job.account_id), job];
+      const status = byId('sync-status');
+      if (status) renderSyncStatus(status);
+      pollSync();
     } catch (error) {
-      status.textContent = 'The sync request could not be confirmed. No automatic retry was sent.';
-      showError(error); updateAvailability();
+      showError(error);
+    } finally {
+      submitting = false;
+      updateAvailability();
     }
   });
-  wrapper.append(form, availability, status);
+  wrapper.append(form, availability);
   return wrapper;
 }
 function syncDescription(job) {
+  if (job.state === 'running') return `Syncing ${accountName(job.account_id)}…`;
   const state = job.state === 'complete' ? 'Sync complete' : job.state === 'partial' ? 'Sync finished with coverage gaps' : label(job.state);
   const records = `${count(job.observations)} saved ${job.observations === 1 ? 'observation' : 'observations'}`;
   return `${state} · ${accountName(job.account_id)} · ${records}${job.error ? '. Check provider coverage and configuration.' : '.'}`;
 }
-function pollSync(id) {
+function pollSync() {
   clearTimeout(syncTimer);
+  syncPollController?.abort();
+  if (!syncJobs.some((job) => job.state === 'running')) return;
   syncTimer = setTimeout(async () => {
+    const controller = new AbortController();
+    syncPollController = controller;
     try {
-      activeSync = await api(`v1/sync/${encodeURIComponent(id)}`);
+      const next = await api('v1/sync', { signal: controller.signal });
+      if (controller.signal.aborted) return;
+      const completed = syncJobs.some((job) => job.state === 'running' && next.some((item) => item.id === job.id && item.state !== 'running'));
+      syncJobs = next;
       const status = byId('sync-status');
-      if (status) status.textContent = syncDescription(activeSync);
-      if (activeSync.state === 'running') pollSync(id);
-      else {
-        const [nextSummary, nextHealth] = await Promise.all([api('v1/summary'), api('health')]);
+      if (status) renderSyncStatus(status);
+      if (view === 'settings') updateSyncForm?.();
+      if (completed) {
+        const options = { signal: controller.signal };
+        const [nextSummary, nextHealth] = await Promise.all([api('v1/summary', options), api('health', options)]);
+        if (controller.signal.aborted) return;
         summary = nextSummary; health = nextHealth; updateFreshness();
-        await renderView();
+        if (view === 'settings') document.querySelector('.coverage-panel')?.replaceWith(coveragePanel(summary.coverage));
+        else await renderView();
       }
+      pollSync();
     } catch (error) {
+      if (controller.signal.aborted) return;
       const status = byId('sync-status');
-      if (status) status.textContent = 'Sync status could not be checked. The request may still be running; no second sync was sent.';
+      if (status) status.textContent = 'Sync status could not be checked. The sync may still be running.';
       showError(error);
     }
   }, 1500);
