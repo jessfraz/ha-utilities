@@ -132,7 +132,8 @@ check_state() {
         echo "Expected server uid10001, got $uid" >&2
         return 1
     fi
-    jq --exit-status '.name == "Utilities" and .read_only_providers == true' \
+    jq --exit-status '.name == "Utilities" and .read_only_providers == false and
+        .read_only_sync == true and .hosted_connections == true' \
         "$scratch/system.json" >/dev/null
     request /v1/summary
     jq --exit-status '.accounts == 2 and .bills == 70 and .collections == 5 and .usage_intervals == 72' \
