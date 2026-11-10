@@ -31,12 +31,6 @@ impl Adapter {
             Self::Bayou(adapter) => adapter.sync(request).await,
         }
     }
-    fn capabilities(&self) -> &'static [Capability] {
-        match self {
-            Self::Wm(adapter) => adapter.capabilities(),
-            Self::Bayou(adapter) => adapter.capabilities(),
-        }
-    }
 }
 
 pub struct Providers {
@@ -45,26 +39,67 @@ pub struct Providers {
 }
 impl Providers {
     pub fn new(config: &Config) -> anyhow::Result<Self> {
-        Ok(Self {
-            wm: config
-                .wm
-                .as_ref()
-                .map(WasteManagement::new)
-                .transpose()?
-                .map(Adapter::Wm),
-            bayou: config
-                .bayou
-                .as_ref()
-                .map(Bayou::new)
-                .transpose()?
-                .map(Adapter::Bayou),
-        })
+        Ok(Self::with_clients(
+            config.wm.as_ref().map(WasteManagement::new).transpose()?,
+            config.bayou.as_ref().map(Bayou::new).transpose()?,
+        ))
+    }
+    pub fn with_clients(wm: Option<WasteManagement>, bayou: Option<Bayou>) -> Self {
+        Self {
+            wm: wm.map(Adapter::Wm),
+            bayou: bayou.map(Adapter::Bayou),
+        }
     }
     fn get(&self, provider: ProviderId) -> Option<&Adapter> {
         match provider {
             ProviderId::WasteManagement => self.wm.as_ref(),
             ProviderId::Bayou => self.bayou.as_ref(),
         }
+    }
+    pub(crate) fn bayou(&self) -> Option<&Bayou> {
+        match self.bayou.as_ref() {
+            Some(Adapter::Bayou(provider)) => Some(provider),
+            _ => None,
+        }
+    }
+    pub(crate) fn initial_coverage(
+        &self,
+        binding: &crate::config::AccountBinding,
+    ) -> Vec<Coverage> {
+        let adapter = self.get(binding.provider);
+        let info = self.info();
+        ALL.iter()
+            .map(|capability| {
+                let supported = info
+                    .iter()
+                    .find(|provider| provider.id == binding.provider)
+                    .is_some_and(|provider| provider.capabilities.contains(capability));
+                Coverage {
+                    account_id: binding.id.clone(),
+                    capability: *capability,
+                    state: if !supported {
+                        CoverageState::Unsupported
+                    } else if adapter.is_none() {
+                        CoverageState::NotConfigured
+                    } else {
+                        CoverageState::Unavailable
+                    },
+                    reason: Some(
+                        if !supported {
+                            "provider_not_supported"
+                        } else if adapter.is_none() {
+                            "credentials_not_configured"
+                        } else {
+                            "not_synced"
+                        }
+                        .to_owned(),
+                    ),
+                    checked_at: Utc::now(),
+                    from: None,
+                    to: None,
+                }
+            })
+            .collect()
     }
     pub fn info(&self) -> Vec<ProviderInfo> {
         [ProviderId::WasteManagement, ProviderId::Bayou]
@@ -77,20 +112,10 @@ impl Providers {
                 }
                 .to_owned(),
                 capabilities: match id {
-                    ProviderId::WasteManagement => vec![
-                        Capability::Bills,
-                        Capability::Balances,
-                        Capability::Payments,
-                        Capability::Services,
-                        Capability::Collections,
-                    ],
-                    ProviderId::Bayou => vec![
-                        Capability::Bills,
-                        Capability::Balances,
-                        Capability::Services,
-                        Capability::Usage,
-                    ],
-                },
+                    ProviderId::WasteManagement => crate::utility::waste_management::CAPABILITIES,
+                    ProviderId::Bayou => crate::utility::bayou::CAPABILITIES,
+                }
+                .to_vec(),
                 configured: self.get(id).is_some(),
             })
             .collect()
@@ -105,12 +130,19 @@ pub struct SyncHandle {
 }
 impl SyncHandle {
     pub async fn request(&self, input: SyncInput) -> Result<SyncJob, StoreError> {
-        if input.from > input.to
-            || input.to.signed_duration_since(input.from).num_days() > 366
-            || !self.config.accounts.iter().any(|a| a.id == input.account)
-        {
+        if input.from > input.to || input.to.signed_duration_since(input.from).num_days() > 366 {
             return Err(StoreError::InvalidQuery);
         }
+        self.store
+            .binding(&self.config.deployment, &input.account)
+            .await
+            .map_err(|error| {
+                if matches!(error, StoreError::NotFound) {
+                    StoreError::InvalidQuery
+                } else {
+                    error
+                }
+            })?;
         let job = self.store.start_job(&input.account).await?;
         if self.sender.try_send((job.clone(), input)).is_err() {
             self.store
@@ -142,48 +174,17 @@ impl SyncWorker {
         store.recover_interrupted().await?;
         let existing = store.coverage().await?;
         let mut initial = Vec::new();
-        for account in &config.accounts {
-            for capability in ALL {
-                let adapter = providers.get(account.provider);
-                let supported = adapter
-                    .map(|a| a.capabilities().contains(capability))
-                    .unwrap_or_else(|| {
-                        providers
-                            .info()
-                            .iter()
-                            .find(|p| p.id == account.provider)
-                            .is_some_and(|p| p.capabilities.contains(capability))
-                    });
-                if !supported
-                    || adapter.is_none()
-                    || !existing
-                        .iter()
-                        .any(|c| c.account_id == account.id && c.capability == *capability)
+        let bindings = store.bindings(&config.deployment).await?;
+        for account in &bindings {
+            for coverage in providers.initial_coverage(account) {
+                if matches!(
+                    coverage.state,
+                    CoverageState::Unsupported | CoverageState::NotConfigured
+                ) || !existing
+                    .iter()
+                    .any(|c| c.account_id == account.id && c.capability == coverage.capability)
                 {
-                    initial.push(Coverage {
-                        account_id: account.id.clone(),
-                        capability: *capability,
-                        state: if !supported {
-                            CoverageState::Unsupported
-                        } else if adapter.is_none() {
-                            CoverageState::NotConfigured
-                        } else {
-                            CoverageState::Unavailable
-                        },
-                        reason: Some(
-                            if !supported {
-                                "provider_not_supported"
-                            } else if adapter.is_none() {
-                                "credentials_not_configured"
-                            } else {
-                                "not_synced"
-                            }
-                            .to_owned(),
-                        ),
-                        checked_at: Utc::now(),
-                        from: None,
-                        to: None,
-                    });
+                    initial.push(coverage);
                 }
             }
         }
@@ -229,11 +230,10 @@ impl SyncWorker {
 
     async fn execute(&self, job: &SyncJob, input: &SyncInput) -> Result<(), &'static str> {
         let binding = self
-            .config
-            .accounts
-            .iter()
-            .find(|a| a.id == input.account)
-            .ok_or("binding_mismatch")?;
+            .store
+            .binding(&self.config.deployment, &input.account)
+            .await
+            .map_err(|_| "binding_mismatch")?;
         let adapter = self
             .providers
             .get(binding.provider)
@@ -272,7 +272,7 @@ impl SyncWorker {
                 ) && c.reason.as_deref() != Some("sync_in_progress")
             });
             self.store
-                .ingest_job(binding, &page, &job.id)
+                .ingest_job(&binding, &page, &job.id)
                 .await
                 .map_err(|_| "ingest_rejected")?;
             match page.continuation {
@@ -310,11 +310,9 @@ impl SyncWorker {
 
     async fn fail(&self, job: &SyncJob, reason: &str, interrupted: bool) -> Result<(), StoreError> {
         let account = self
-            .config
-            .accounts
-            .iter()
-            .find(|a| a.id == job.account_id)
-            .ok_or(StoreError::InvalidObservation)?;
+            .store
+            .binding(&self.config.deployment, &job.account_id)
+            .await?;
         let capabilities = self
             .providers
             .info()
@@ -497,7 +495,7 @@ mod tests {
     }
 
     impl WorkerFixture {
-        async fn start(later: LaterPage) -> Self {
+        async fn start(later: LaterPage, hosted: bool) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let endpoint = url::Url::parse(&format!(
                 "http://{}/api/v2/",
@@ -592,6 +590,41 @@ mod tests {
                 .await
                 .unwrap();
             store.register(&config).await.unwrap();
+            let config = if hosted {
+                let mut current = (*config).clone();
+                let binding = current.accounts.remove(0);
+                store.register(&current).await.unwrap();
+                let input = crate::models::CreateConnection {
+                    provider: crate::models::ConnectionProvider::Bayou,
+                    request_id: uuid::Uuid::now_v7().to_string(),
+                    utility_id: "speculoos_power".into(),
+                    name: None,
+                    currency: "USD".into(),
+                    accept_provider_settings: true,
+                };
+                let (record, _) = store
+                    .create_connection(DEPLOYMENT, &input, "Speculoos Power")
+                    .await
+                    .unwrap();
+                let mut progress = record.connection.progress.clone();
+                progress.customer_id = Some("71001".into());
+                progress.state = crate::models::ConnectionState::Ready;
+                store
+                    .save_connection_progress(DEPLOYMENT, &record, &progress, true)
+                    .await
+                    .unwrap();
+                let record = store
+                    .connection(DEPLOYMENT, &record.connection.id)
+                    .await
+                    .unwrap();
+                store
+                    .bind_connection(&current, &record, &[binding], &[])
+                    .await
+                    .unwrap();
+                Arc::new(current)
+            } else {
+                config
+            };
             let (handle, worker) =
                 SyncWorker::new(store.clone(), config.clone(), providers.clone())
                     .await
@@ -674,7 +707,7 @@ mod tests {
 
     #[tokio::test]
     async fn committed_page_count_survives_later_authentication_failure() {
-        let mut fixture = WorkerFixture::start(LaterPage::AuthenticationFailure).await;
+        let mut fixture = WorkerFixture::start(LaterPage::AuthenticationFailure, false).await;
         let job = fixture.request().await;
         let result = fixture.terminal_job(&job.id).await;
         fixture.assert_saved_bill().await;
@@ -687,7 +720,7 @@ mod tests {
 
     #[tokio::test]
     async fn graceful_shutdown_preserves_committed_page_progress() {
-        let mut fixture = WorkerFixture::start(LaterPage::Pending).await;
+        let mut fixture = WorkerFixture::start(LaterPage::Pending, false).await;
         let job = fixture.request().await;
         fixture.await_later_page().await;
         fixture.assert_saved_bill().await;
@@ -700,7 +733,7 @@ mod tests {
 
     #[tokio::test]
     async fn restart_recovers_committed_page_progress_after_worker_loss() {
-        let mut fixture = WorkerFixture::start(LaterPage::Pending).await;
+        let mut fixture = WorkerFixture::start(LaterPage::Pending, false).await;
         let job = fixture.request().await;
         fixture.await_later_page().await;
         fixture.assert_saved_bill().await;
@@ -728,7 +761,7 @@ mod tests {
 
     #[tokio::test]
     async fn successful_paged_sync_finishes_with_durable_processed_count() {
-        let mut fixture = WorkerFixture::start(LaterPage::Success).await;
+        let mut fixture = WorkerFixture::start(LaterPage::Success, false).await;
         let job = fixture.request().await;
         let result = fixture.terminal_job(&job.id).await;
         fixture.assert_saved_bill().await;
@@ -736,6 +769,28 @@ mod tests {
         assert!(result.error.is_none());
         // The second, empty billing page still validates its Service.
         assert_eq!(result.observations, 3);
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn hosted_account_failure_finishes_durably_and_keeps_accepting_jobs() {
+        let mut fixture = WorkerFixture::start(LaterPage::AuthenticationFailure, true).await;
+        assert!(fixture.config.accounts.is_empty());
+        assert_eq!(fixture.store.bindings(DEPLOYMENT).await.unwrap().len(), 1);
+        let job = fixture.request().await;
+        let failed = fixture.terminal_job(&job.id).await;
+        assert_eq!(failed.state, SyncState::Failed);
+        assert_eq!(failed.error.as_deref(), Some("authentication_required"));
+        assert_eq!(failed.observations, 2);
+        fixture.assert_saved_bill().await;
+        let coverage = fixture.store.coverage().await.unwrap();
+        assert!(coverage.iter().any(|item| item.account_id == ACCOUNT
+            && item.reason.as_deref() == Some("authentication_required")));
+        let next = fixture.request().await;
+        assert_ne!(job.id, next.id);
+        let next = fixture.terminal_job(&next.id).await;
+        assert_eq!(next.state, SyncState::Failed);
+        assert_eq!(next.error.as_deref(), Some("authentication_required"));
         fixture.shutdown().await;
     }
 }

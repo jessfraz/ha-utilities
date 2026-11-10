@@ -1,4 +1,4 @@
-//! Explicit deployment/account/service bindings. No account discovery or enrollment.
+//! Manual deployment/account/service bindings and private provider credentials.
 use crate::models::{Account, ProviderId, Service, ServiceKind};
 use serde::{Deserialize, Serialize};
 use std::{

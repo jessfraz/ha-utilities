@@ -6,9 +6,16 @@ the reconciled local read model used by the dashboard, CLI, and Assist.
 
 ## Run
 
-In Home Assistant, use the app's Configuration options for explicit account,
-service, deployment, and currency bindings, plus the WM/Bayou password fields.
-No file editor or SSH is needed. Native installations can use
+In Home Assistant, add the Bayou API key in the app's Configuration options,
+then open **Settings → Connect utility**. Choose the utility, review the Bayou
+workspace's data and billing settings, and sign in on Bayou's hosted page.
+Return to select the accounts and meters for this deployment. Setup and
+selected bindings are saved in SQLite. Utility passwords stay with Bayou.
+Bills cover the whole selected utility account. Meter selection limits usage
+intervals, not account bill totals or Bayou's workspace charges.
+
+Waste Management uses explicit account and service bindings and its WM-issued
+token and ClientId. Native installations can use
 [the fictional TOML example](config/example.toml) with runtime credential-file
 paths. Keep credentials in 1Password and runtime storage, never source control.
 
@@ -33,10 +40,39 @@ Add this repository to the HA app store and install the bundled
 sensors, guarded Energy statistics, redacted diagnostics, Repairs, and
 explicitly exposed read-only Assist tools. Native HA cold backups own recovery.
 
-[Provider contracts and limits](PROVIDERS.md) explain coverage. No payment,
-booking, account enrollment, or utility-account modification exists here.
+[Provider contracts and limits](PROVIDERS.md) explain coverage. Sync only reads
+data. Hosted setup creates a Bayou customer after explicit consent; it does not
+open a new utility account, pay bills, or book collections.
 Provider access is not established merely by installing this app. Empty,
 partial, unavailable, and stale data remain distinguishable.
+
+## Connect from the CLI
+
+```sh
+ha-utilities connections utilities
+ha-utilities connections start --utility speculoos_power --name Electricity --accept-provider-settings
+ha-utilities connections list
+ha-utilities connections authorize CONNECTION_ID
+ha-utilities connections refresh CONNECTION_ID
+ha-utilities connections bind CONNECTION_ID --account PROVIDER_ACCOUNT --meter PROVIDER_METER
+```
+
+`speculoos_power` is Bayou's fictional utility. Choose a real ID from
+`connections utilities`. `authorize` returns a private, temporary sign-in URL;
+open it locally and keep it out of logs. Setup does not select accounts or
+meters automatically. Use `--meter` more than once for multiple meters.
+
+If `start` cannot confirm its result, its error includes `request_id`. Retry
+with the same `--request-id`, or use `connections list` to find saved setup.
+`connections resume CONNECTION_ID` checks an interrupted request before
+continuing. Restarting the app does not blindly repeat an uncertain create.
+
+`GET /v1/providers/bayou/utilities` lists supported utilities.
+`GET /v1/connections` lists saved setup; `POST /v1/connections` starts it.
+`GET /v1/connections/{id}` reads one connection. A saved connection has
+`refresh`, `resume`, and `bind` POST actions and an explicit `authorization`
+GET action. The Home Assistant bridge requires an administrator for connection
+setup and temporary links. Ordinary read-only Assist tools cannot create them.
 
 ## Develop
 

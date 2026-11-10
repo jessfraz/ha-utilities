@@ -26,6 +26,19 @@ def record(value: object) -> dict[str, object]:
     return value
 
 
+def valid_system(value: object) -> bool:
+    """Accept read-only sync with separately advertised hosted connection setup."""
+    row = record(value)
+    return row.get("name") == "Utilities" and (
+        row.get("read_only_providers") is True
+        or (
+            row.get("read_only_providers") is False
+            and row.get("read_only_sync") is True
+            and row.get("hosted_connections") is True
+        )
+    )
+
+
 def json_value(value: object, depth: int = 0) -> JsonValueType:
     """Narrow decoded JSON at the Assist boundary without unchecked casts."""
     if depth > 32:

@@ -13,7 +13,7 @@ use serde::{Deserialize, de::DeserializeOwned};
 use std::{collections::HashMap, str::FromStr, time::Duration};
 use url::Url;
 
-const CAPABILITIES: &[Capability] = &[
+pub(crate) const CAPABILITIES: &[Capability] = &[
     Capability::Bills,
     Capability::Balances,
     Capability::Payments,

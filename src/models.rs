@@ -50,6 +50,141 @@ pub struct Account {
 }
 
 #[derive(JsonSchema, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ConnectableUtility {
+    pub id: String,
+    pub name: String,
+    pub support: String,
+}
+
+#[derive(JsonSchema, Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectionProvider {
+    Bayou,
+}
+
+#[derive(JsonSchema, Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectionState {
+    #[default]
+    Queued,
+    Creating,
+    Unconfirmed,
+    AwaitingAuthorization,
+    Authenticating,
+    Discovering,
+    Ready,
+    Connected,
+    NeedsAuthentication,
+    Unavailable,
+}
+
+#[derive(JsonSchema, Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectionAuthStatus {
+    Authenticated,
+    OnboardingCredentialsNeeded,
+    OnboardingMfaNeeded,
+    OnboardingReauthNeeded,
+    OnboardingCustomerActionRequired,
+    OnboardingAuthIssue,
+    RefreshMfaNeeded,
+    RefreshReauthNeeded,
+    RefreshCustomerActionRequired,
+    RefreshAuthIssue,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(JsonSchema, Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectionIssue {
+    AuthenticationRequired,
+    AccessDenied,
+    RateLimited,
+    ProviderUnavailable,
+    InvalidResponse,
+    CustomerNotFound,
+    ProcessInterrupted,
+}
+
+#[derive(JsonSchema, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ConnectionMeter {
+    pub id: String,
+    pub kind: ServiceKind,
+}
+
+#[derive(JsonSchema, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ConnectionAccount {
+    pub id: String,
+    pub meters: Vec<ConnectionMeter>,
+}
+
+#[derive(JsonSchema, Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ConnectionProgress {
+    pub state: ConnectionState,
+    pub customer_id: Option<String>,
+    pub auth_status: Option<ConnectionAuthStatus>,
+    pub has_filled_credentials: bool,
+    pub bills_ready: bool,
+    pub intervals_ready: bool,
+    pub accounts: Vec<ConnectionAccount>,
+    pub linked_account_ids: Vec<String>,
+    pub issue: Option<ConnectionIssue>,
+}
+
+#[derive(JsonSchema, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct Connection {
+    pub id: String,
+    pub provider: ConnectionProvider,
+    pub request_id: String,
+    pub utility_id: String,
+    pub utility_name: String,
+    pub name: String,
+    pub currency: String,
+    #[serde(flatten)]
+    pub progress: ConnectionProgress,
+    pub provider_settings_accepted_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub checked_at: Option<DateTime<Utc>>,
+}
+
+#[derive(JsonSchema, Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateConnection {
+    pub provider: ConnectionProvider,
+    pub request_id: String,
+    pub utility_id: String,
+    pub name: Option<String>,
+    pub currency: String,
+    pub accept_provider_settings: bool,
+}
+
+#[derive(JsonSchema, Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConnectionSelection {
+    pub account: String,
+    pub meters: Vec<String>,
+}
+
+#[derive(JsonSchema, Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BindConnection {
+    pub accounts: Vec<ConnectionSelection>,
+}
+
+#[derive(JsonSchema, Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConnectionAction {}
+
+// The hosted link is a temporary authorization credential. It is returned only
+// on request, never included in diagnostics, database state, or ordinary status.
+#[derive(JsonSchema, Deserialize, Serialize)]
+pub struct ConnectionAuthorization {
+    pub url: String,
+}
+
+#[derive(JsonSchema, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Service {
     pub id: String,
     pub name: String,
@@ -71,6 +206,7 @@ pub struct Bill {
     pub due_on: Option<NaiveDate>,
     pub period_from: Option<NaiveDate>,
     pub period_to: Option<NaiveDate>,
+    /// The whole provider account bill, including meters not selected for usage.
     pub total: Money,
     pub outstanding_balance: Option<Money>,
     /// Source status only. Absence of a balance does not mean paid.
@@ -220,6 +356,10 @@ pub struct System {
     pub name: String,
     pub version: String,
     pub read_only_providers: bool,
+    #[serde(default)]
+    pub read_only_sync: bool,
+    #[serde(default)]
+    pub hosted_connections: bool,
 }
 
 #[derive(JsonSchema, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]

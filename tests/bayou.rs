@@ -375,6 +375,61 @@ async fn sync_all(adapter: &Bayou, mut request: SyncRequest) -> Vec<SyncPage> {
 }
 
 #[tokio::test]
+async fn selected_meter_usage_keeps_combined_account_bill_totals() {
+    let fixture = Fixture::new(|request| {
+        if request.url.path() == "/api/v2/customers/71001" {
+            let mut value = customer();
+            value
+                .account_numbers
+                .iter_mut()
+                .find(|account| account.id == ACCOUNT_ID)
+                .unwrap()
+                .meters
+                .push(Meter {
+                    id: "same-account-gas",
+                    kind: "gas",
+                });
+            Reply::ok(serde_json::to_string(&value).unwrap())
+        } else if request.url.path() == "/api/v2/customers/71001/bills"
+            && request
+                .url
+                .query_pairs()
+                .any(|(key, value)| key == "start" && value == "2026-10-01")
+        {
+            let mut value = bill();
+            value.meters.push(Meter {
+                id: "same-account-gas",
+                kind: "gas",
+            });
+            Reply::ok(serde_json::to_string(&vec![value]).unwrap())
+        } else {
+            default_reply(request)
+        }
+    })
+    .await;
+    let pages = sync_all(&fixture.adapter(), request("2026-10-01", "2026-10-02")).await;
+    let observations = pages
+        .into_iter()
+        .flat_map(|page| page.observations)
+        .collect::<Vec<_>>();
+    let totals = observations
+        .iter()
+        .filter_map(|value| match value {
+            Observation::Bill(bill) => Some(bill.total.minor_units),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(totals, vec![12050]);
+    assert!(observations.iter().any(
+        |value| matches!(value,Observation::Usage(usage) if usage.service_id=="demo-electric")
+    ));
+    assert!(!observations.iter().any(
+        |value| matches!(value,Observation::Service(service) if service.kind==ServiceKind::Gas)
+    ));
+    fixture.assert_read_only_auth();
+}
+
+#[tokio::test]
 async fn sync_pages_scope_accounts_preserve_bill_meaning_and_reconcile_interval_windows() {
     let fixture = Fixture::new(default_reply).await;
     let adapter = fixture.adapter();

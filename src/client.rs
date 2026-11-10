@@ -20,6 +20,8 @@ pub struct ClientError {
     pub error: &'static str,
     pub message: String,
     pub status: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
 }
 impl ClientError {
     pub fn new(error: &'static str, status: Option<u16>) -> Self {
@@ -27,6 +29,7 @@ impl ClientError {
             error,
             message: error.replace('_', " "),
             status,
+            request_id: None,
         }
     }
 }
@@ -124,6 +127,9 @@ impl Client {
         url: Url,
         body: Option<Vec<u8>>,
     ) -> Result<T, ClientError> {
+        let connection_request = url
+            .path_segments()
+            .is_some_and(|segments| segments.into_iter().any(|segment| segment == "connections"));
         let mut builder = self
             .http
             .request(method, url)
@@ -142,10 +148,11 @@ impl Client {
         if !status.is_success() {
             return Err(ClientError::new(
                 match status.as_u16() {
-                    400 => "invalid_request",
+                    400 | 422 => "invalid_request",
                     401 => "authentication_required",
                     403 => "access_denied",
                     404 => "not_found",
+                    409 if connection_request => "connection_changed",
                     409 => "sync_busy",
                     429 => "rate_limited",
                     _ => "service_error",
@@ -216,5 +223,109 @@ impl Client {
     }
     pub async fn sync_get(&self, id: &str) -> Result<SyncJob, ClientError> {
         self.get("sync", Some(id), None).await
+    }
+
+    pub async fn connection_utilities(&self) -> Result<Page<ConnectableUtility>, ClientError> {
+        let mut url = self.endpoint("providers", Some("bayou"), None)?;
+        url.path_segments_mut()
+            .map_err(|_| ClientError::new("invalid_url", None))?
+            .push("utilities");
+        self.request(Method::GET, url, None).await
+    }
+
+    pub async fn connections(&self) -> Result<Page<Connection>, ClientError> {
+        self.get("connections", None, None).await
+    }
+
+    fn connection_endpoint(&self, id: &str, action: Option<&str>) -> Result<Url, ClientError> {
+        let id = uuid::Uuid::parse_str(id)
+            .map_err(|_| ClientError::new("invalid_connection_id", None))?;
+        let mut url = self.endpoint("connections", Some(&id.to_string()), None)?;
+        if let Some(action) = action {
+            url.path_segments_mut()
+                .map_err(|_| ClientError::new("invalid_url", None))?
+                .push(action);
+        }
+        Ok(url)
+    }
+
+    pub async fn connection(&self, id: &str) -> Result<Connection, ClientError> {
+        self.request(Method::GET, self.connection_endpoint(id, None)?, None)
+            .await
+    }
+
+    pub async fn connection_start(
+        &self,
+        input: &CreateConnection,
+    ) -> Result<Connection, ClientError> {
+        let result = async {
+            if !self.system().await?.hosted_connections {
+                return Err(ClientError::new(
+                    "backend_does_not_support_connections",
+                    None,
+                ));
+            }
+            self.request(
+                Method::POST,
+                self.endpoint("connections", None, None)?,
+                Some(
+                    serde_json::to_vec(input)
+                        .map_err(|_| ClientError::new("invalid_request", None))?,
+                ),
+            )
+            .await
+        }
+        .await;
+        result.map_err(|mut error| {
+            error.request_id = uuid::Uuid::parse_str(&input.request_id)
+                .ok()
+                .map(|id| id.to_string());
+            error
+        })
+    }
+
+    async fn connection_action(&self, id: &str, action: &str) -> Result<Connection, ClientError> {
+        self.request(
+            Method::POST,
+            self.connection_endpoint(id, Some(action))?,
+            Some(
+                serde_json::to_vec(&ConnectionAction::default())
+                    .map_err(|_| ClientError::new("invalid_request", None))?,
+            ),
+        )
+        .await
+    }
+
+    pub async fn connection_refresh(&self, id: &str) -> Result<Connection, ClientError> {
+        self.connection_action(id, "refresh").await
+    }
+
+    pub async fn connection_resume(&self, id: &str) -> Result<Connection, ClientError> {
+        self.connection_action(id, "resume").await
+    }
+
+    pub async fn connection_authorization(
+        &self,
+        id: &str,
+    ) -> Result<ConnectionAuthorization, ClientError> {
+        self.request(
+            Method::GET,
+            self.connection_endpoint(id, Some("authorization"))?,
+            None,
+        )
+        .await
+    }
+
+    pub async fn connection_bind(
+        &self,
+        id: &str,
+        input: &BindConnection,
+    ) -> Result<Connection, ClientError> {
+        self.request(
+            Method::POST,
+            self.connection_endpoint(id, Some("bind"))?,
+            Some(serde_json::to_vec(input).map_err(|_| ClientError::new("invalid_request", None))?),
+        )
+        .await
     }
 }

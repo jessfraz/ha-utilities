@@ -2,6 +2,7 @@ use clap::Parser;
 use ha_utilities::{
     api,
     config::{Config, read_secret},
+    connect::ConnectionWorker,
     store::Store,
     sync::{Providers, SyncWorker},
 };
@@ -14,7 +15,7 @@ use std::{
 #[derive(Parser)]
 #[command(
     version,
-    about = "Utilities local service. Provider access is read-only."
+    about = "Utilities local service and hosted account connections."
 )]
 struct Options {
     #[arg(long)]
@@ -64,7 +65,16 @@ async fn main() -> anyhow::Result<()> {
     store.register(&config).await?;
     let (handle, worker) =
         SyncWorker::new(store.clone(), config.clone(), providers.clone()).await?;
-    let context = api::Context::new(store.clone(), config, providers, handle, &token);
+    let (connections, connection_worker) =
+        ConnectionWorker::new(store.clone(), config.clone(), providers.clone()).await?;
+    let context = api::Context::new(
+        store.clone(),
+        config,
+        providers,
+        handle,
+        connections,
+        &token,
+    );
     let server = api::start(options.bind, Arc::new(context.clone()))?;
     let ingress = options
         .ingress_bind
@@ -72,6 +82,7 @@ async fn main() -> anyhow::Result<()> {
         .transpose()?;
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
     let worker = tokio::spawn(worker.run(stop_rx.clone()));
+    let connection_worker = tokio::spawn(connection_worker.run(stop_rx.clone()));
     let discovery = if let Some(supervisor) =
         ha_utilities::supervisor::Supervisor::from_environment()?
     {
@@ -98,6 +109,7 @@ async fn main() -> anyhow::Result<()> {
     };
     let _ = stop_tx.send(true);
     let worker_result = worker.await;
+    let connection_result = connection_worker.await;
     let discovery_result = if let Some(task) = discovery {
         task.await
     } else {
@@ -107,6 +119,7 @@ async fn main() -> anyhow::Result<()> {
     api_closed.map_err(|_| anyhow::anyhow!("API shutdown failed"))?;
     ingress_closed?;
     worker_result??;
+    connection_result??;
     discovery_result?;
     Ok(())
 }

@@ -152,6 +152,98 @@ async def test_bridge_allows_reads_and_admin_sync_only(
     assert backend.requests[-1].path == "/health"
 
 
+async def test_hosted_connections_require_admin_even_for_the_authorization_link(
+    entry: UtilitiesConfigEntry,
+    backend: Backend,
+    hass_client: ClientSessionGenerator,
+    hass_user_token: str,
+) -> None:
+    user = await hass_client(hass_user_token)
+    admin = await hass_client()
+    identity = "01900000-0000-7000-8000-000000000001"
+    paths = [
+        "connections",
+        "providers/bayou/utilities",
+        f"connections/{identity}",
+        f"connections/{identity}/authorization",
+    ]
+    for path in paths:
+        backend.responses[f"/v1/{path}"] = (200, b"{}", {})
+        backend.requests.clear()
+        assert (await user.get(f"{PREFIX}/{path}")).status == 403
+        assert backend.requests == []
+        response = await admin.get(f"{PREFIX}/{path}")
+        assert response.status == 200
+        assert response.headers["Cache-Control"] == "no-store"
+        assert backend.requests[-1].path == f"/v1/{path}"
+    backend.requests.clear()
+    assert (
+        await admin.get(f"{PREFIX}/connections/not-a-uuid/authorization")
+    ).status == 404
+    assert backend.requests == []
+    body = {
+        "provider": "bayou",
+        "request_id": identity,
+        "utility_id": "speculoos_power",
+        "currency": "USD",
+        "accept_provider_settings": True,
+    }
+    backend.responses["/v1/connections"] = (202, b"{}", {})
+    backend.requests.clear()
+    assert (await user.post(f"{PREFIX}/connections", json=body)).status == 403
+    assert backend.requests == []
+    assert (await admin.post(f"{PREFIX}/connections", json=body)).status == 202
+    assert json.loads(backend.requests[-1].body) == body
+    for extra in [
+        {"password": "fictional-never-forward"},
+        {"accept_provider_settings": False},
+        {"request_id": "invalid"},
+    ]:
+        backend.requests.clear()
+        assert (
+            await admin.post(f"{PREFIX}/connections", json={**body, **extra})
+        ).status == 400
+        assert backend.requests == []
+
+
+@pytest.mark.parametrize(
+    "flags,accepted",
+    [
+        ({"read_only_providers": True}, True),
+        (
+            {
+                "read_only_providers": False,
+                "read_only_sync": True,
+                "hosted_connections": True,
+            },
+            True,
+        ),
+        ({"read_only_providers": False}, False),
+    ],
+)
+async def test_flow_accepts_the_explicit_hosted_setup_contract(
+    hass: HomeAssistant,
+    backend: Backend,
+    flags: dict[str, bool],
+    accepted: bool,
+) -> None:
+    backend.responses["/v1/system"] = (
+        200,
+        json.dumps({"name": "Utilities", "version": "0.1.2", **flags}).encode(),
+        {},
+    )
+    flow = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": SOURCE_USER}
+    )
+    result = await hass.config_entries.flow.async_configure(
+        flow["flow_id"], {CONF_BACKEND_URL: backend.origin, CONF_TOKEN: TOKEN}
+    )
+    if accepted:
+        assert result["type"] is FlowResultType.CREATE_ENTRY
+    else:
+        assert result["type"] is FlowResultType.FORM
+
+
 @pytest.mark.parametrize(
     "method,path,payload,status",
     [

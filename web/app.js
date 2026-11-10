@@ -1,4 +1,5 @@
 import { mountAppShell, setNotice } from './shell.js';
+import { createConnections } from './connections.js';
 
 const byId = (id) => document.getElementById(id);
 const content = byId('content');
@@ -9,16 +10,16 @@ const isIngress = document.documentElement.dataset.ingress === 'true';
 const retry = byId('retry');
 const detail = byId('bill-detail');
 const views = {
-  overview: ['Overview', 'Bills, collections, and meter data. In one place.'],
-  bills: ['Bills', 'Provider-reported bills. A bill is not proof of payment.'],
-  collections: ['Collections', 'Scheduled pickups, completion reports, and exceptions.'],
+  overview: ['Overview', 'Bills and service data from your utilities.'],
+  bills: ['Bills', 'Whole-account bills. Meter selection limits usage, not bill totals. A bill is not proof of payment.'],
+  collections: ['Trash collections', 'Scheduled pickups, completion reports, and exceptions.'],
   usage: ['Usage', 'Meter intervals, with the units and time ranges reported by the provider.'],
-  settings: ['Settings', 'Provider coverage, account bindings, and read-only sync.'],
+  settings: ['Settings', 'Utility connections, provider coverage, and sync.'],
 };
 const names = {
   waste_management: 'Waste Management', bayou: 'Bayou',
   bills: 'Bills', balances: 'Balances', payments: 'Payments', services: 'Services',
-  collections: 'Collections', usage: 'Usage',
+  collections: 'Trash collections', usage: 'Usage',
   complete: 'Available', partial: 'Partial coverage', unavailable: 'Unavailable',
   unsupported: 'Not supported', not_configured: 'Not configured',
   scheduled: 'Scheduled', completed: 'Completed', exception: 'Exception', unknown: 'Unknown',
@@ -79,6 +80,11 @@ const shell = mountAppShell({
   sourceUrl: 'https://github.com/jessfraz/ha-utilities',
   actions: [refresh], status: 'Connecting',
 });
+const connectionManager = createConnections({
+  api, node, providers: () => providers, onError: showError,
+  updated: load,
+  connected: async () => { location.hash = 'settings'; view = 'settings'; await renderView(); byId('main').focus(); },
+});
 
 function node(tag, text, className) {
   const value = document.createElement(tag);
@@ -130,6 +136,16 @@ function readView() {
 function navigate(next) {
   if (next === view) return;
   location.hash = next;
+}
+
+function accountSupports(account, capability) {
+  const provider = providers.find((provider) => provider.id === account.provider);
+  return !!provider?.capabilities.includes(capability)
+    && !summary?.coverage.some((item) => item.account_id === account.id && item.capability === capability && item.state === 'unsupported');
+}
+
+function accountsFor(capability) {
+  return accounts.filter((account) => accountSupports(account, capability));
 }
 
 class ApiError extends Error {
@@ -328,6 +344,13 @@ async function renderView() {
   viewController?.abort();
   viewController = new AbortController();
   const controller = viewController;
+  const trash = document.querySelector('[data-view="collections"]');
+  const hasCollections = accountsFor('collections').length > 0;
+  trash.hidden = !hasCollections;
+  if (ready && view === 'collections' && !hasCollections) {
+    view = 'overview';
+    history.replaceState(null, '', '#overview');
+  }
   for (const button of document.querySelectorAll('[data-view]')) button.setAttribute('aria-pressed', String(button.dataset.view === view));
   byId('page-title').textContent = views[view][0];
   byId('page-description').textContent = views[view][1];
@@ -348,16 +371,29 @@ async function renderView() {
 }
 
 async function renderOverview(signal, current) {
+  if (!accounts.length) {
+    const setup = empty('Connect your first utility', 'Add your utility connection to see bills and usage here.');
+    const connect = node('button', 'Connect utility');
+    connect.type = 'button';
+    connect.disabled = !providers.some((provider) => provider.id === 'bayou' && provider.configured);
+    connect.addEventListener('click', () => connectionManager.open());
+    setup.append(connect);
+    if (connect.disabled) setup.append(node('p', 'Add a Bayou API key in the app configuration to get started.', 'connection-note'));
+    content.replaceChildren(setup, connectionManager.section({ pendingOnly: true }), coveragePanel(summary.coverage));
+    return;
+  }
+  const hasCollections = accountsFor('collections').length > 0;
   const upcoming = new URLSearchParams({ from: dateOffset(0), to: dateOffset(30), limit: '5' });
   const [balances, collections] = await Promise.all([
     api('v1/balances?limit=10', { signal }).then(requirePage),
-    api(`v1/collections?${upcoming}`, { signal }).then(requirePage),
+    hasCollections ? api(`v1/collections?${upcoming}`, { signal }).then(requirePage) : null,
   ]);
   if (current !== generation) return;
   const fragment = document.createDocumentFragment();
   const metrics = node('section', undefined, 'metrics');
   metrics.setAttribute('aria-label', 'Saved utility data');
-  for (const [value, title] of [[summary.accounts, 'Bound accounts'], [summary.bills, 'Saved bills'], [summary.collections, 'Saved collections'], [summary.usage_intervals, 'Usage intervals']]) {
+  const values = [[summary.accounts, 'Connected accounts'], [summary.bills, 'Saved bills'], ...(hasCollections ? [[summary.collections, 'Saved trash collections']] : []), [summary.usage_intervals, 'Usage intervals']];
+  for (const [value, title] of values) {
     const metric = node('div', undefined, 'metric');
     metric.append(node('span', count(value), 'metric-value'), node('span', title, 'metric-label'));
     metrics.append(metric);
@@ -386,7 +422,9 @@ async function renderOverview(signal, current) {
     balancePanel.append(node('p', 'A missing account balance is not confirmation that nothing is owed.', 'section-note'));
     if (balances.next_page) balancePanel.append(node('p', 'More balances are available through the API or CLI.', 'section-note'));
   }
-  const collectionPanel = panel('Next 30 days', ['All collections', 'collections']);
+  columns.append(balancePanel);
+  if (collections) {
+  const collectionPanel = panel('Next 30 days', ['All trash collections', 'collections']);
   if (!collections.items.length) collectionPanel.append(node('p', 'No collections reported for the next 30 days. Check coverage before relying on an empty schedule.', 'panel-empty'));
   else {
     const list = node('ul', undefined, 'record-list');
@@ -398,9 +436,10 @@ async function renderOverview(signal, current) {
       list.append(item);
     }
     collectionPanel.append(list);
-    if (collections.next_page) collectionPanel.append(node('p', 'Showing the first 5 collections. Open All collections for the full paginated schedule.', 'section-note'));
+    if (collections.next_page) collectionPanel.append(node('p', 'Showing the first 5 collections. Open All trash collections for the full paginated schedule.', 'section-note'));
   }
-  columns.append(balancePanel, collectionPanel);
+  columns.append(collectionPanel);
+  }
   fragment.append(metrics, freshness, columns, coveragePanel(summary.coverage));
   content.replaceChildren(fragment);
 }
@@ -442,11 +481,11 @@ function setDateValidity(from, to) {
 function filterForm(type, state, onSubmit) {
   const form = node('form', undefined, 'toolbar');
   form.setAttribute('aria-label', `Filter ${type}`);
-  const account = selectField('Account', 'account', [['', 'All accounts'], ...accounts.map((item) => [item.id, item.name])], state.filters.account);
+  const account = selectField('Account', 'account', [['', 'All accounts'], ...accountsFor(type).map((item) => [item.id, item.name])], state.filters.account);
   form.append(account.field);
   let service = null;
   if (type !== 'bills') {
-    service = selectField('Service', 'service', serviceOptions(state.filters.account), state.filters.service);
+    service = selectField('Service', 'service', serviceOptions(state.filters.account, type), state.filters.service);
     form.append(service.field);
   }
   const from = dateField('From', 'from', state.filters.from);
@@ -459,10 +498,10 @@ function filterForm(type, state, onSubmit) {
   account.select.addEventListener('change', () => {
     if (!service) return;
     const previous = service.select.value;
-    service.select.replaceChildren(...serviceOptions(account.select.value).map(([id, text]) => {
+    service.select.replaceChildren(...serviceOptions(account.select.value, type).map(([id, text]) => {
       const option = node('option', text); option.value = id; return option;
     }));
-    service.select.value = serviceOptions(account.select.value).some(([id]) => id === previous) ? previous : '';
+    service.select.value = serviceOptions(account.select.value, type).some(([id]) => id === previous) ? previous : '';
   });
   form.addEventListener('submit', (event) => {
     event.preventDefault();
@@ -473,8 +512,8 @@ function filterForm(type, state, onSubmit) {
   });
   return form;
 }
-function serviceOptions(account) {
-  return [['', 'All services'], ...accounts.filter((item) => !account || item.id === account)
+function serviceOptions(account, capability) {
+  return [['', 'All services'], ...accountsFor(capability).filter((item) => !account || item.id === account)
     .flatMap((item) => item.services.map((service) => [service.id, `${service.name} · ${item.name}`]))];
 }
 
@@ -586,7 +625,7 @@ async function openBill(id) {
       [bill.provider === 'bayou' ? 'Previous-cycle balance' : 'Outstanding balance', money(bill.outstanding_balance)], ['Provider status', bill.source_status ?? 'Not reported'],
       ['Provider', label(bill.provider)], ['Observed', timestamp(bill.observed_at)],
     ]) fields.append(node('dt', title), node('dd', value));
-    const balanceMeaning = bill.provider === 'bayou' ? 'Bayou reports outstanding balance from the previous billing cycle.' : 'Outstanding balance is the source-reported value on this bill.';
+    const balanceMeaning = bill.provider === 'bayou' ? 'Bill totals cover the entire selected utility account, including meters not selected for usage. Bayou reports outstanding balance from the previous billing cycle.' : 'Outstanding balance is the source-reported value on this bill.';
     body.replaceChildren(heading, total, fields, node('p', `${balanceMeaning} It is not a live account balance or confirmation of settlement. Provider status describes the provider record, not whether a payment settled. No payment actions are available in Utilities.`, 'detail-note'));
   } catch (error) {
     if (error.name === 'AbortError') return;
@@ -605,16 +644,19 @@ async function openBill(id) {
 
 function renderSettings() {
   const fragment = document.createDocumentFragment();
+  fragment.append(connectionManager.section());
   const providerGrid = node('section', undefined, 'provider-grid');
   providerGrid.setAttribute('aria-label', 'Utility providers');
   for (const provider of providers) {
     const card = node('article', undefined, 'panel');
     const heading = node('div', undefined, 'section-heading');
-    heading.append(node('h2', provider.name), badge(provider.configured ? 'complete' : 'not_configured', provider.configured ? 'Credentials configured' : 'Not configured'));
+    heading.append(node('h2', provider.name), badge(provider.configured ? 'complete' : 'not_configured', provider.configured ? provider.id === 'bayou' ? 'API key configured' : 'Credentials configured' : 'Not configured'));
     const description = provider.configured ? 'Credentials are present. A successful sync is still required to verify account access and data coverage.'
       : provider.id === 'waste_management' ? 'A WM-issued token and ClientId are required. Residential eligibility and API pricing must be confirmed with WM.'
-      : 'An existing Bayou API credential and an explicitly bound customer, account, and meter are required. Utilities does not enroll or link accounts.';
-    card.append(heading, node('p', description));
+      : 'Add a Bayou API key in the app configuration. Then connect your utility above to choose the accounts and meters to use.';
+    const providerDescription = provider.id === 'bayou' && provider.configured
+      ? 'The API key is configured. Connect your utility above, sign in through Bayou, and choose its accounts and meters. A key alone does not connect a utility account.' : description;
+    card.append(heading, node('p', providerDescription));
     const capabilities = node('div', undefined, 'capabilities');
     capabilities.setAttribute('aria-label', 'Supported data');
     for (const capability of provider.capabilities) capabilities.append(node('span', label(capability)));
@@ -625,7 +667,7 @@ function renderSettings() {
   fragment.append(providerGrid);
   const bindings = panel('Bound accounts');
   bindings.classList.add('settings-section');
-  if (!accounts.length) bindings.append(node('p', 'No accounts are bound. Add explicit account and service bindings in the app configuration before syncing. Accounts are never selected automatically.', 'panel-empty'));
+  if (!accounts.length) bindings.append(node('p', 'Connect a utility and choose its meters before syncing. Waste Management accounts use explicit bindings in the app configuration.', 'panel-empty'));
   else {
     const grid = node('div', undefined, 'panel-body');
     grid.classList.add('account-grid');
