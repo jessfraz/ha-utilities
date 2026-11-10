@@ -1,9 +1,9 @@
 #!/bin/sh
 set -eu
 
-# Native restores retain restrictive modes but copy private data as root.
-# Repair only this volume, without following links or crossing another mount,
-# before the server and worker drop to their fixed application user.
+# Native restores can copy app-owned files as root with permissive modes.
+# Normalize this private volume before dropping privileges, without traversing
+# links or touching a nested mount. Regular files are data, never executables.
 if [ "$(id -u)" -eq 0 ]; then
     if [ -L /data ] || [ ! -d /data ]; then
         echo 'Private data must be a real directory' >&2
@@ -14,6 +14,8 @@ if [ "$(id -u)" -eq 0 ]; then
         exit 1
     fi
     find -P /data -xdev -exec chown --no-dereference utilities:utilities -- {} +
+    find -P /data -xdev -type d -exec chmod 0700 -- {} +
+    find -P /data -xdev -type f -exec chmod 0600 -- {} +
     exec gosu utilities "$0" "$@"
 fi
 
