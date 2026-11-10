@@ -1,13 +1,17 @@
 //! Native and HA transports share the same typed local read model.
-use crate::{config::read_secret, models::*};
-use reqwest::{Client as HttpClient, Method};
+use crate::models::*;
+use reqwest::{
+    Client as HttpClient, Method,
+    header::{AUTHORIZATION, HeaderValue},
+};
 use serde::{Serialize, de::DeserializeOwned};
-use std::{path::Path, time::Duration};
+use std::time::Duration;
 use url::Url;
 
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
 pub enum Transport {
     Native,
+    #[value(name = "home-assistant", alias = "ha")]
     Ha,
 }
 #[derive(Debug, thiserror::Error, Serialize)]
@@ -18,7 +22,7 @@ pub struct ClientError {
     pub status: Option<u16>,
 }
 impl ClientError {
-    fn new(error: &'static str, status: Option<u16>) -> Self {
+    pub fn new(error: &'static str, status: Option<u16>) -> Self {
         Self {
             error,
             message: error.replace('_', " "),
@@ -30,10 +34,10 @@ pub struct Client {
     http: HttpClient,
     base: Url,
     transport: Transport,
-    token: String,
+    authorization: HeaderValue,
 }
 impl Client {
-    pub fn new(url: &str, transport: Transport, token_file: &Path) -> Result<Self, ClientError> {
+    pub fn new(url: &str, transport: Transport, token: &str) -> Result<Self, ClientError> {
         let base = Url::parse(url).map_err(|_| ClientError::new("invalid_url", None))?;
         if !matches!(base.scheme(), "http" | "https")
             || base.host_str().is_none()
@@ -45,8 +49,12 @@ impl Client {
         {
             return Err(ClientError::new("invalid_url", None));
         }
-        let token = read_secret(token_file)
-            .map_err(|_| ClientError::new("credential_file_unavailable", None))?;
+        if token.is_empty() || token.len() > 8192 || !token.bytes().all(|v| v.is_ascii_graphic()) {
+            return Err(ClientError::new("invalid_credential", None));
+        }
+        let mut authorization = HeaderValue::from_bytes(format!("Bearer {token}").as_bytes())
+            .map_err(|_| ClientError::new("invalid_credential", None))?;
+        authorization.set_sensitive(true);
         let http = HttpClient::builder()
             .timeout(Duration::from_secs(30))
             .connect_timeout(Duration::from_secs(10))
@@ -57,7 +65,7 @@ impl Client {
             http,
             base,
             transport,
-            token,
+            authorization,
         })
     }
     fn endpoint(
@@ -119,7 +127,7 @@ impl Client {
         let mut builder = self
             .http
             .request(method, url)
-            .bearer_auth(&self.token)
+            .header(AUTHORIZATION, self.authorization.clone())
             .header("Accept", "application/json");
         if let Some(body) = body {
             builder = builder

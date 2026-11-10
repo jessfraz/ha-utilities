@@ -16,9 +16,12 @@ paths. Keep credentials in 1Password and runtime storage, never source control.
 utilities --config /data/config.toml --database /data/utilities.sqlite3
 ha-utilities --token-file /data/api-token providers list
 ha-utilities --token-file /data/api-token bills list --limit 25 --json
-ha-utilities --transport ha --url https://ha.example.test \
-  --token-file /run/secrets/ha-token summary --json
+fetch-home-assistant ha-utilities --transport home-assistant summary --json
 ```
+
+HA transport uses `HOME_ASSISTANT_URL` and `HOME_ASSISTANT_TOKEN`. Native uses
+`UTILITIES_URL` and `UTILITIES_TOKEN_FILE`. Explicit `--url` and `--token-file`
+override those settings; `ha` remains a transport alias.
 
 The server creates a private API-token file on first startup. Native clients
 use bearer authentication; the browser uses an HTTP-only session. The HA app

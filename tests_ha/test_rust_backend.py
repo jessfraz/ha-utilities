@@ -24,6 +24,45 @@ from .conftest import entity_id
 from .test_assist import assist_api
 
 _ROOT = Path(__file__).resolve().parents[1]
+_TRANSPORT_ENVIRONMENT = (
+    "HOME_ASSISTANT_URL",
+    "HOME_ASSISTANT_TOKEN",
+    "UTILITIES_URL",
+    "UTILITIES_TOKEN_FILE",
+)
+
+
+async def run_cli(
+    arguments: list[str], environment: dict[str, str] | None = None
+) -> tuple[int, bytes, bytes]:
+    """Run the real binary with isolated, exclusively fictional configuration."""
+    binary = Path(
+        os.environ.get("HA_UTILITIES_TEST_BINARY", _ROOT / "target/debug/ha-utilities")
+    )
+    assert await asyncio.to_thread(binary.is_file), (
+        "Build the ha-utilities CLI before the native HA transport test"
+    )
+    process_environment = os.environ.copy()
+    for name in _TRANSPORT_ENVIRONMENT:
+        process_environment.pop(name, None)
+    if environment is not None:
+        process_environment.update(environment)
+    process = await asyncio.create_subprocess_exec(
+        str(binary),
+        *arguments,
+        env=process_environment,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        async with asyncio.timeout(10):
+            stdout, stderr = await process.communicate()
+    finally:
+        if process.returncode is None:
+            process.kill()
+            await process.wait()
+    assert process.returncode is not None
+    return process.returncode, stdout, stderr
 
 
 async def connect_backend(
@@ -94,19 +133,9 @@ async def test_actual_cli_ha_transport_reads_native_bridge_and_denies_revoked_ac
     token_file = tmp_path / "ha-credential"
     await asyncio.to_thread(token_file.write_text, hass_user_token)
     await asyncio.to_thread(token_file.chmod, 0o600)
-    binary = Path(
-        os.environ.get(
-            "HA_UTILITIES_TEST_BINARY",
-            _ROOT / "target/debug/ha-utilities",
-        )
-    )
-    assert await asyncio.to_thread(binary.is_file), (
-        "Build the ha-utilities CLI before the native HA transport test"
-    )
 
-    async def run_cli(cursor: str | None = None) -> tuple[int, bytes, bytes]:
+    async def bills_cli(cursor: str | None = None) -> tuple[int, bytes, bytes]:
         arguments = [
-            str(binary),
             "--transport",
             "ha",
             "--url",
@@ -121,25 +150,14 @@ async def test_actual_cli_ha_transport_reads_native_bridge_and_denies_revoked_ac
         ]
         if cursor is not None:
             arguments.extend(["--page", cursor])
-        process = await asyncio.create_subprocess_exec(
-            *arguments, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-        )
-        try:
-            async with asyncio.timeout(10):
-                stdout, stderr = await process.communicate()
-        finally:
-            if process.returncode is None:
-                process.kill()
-                await process.wait()
-        assert process.returncode is not None
-        return process.returncode, stdout, stderr
+        return await run_cli(arguments)
 
     bridge = await client.get("/api/utilities/v1/bills?limit=1")
     assert bridge.status == 200
     expected = record(await bridge.json())
     expected_items, expected_cursor, expected_coverage = page(expected, maximum=1)
     assert len(expected_items) == 1 and expected_cursor is not None
-    result, stdout, stderr = await run_cli()
+    result, stdout, stderr = await bills_cli()
     assert result == 0, stderr.decode()
     assert stderr == b""
     items, cursor, coverage = page(json.loads(stdout), maximum=1)
@@ -150,7 +168,7 @@ async def test_actual_cli_ha_transport_reads_native_bridge_and_denies_revoked_ac
     amount = record(first_bill["total"])
     assert type(amount["minor_units"]) is int and amount["currency"] == "USD"
 
-    result, stdout, stderr = await run_cli(cursor)
+    result, stdout, stderr = await bills_cli(cursor)
     assert result == 0, stderr.decode()
     following, following_cursor, following_coverage = page(
         json.loads(stdout), maximum=1
@@ -169,7 +187,7 @@ async def test_actual_cli_ha_transport_reads_native_bridge_and_denies_revoked_ac
         assert hass_user.is_active
     assert hass.auth.async_validate_access_token(hass_user_token) is None
     assert (await client.get("/api/utilities/v1/bills?limit=1")).status == 401
-    result, stdout, stderr = await run_cli()
+    result, stdout, stderr = await bills_cli()
     assert result != 0 and stdout == b""
     error = record(json.loads(stderr))
     assert error == {
@@ -179,3 +197,138 @@ async def test_actual_cli_ha_transport_reads_native_bridge_and_denies_revoked_ac
     }
     assert hass_user_token.encode() not in stderr
     assert web_backend.token.encode() not in stderr
+
+
+@pytest.mark.parametrize("transport", ["home-assistant", "ha"])
+async def test_actual_cli_home_assistant_environment_isolated_from_native(
+    hass: HomeAssistant,
+    web_backend: WebBackend,
+    hass_client: ClientSessionGenerator,
+    hass_user_token: str,
+    tmp_path: Path,
+    transport: str,
+) -> None:
+    await connect_backend(hass, web_backend)
+    client = await hass_client(hass_user_token)
+    ha_origin = str(client.make_url("/")).rstrip("/")
+    expected_response = await client.get("/api/utilities/v1/summary")
+    assert expected_response.status == 200
+    expected = record(await expected_response.json())
+    assert expected["accounts"] == 2 and expected["bills"] == 70
+
+    native_token_file = tmp_path / "native-credential"
+    await asyncio.to_thread(native_token_file.write_text, web_backend.token)
+    await asyncio.to_thread(native_token_file.chmod, 0o600)
+    environment = {
+        "HOME_ASSISTANT_URL": ha_origin,
+        "HOME_ASSISTANT_TOKEN": hass_user_token,
+        "UTILITIES_URL": web_backend.origin,
+        "UTILITIES_TOKEN_FILE": str(native_token_file),
+    }
+    if transport == "ha":
+        # Irrelevant native settings must not even be parsed or read.
+        environment["UTILITIES_URL"] = "invalid-native-origin"
+        environment["UTILITIES_TOKEN_FILE"] = str(tmp_path / "missing-native-token")
+    result, stdout, stderr = await run_cli(
+        ["--transport", transport, "--json", "summary"], environment
+    )
+    assert result == 0, stderr.decode()
+    assert stderr == b""
+    assert record(json.loads(stdout)) == expected
+
+
+async def test_actual_cli_explicit_overrides_and_native_environment(
+    hass: HomeAssistant,
+    web_backend: WebBackend,
+    hass_client: ClientSessionGenerator,
+    hass_user_token: str,
+    tmp_path: Path,
+) -> None:
+    await connect_backend(hass, web_backend)
+    client = await hass_client(hass_user_token)
+    ha_origin = str(client.make_url("/")).rstrip("/")
+    expected_response = await client.get("/api/utilities/v1/summary")
+    assert expected_response.status == 200
+    expected = record(await expected_response.json())
+    native_token_file = tmp_path / "native-credential"
+    await asyncio.to_thread(native_token_file.write_text, web_backend.token)
+    await asyncio.to_thread(native_token_file.chmod, 0o600)
+    environment = {
+        "UTILITIES_URL": web_backend.origin,
+        "UTILITIES_TOKEN_FILE": str(native_token_file),
+        "HOME_ASSISTANT_URL": "invalid-unused-origin",
+        "HOME_ASSISTANT_TOKEN": "fictional-wrong-unused-token",
+    }
+    result, stdout, stderr = await run_cli(
+        ["--transport", "native", "--json", "summary"], environment
+    )
+    assert result == 0, stderr.decode()
+    assert stderr == b""
+    assert record(json.loads(stdout)) == expected
+
+    ha_token_file = tmp_path / "ha-explicit-credential"
+    await asyncio.to_thread(ha_token_file.write_text, hass_user_token)
+    await asyncio.to_thread(ha_token_file.chmod, 0o600)
+    arguments = [
+        "--transport",
+        "home-assistant",
+        "--url",
+        ha_origin,
+        "--token-file",
+        str(ha_token_file),
+        "--json",
+        "summary",
+    ]
+    result, stdout, stderr = await run_cli(arguments, environment)
+    assert result == 0, stderr.decode()
+    assert stderr == b""
+    assert record(json.loads(stdout)) == expected
+
+    # A failed explicit override cannot fall back to a valid HA environment.
+    arguments[5] = str(tmp_path / "missing-explicit-token")
+    environment.update(
+        HOME_ASSISTANT_URL=ha_origin, HOME_ASSISTANT_TOKEN=hass_user_token
+    )
+    result, stdout, stderr = await run_cli(arguments, environment)
+    assert result != 0 and stdout == b""
+    error = record(json.loads(stderr))
+    assert error["error"] == "credential_file_unavailable"
+    assert error["status"] is None
+    assert hass_user_token.encode() not in stderr
+    assert web_backend.token.encode() not in stderr
+
+
+async def test_actual_cli_missing_ha_environment_never_falls_back_to_native(
+    hass: HomeAssistant,
+    web_backend: WebBackend,
+    hass_client: ClientSessionGenerator,
+    hass_user_token: str,
+    tmp_path: Path,
+) -> None:
+    await connect_backend(hass, web_backend)
+    client = await hass_client(hass_user_token)
+    native_token_file = tmp_path / "native-credential"
+    await asyncio.to_thread(native_token_file.write_text, web_backend.token)
+    await asyncio.to_thread(native_token_file.chmod, 0o600)
+    environment = {
+        "HOME_ASSISTANT_URL": str(client.make_url("/")).rstrip("/"),
+        "HOME_ASSISTANT_TOKEN": hass_user_token,
+        "UTILITIES_URL": web_backend.origin,
+        "UTILITIES_TOKEN_FILE": str(native_token_file),
+    }
+    for missing, expected_error in (
+        ("HOME_ASSISTANT_URL", "url_required"),
+        ("HOME_ASSISTANT_TOKEN", "credential_required"),
+    ):
+        incomplete = {
+            name: value for name, value in environment.items() if name != missing
+        }
+        result, stdout, stderr = await run_cli(
+            ["--transport", "home-assistant", "--json", "summary"], incomplete
+        )
+        assert result != 0 and stdout == b""
+        error = record(json.loads(stderr))
+        assert error["error"] == expected_error
+        assert error["status"] is None
+        assert hass_user_token.encode() not in stderr
+        assert web_backend.token.encode() not in stderr
