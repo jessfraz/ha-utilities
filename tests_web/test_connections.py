@@ -4,8 +4,10 @@ import asyncio
 import json
 import os
 import re
+from calendar import monthrange
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Literal
 
@@ -40,6 +42,9 @@ class BayouFixture:
     onboarding_link: str | None = LEGACY_LINK
     lose_post_response: bool = False
     post_received: asyncio.Event = field(default_factory=asyncio.Event)
+    bills_gate: asyncio.Event | None = None
+    bill: dict[str, object] | None = None
+    bill_requests: list[str] = field(default_factory=list)
 
     async def handle(self, request: web.Request) -> web.Response:
         if request.path == "/api/v2/utilities":
@@ -72,7 +77,15 @@ class BayouFixture:
             return web.json_response({}, status=self.lookup_error_status)
         if request.path.endswith("/bills"):
             assert request.match_info["customer"] == "71001"
-            return web.json_response([])
+            day = request.query["start"]
+            assert day == request.query["end"]
+            self.bill_requests.append(day)
+            if self.bills_gate is not None:
+                await self.bills_gate.wait()
+            bill = self.bill
+            return web.json_response(
+                [bill] if bill and bill["billed_on"] == day else []
+            )
         if self.external_id is None:
             return web.json_response({}, status=404)
         assert request.match_info["customer"] in {
@@ -531,6 +544,88 @@ async def test_hosted_link_meter_selection_and_saved_connection(
             )
             assert not errors
         finally:
+            await browser.close()
+
+
+async def test_manual_sync_progress_survives_reload_and_reconciles_overlapping_reads(
+    connection_backend: ConnectionBackend,
+) -> None:
+    fixture = connection_backend
+    gate = asyncio.Event()
+    fixture.provider.bills_gate = gate
+    today = datetime.now(UTC).date()
+    year, month = divmod(today.year * 12 + today.month - 4, 12)
+    month += 1
+    from_default = date(year, month, min(today.day, monthrange(year, month)[1]))
+    billed_on = today - timedelta(days=7)
+    fixture.provider.bill = {
+        "id": 83001,
+        "customer_id": 71001,
+        "account_number": "fictional-account-1234",
+        "status": "unlocked",
+        "billed_on": billed_on.isoformat(),
+        "billing_period_from": (billed_on - timedelta(days=29)).isoformat(),
+        "billing_period_to": billed_on.isoformat(),
+        "outstanding_balance": 4500,
+        "total_amount": 12050,
+        "meters": [{"id": "fictional-electric-5678", "type": "electric"}],
+    }
+    running = re.compile(r"(?:syncing|running).*example electricity", re.I)
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch()
+        try:
+            page = await browser.new_page(timezone_id="UTC")
+            await sign_in(page, fixture)
+            await start_connection(page, fixture.provider)
+            dialog = page.get_by_role("dialog")
+            fixture.provider.authenticated = True
+            await dialog.get_by_role("button", name="Check status", exact=True).click()
+            await dialog.get_by_role("checkbox", name="Electricity").check()
+            await dialog.get_by_role("button", name="Connect selected meters").click()
+            await dialog.get_by_role("button", name="Go to sync settings").click()
+
+            status = page.locator("#sync-status")
+            account = page.get_by_label("Account to sync")
+            await account.select_option(label="Example electricity")
+            submit = page.get_by_role("button", name="Sync account")
+            await submit.click()
+            await expect(status).to_have_text(running)
+            await page.reload()
+            await expect(status).to_have_text(running)
+            from_field = page.get_by_label("From", exact=True)
+            to_field = page.get_by_label("To", exact=True)
+            await expect(from_field).to_have_value(from_default.isoformat())
+            await expect(to_field).to_have_value(today.isoformat())
+            await account.select_option(label="Example electricity")
+            await expect(submit).to_be_disabled()
+            gate.set()
+            await expect(status).to_contain_text("Sync finished with coverage gaps")
+            await expect(submit).to_be_enabled()
+            assert fixture.provider.bill_requests[0] == from_default.isoformat()
+
+            gate.clear()
+            await from_field.fill((today - timedelta(days=30)).isoformat())
+            await submit.click()
+            await expect(status).to_contain_text("Syncing Example electricity")
+            await page.reload()
+            await expect(status).to_contain_text("Syncing Example electricity")
+            gate.set()
+            await expect(status).to_contain_text("Sync finished with coverage gaps")
+            assert fixture.provider.bill_requests.count(billed_on.isoformat()) == 2
+            async with ClientSession(
+                headers={"Authorization": f"Bearer {TOKEN}"}
+            ) as client:
+                async with client.get(f"{fixture.backend.origin}/v1/bills") as response:
+                    assert response.status == 200
+                    bills = await response.json()
+            assert len(bills["items"]) == 1
+
+            await page.clock.set_fixed_time(datetime(2026, 5, 31, 12, tzinfo=UTC))
+            await page.reload()
+            await expect(from_field).to_have_value("2026-02-28")
+            await expect(to_field).to_have_value("2026-05-31")
+        finally:
+            gate.set()
             await browser.close()
 
 

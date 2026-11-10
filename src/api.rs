@@ -556,6 +556,20 @@ async fn sync_request(
         PrivateHeaders::new(),
     ))
 }
+#[endpoint {method=GET,path="/v1/sync",tags=["sync"]}]
+async fn sync_latest(
+    request: RequestContext<Arc<Context>>,
+) -> Result<PrivateOk<Vec<SyncJob>>, HttpError> {
+    authorized(&request)?;
+    Ok(private(
+        request
+            .context()
+            .store
+            .latest_jobs(&request.context().config.deployment)
+            .await
+            .map_err(store_error)?,
+    ))
+}
 #[endpoint {method=GET,path="/v1/sync/{id}",tags=["sync"]}]
 async fn sync_get(
     request: RequestContext<Arc<Context>>,
@@ -718,7 +732,7 @@ async fn schema(request: RequestContext<Arc<Context>>) -> Result<Response<Body>,
 
 pub fn description() -> anyhow::Result<ApiDescription<Arc<Context>>> {
     let mut api = ApiDescription::new();
-    let endpoints: [dropshot::ApiEndpoint<Arc<Context>>; 26] = [
+    let endpoints: [dropshot::ApiEndpoint<Arc<Context>>; 27] = [
         system.into(),
         health.into(),
         providers.into(),
@@ -738,6 +752,7 @@ pub fn description() -> anyhow::Result<ApiDescription<Arc<Context>>> {
         collections.into(),
         usage.into(),
         sync_request.into(),
+        sync_latest.into(),
         sync_get.into(),
         index.into(),
         asset.into(),

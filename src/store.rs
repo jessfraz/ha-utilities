@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use sqlx::{
     QueryBuilder, Row, Sqlite, SqlitePool,
-    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
+    sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteRow},
 };
 use std::{path::Path, time::Duration};
 
@@ -361,6 +361,20 @@ impl Store {
             .fetch_optional(&self.pool)
             .await?
             .ok_or(StoreError::NotFound)?;
+        Self::decode_job(row)
+    }
+
+    pub async fn latest_jobs(&self, deployment: &str) -> Result<Vec<SyncJob>, StoreError> {
+        sqlx::query(queries::LATEST_JOBS)
+            .bind(deployment)
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .map(Self::decode_job)
+            .collect()
+    }
+
+    fn decode_job(row: SqliteRow) -> Result<SyncJob, StoreError> {
         let started: String = row.try_get("started_at")?;
         let finished: Option<String> = row.try_get("finished_at")?;
         let state: String = row.try_get("state")?;
@@ -583,6 +597,13 @@ mod queries {
         "SELECT kind,count(*) AS count FROM observations WHERE account_id IN (";
     pub const FRESHNESS_PREFIX: &str = "SELECT count(*) AS accounts,max(finished_at) AS newest,min(finished_at) AS oldest FROM (SELECT account_id,max(finished_at) AS finished_at FROM sync_jobs WHERE state IN ('complete','partial') AND account_id IN (";
     pub const START_JOB: &str = "INSERT INTO sync_jobs(id,account_id,state,started_at) VALUES(?,?,'running',strftime('%Y-%m-%dT%H:%M:%fZ','now'))";
+    pub const LATEST_JOBS: &str = "SELECT job.id,job.account_id,job.state,job.started_at,job.finished_at,job.observations,job.error
+        FROM accounts AS account
+        JOIN sync_jobs AS job ON job.id=(
+            SELECT id FROM sync_jobs WHERE account_id=account.id ORDER BY started_at DESC,id DESC LIMIT 1
+        )
+        WHERE account.deployment=? AND account.binding IS NOT NULL
+        ORDER BY account.id LIMIT 100";
     pub const FINISH_JOB: &str = "UPDATE sync_jobs SET state=?,finished_at=strftime('%Y-%m-%dT%H:%M:%fZ','now'),observations=?,error=? WHERE id=? AND state='running'";
     pub const JOB: &str = "SELECT id,account_id,state,started_at,finished_at,observations,error FROM sync_jobs WHERE id=?";
     pub const LIST_PREFIX: &str =
@@ -819,6 +840,26 @@ mod tests {
             sqlx::query(queries::JOB).bind("fictional-job"),
         )
         .await;
+        explain(
+            "latest_jobs",
+            &store,
+            sqlx::query(queries::LATEST_JOBS).bind(&config.deployment),
+        )
+        .await;
+        let started = std::time::Instant::now();
+        let jobs = store.latest_jobs(&config.deployment).await.unwrap();
+        println!(
+            "Latest sync per account in 200 jobs: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(jobs.len(), config.accounts.len());
+        assert!(
+            store
+                .latest_jobs("another-deployment")
+                .await
+                .unwrap()
+                .is_empty()
+        );
         explain_write(
             "register",
             &store,

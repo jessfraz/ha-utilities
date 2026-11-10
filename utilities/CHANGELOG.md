@@ -1,6 +1,8 @@
 # 0.1.5
 
 Open Bayou sign-in in one click and explain why Bayou saves the utility login.
+Keep manual sync progress visible after reload. The editable dates default
+to the last three calendar months.
 
 # 0.1.4
 
