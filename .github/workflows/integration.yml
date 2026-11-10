@@ -15,6 +15,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          python-version: "3.14"
+          enable-cache: false
       - run: rustup toolchain install stable --profile minimal
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - run: cargo run --locked --bin utilities -- --openapi dist/openapi.json
@@ -22,8 +26,8 @@ jobs:
         env:
           TAG: ${{ github.ref_name }}
         run: |
-          python3 scripts/build-integration --output dist
-          python3 - <<'PY'
+          uv run --no-project --python 3.14 python scripts/build-integration --output dist
+          uv run --no-project --python 3.14 python - <<'PY'
           import hashlib, json, os, pathlib, tomllib
           root = pathlib.Path('custom_components/utilities')
           version = tomllib.loads(pathlib.Path('Cargo.toml').read_text())['package']['version']
