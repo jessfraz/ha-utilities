@@ -1,5 +1,5 @@
 name: Utilities
-version: "0.1.4"
+version: "0.1.5"
 slug: utilities
 description: Read-only utility bills, collections, and meter usage
 url: https://github.com/jessfraz/ha-utilities
