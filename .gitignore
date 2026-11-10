@@ -11,3 +11,4 @@ __pycache__/
 /test-results/
 /playwright-report/
 /dist/
+/custom_components/utilities/_app_kit/

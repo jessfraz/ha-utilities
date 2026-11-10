@@ -16,6 +16,8 @@ from pytest_aiohttp.plugin import AiohttpServer
 
 from tests_web.conftest import ROOT, TOKEN, WebBackend
 
+ONBOARD_LINK = "https://bayou.energy/companies/12345/onboard/fictional-signin_Token"
+
 
 @dataclass
 class BayouFixture:
@@ -24,7 +26,10 @@ class BayouFixture:
     external_id: str | None = None
     authenticated: bool = False
     posts: list[dict[str, object]] = field(default_factory=list)
-    fail_lookup: bool = False
+    lookup_error_status: int | None = None
+    onboarding_link: str | None = (
+        "https://bayou.energy/companies/12345/sign_up?key=fictional-private-link"
+    )
     lose_post_response: bool = False
     post_received: asyncio.Event = field(default_factory=asyncio.Event)
 
@@ -52,8 +57,8 @@ class BayouFixture:
                 return web.json_response({}, status=409)
             self.external_id = value["external_id"]
             return web.json_response({}, status=503 if self.lose_post_response else 201)
-        if self.fail_lookup:
-            return web.json_response({}, status=503)
+        if self.lookup_error_status is not None:
+            return web.json_response({}, status=self.lookup_error_status)
         if request.path.endswith("/bills"):
             assert request.match_info["customer"] == "71001"
             return web.json_response([])
@@ -88,7 +93,7 @@ class BayouFixture:
                 ]
                 if self.authenticated
                 else [],
-                "onboarding_link": "https://bayou.energy/companies/12345/sign_up?key=fictional-private-link",
+                "onboarding_link": self.onboarding_link,
                 "onboarding_token": "fictional-token-never-store",
                 "private_metadata": "fictional-private-extra",
             }
@@ -220,6 +225,86 @@ async def start_connection(
     await expect(page.get_by_role("dialog").get_by_role("status")).to_have_text(
         "Sign-in needed", timeout=15000
     )
+
+
+async def test_hosted_onboard_link_is_available_without_navigating_to_bayou(
+    connection_backend: ConnectionBackend,
+) -> None:
+    fixture = connection_backend
+    fixture.provider.onboarding_link = ONBOARD_LINK
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch()
+        try:
+            page = await browser.new_page()
+            await sign_in(page, fixture)
+            await start_connection(page, fixture.provider)
+            dialog = page.get_by_role("dialog")
+            async with page.expect_response(
+                lambda response: response.url.endswith("/authorization")
+            ) as authorization:
+                await dialog.get_by_role(
+                    "button", name="Get secure sign-in link"
+                ).click()
+            response = await authorization.value
+            assert response.status == 200
+            assert response.headers["cache-control"] == "no-store"
+            assert await response.json() == {"url": ONBOARD_LINK}
+            link = dialog.get_by_role("link", name="Continue on Bayou")
+            await expect(link).to_have_attribute("href", ONBOARD_LINK)
+            await expect(link).to_have_attribute("rel", "noopener noreferrer")
+            await expect(link).to_have_attribute("referrerpolicy", "no-referrer")
+            assert len(page.context.pages) == 1
+        finally:
+            await browser.close()
+
+
+async def test_hosted_sign_in_distinguishes_bad_links_credentials_and_outages(
+    connection_backend: ConnectionBackend,
+) -> None:
+    fixture = connection_backend
+    fixture.provider.onboarding_link = ONBOARD_LINK + "%2Fexample"
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch()
+        try:
+            page = await browser.new_page()
+            await sign_in(page, fixture)
+            await start_connection(page, fixture.provider)
+            dialog = page.get_by_role("dialog")
+            for upstream_status, code, message in (
+                (
+                    None,
+                    "bayou_authorization_link_unavailable",
+                    "Bayou did not return a usable sign-in link. "
+                    "Check status and try again.",
+                ),
+                (
+                    401,
+                    "bayou_authentication_required",
+                    "Bayou rejected the API key. Check it in the app configuration.",
+                ),
+                (
+                    503,
+                    "bayou_unavailable",
+                    "Bayou could not be reached. Saved connection details are safe.",
+                ),
+            ):
+                fixture.provider.lookup_error_status = upstream_status
+                async with page.expect_response(
+                    lambda response: response.url.endswith("/authorization")
+                ) as authorization:
+                    await dialog.get_by_role(
+                        "button", name="Get secure sign-in link"
+                    ).click()
+                response = await authorization.value
+                assert response.status == 503
+                assert (await response.json())["error_code"] == code
+                await expect(dialog.get_by_role("alert")).to_have_text(message)
+                await expect(
+                    dialog.get_by_role("link", name="Continue on Bayou")
+                ).to_have_count(0)
+            assert len(fixture.provider.posts) == 1
+        finally:
+            await browser.close()
 
 
 @pytest.mark.parametrize(
@@ -434,7 +519,7 @@ async def test_worker_reconciles_lost_responses_and_never_posts_when_lookup_fail
 ) -> None:
     fixture = connection_backend
     fixture.provider.lose_post_response = uncertain
-    fixture.provider.fail_lookup = not uncertain
+    fixture.provider.lookup_error_status = None if uncertain else 503
     async with ClientSession(headers={"Authorization": f"Bearer {TOKEN}"}) as client:
         body = {
             "provider": "bayou",
@@ -467,7 +552,7 @@ async def test_worker_reconciles_lost_responses_and_never_posts_when_lookup_fail
             async with client.post(url + "/resume", json={}) as response:
                 assert response.status == 503
             assert fixture.provider.posts == []
-            fixture.provider.fail_lookup = False
+            fixture.provider.lookup_error_status = None
             async with client.post(url + "/resume", json={}) as response:
                 assert response.status == 200
             await asyncio.wait_for(fixture.provider.post_received.wait(), 5)
@@ -525,7 +610,7 @@ async def test_hosted_sync_failure_is_terminal_and_next_sync_can_succeed(
         row = rows[0]
         assert isinstance(row, dict) and isinstance(row["id"], str)
         account = row["id"]
-        fixture.provider.fail_lookup = True
+        fixture.provider.lookup_error_status = 503
 
         async def sync() -> dict[str, object]:
             job = await call(
@@ -545,7 +630,7 @@ async def test_hosted_sync_failure_is_terminal_and_next_sync_can_succeed(
         failed = await sync()
         assert failed["state"] == "failed" and failed["error"] == "provider_unavailable"
         assert failed["finished_at"] is not None
-        fixture.provider.fail_lookup = False
+        fixture.provider.lookup_error_status = None
         next_job = await sync()
         assert next_job["id"] != failed["id"]
         assert next_job["state"] == "partial" and next_job["error"] is None

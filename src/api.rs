@@ -119,6 +119,10 @@ fn connection_error(error: ConnectionError) -> HttpError {
             fail(S::CONFLICT, "connection_changed")
         }
         ConnectionError::NotReady => fail(S::CONFLICT, "connection_not_ready"),
+        ConnectionError::AuthorizationLinkUnavailable => HttpError::for_unavail(
+            Some("bayou_authorization_link_unavailable".to_owned()),
+            "bayou_authorization_link_unavailable".to_owned(),
+        ),
         ConnectionError::Store(StoreError::NotFound) => fail(S::NOT_FOUND, "connection_not_found"),
         ConnectionError::Store(StoreError::InvalidQuery) => {
             fail(S::BAD_REQUEST, "invalid_connection_input")

@@ -1,3 +1,9 @@
+# 0.1.4
+
+Repair app and integration version mismatches from Home Assistant Repairs.
+Open Bayou's hosted sign-in links and distinguish link problems from a rejected
+key or an outage.
+
 # 0.1.3
 
 Connect utility accounts through Bayou's hosted login and retain connections

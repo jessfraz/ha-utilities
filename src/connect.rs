@@ -42,6 +42,8 @@ pub enum ConnectionError {
     Changed,
     #[error("the utility account is not ready to be connected")]
     NotReady,
+    #[error("the Bayou sign-in link is missing or could not be verified")]
+    AuthorizationLinkUnavailable,
     #[error(transparent)]
     Store(#[from] StoreError),
     #[error(transparent)]
@@ -295,7 +297,9 @@ impl ConnectionHandle {
             .await?
             .ok_or(ConnectionError::NotReady)?;
         self.engine.apply_customer(&record, &customer).await?;
-        let link = customer.authorization.ok_or(ConnectionError::NotReady)?;
+        let link = customer
+            .authorization
+            .ok_or(ConnectionError::AuthorizationLinkUnavailable)?;
         authorization_link(&link)
     }
 
@@ -517,31 +521,45 @@ impl ConnectionEngine {
 
 fn authorization_link(link: &str) -> Result<ConnectionAuthorization, ConnectionError> {
     if link.len() > 8192 || link.chars().any(char::is_control) {
-        return Err(ConnectionError::Provider(UtilityError::InvalidResponse));
+        return Err(ConnectionError::AuthorizationLinkUnavailable);
     }
-    let url =
-        Url::parse(link).map_err(|_| ConnectionError::Provider(UtilityError::InvalidResponse))?;
-    let segments = url
-        .path_segments()
-        .map(|segments| segments.collect::<Vec<_>>())
-        .unwrap_or_default();
-    let keys = url.query_pairs().collect::<Vec<_>>();
+    let url = Url::parse(link).map_err(|_| ConnectionError::AuthorizationLinkUnavailable)?;
     if url.scheme() != "https"
         || url.host_str() != Some("bayou.energy")
         || url.port().is_some()
         || !url.username().is_empty()
         || url.password().is_some()
         || url.fragment().is_some()
-        || segments.len() != 3
-        || segments[0] != "companies"
-        || segments[1].is_empty()
-        || !segments[1].bytes().all(|byte| byte.is_ascii_digit())
-        || segments[2] != "sign_up"
-        || keys.len() != 1
-        || keys[0].0 != "key"
-        || keys[0].1.is_empty()
     {
-        return Err(ConnectionError::Provider(UtilityError::InvalidResponse));
+        return Err(ConnectionError::AuthorizationLinkUnavailable);
+    }
+    let segments = url
+        .path_segments()
+        .map(|segments| segments.collect::<Vec<_>>())
+        .unwrap_or_default();
+    let ["companies", company, route @ ..] = segments.as_slice() else {
+        return Err(ConnectionError::AuthorizationLinkUnavailable);
+    };
+    let valid_route = match route {
+        ["sign_up"] => {
+            let mut keys = url.query_pairs();
+            keys.next()
+                .is_some_and(|(key, value)| key == "key" && !value.is_empty())
+                && keys.next().is_none()
+        }
+        ["onboard", token] => {
+            // Preserve the provider's opaque path exactly.
+            link == url.as_str()
+                && url.query().is_none()
+                && (1..=1024).contains(&token.len())
+                && token
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        }
+        _ => false,
+    };
+    if company.is_empty() || !company.bytes().all(|byte| byte.is_ascii_digit()) || !valid_route {
+        return Err(ConnectionError::AuthorizationLinkUnavailable);
     }
     Ok(ConnectionAuthorization {
         url: url.to_string(),
@@ -635,7 +653,7 @@ fn ending(value: &str) -> String {
 mod tests {
     use crate::{
         config::Config,
-        connect::{ConnectionEngine, ConnectionWorker, authorization_link},
+        connect::{ConnectionEngine, ConnectionError, ConnectionWorker, authorization_link},
         models::*,
         store::Store,
         sync::Providers,
@@ -644,11 +662,13 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
-    fn hosted_authorization_accepts_only_the_documented_bayou_origin_and_path() {
+    fn hosted_authorization_accepts_only_supported_bayou_paths() {
         assert!(
             authorization_link("https://bayou.energy/companies/12345/sign_up?key=fictional")
                 .is_ok()
         );
+        let onboard = "https://bayou.energy/companies/12345/onboard/fictional-signin_Token";
+        assert_eq!(authorization_link(onboard).unwrap().url, onboard);
         for link in [
             "http://bayou.energy/companies/12345/sign_up?key=x",
             "https://bayou.energy.evil.invalid/companies/12345/sign_up?key=x",
@@ -659,9 +679,30 @@ mod tests {
             "https://bayou.energy/companies/a/sign_up?key=x",
             "https://bayou.energy/companies/12345/sign_up?key=",
             "https://bayou.energy/companies/12345/sign_up?key=x\n",
+            "https://bayou.energy:443/companies/12345/onboard/x",
+            "https://bayou.energy/companies/12345/./onboard/x",
+            "https://bayou.energy/companies/12345/onboard/",
+            "https://bayou.energy/companies/12345/onboard/x/extra",
+            "https://bayou.energy/companies/12345/unknown/x",
+            "https://bayou.energy/companies/12345/onboard/x%2Fy",
+            "https://bayou.energy/companies/12345/onboard/x.y",
+            "https://bayou.energy/companies/12345/onboard/x?key=y",
         ] {
-            assert!(authorization_link(link).is_err(), "accepted {link}");
+            assert!(
+                matches!(
+                    authorization_link(link),
+                    Err(ConnectionError::AuthorizationLinkUnavailable)
+                ),
+                "accepted {link}"
+            );
         }
+        assert!(
+            authorization_link(&format!(
+                "https://bayou.energy/companies/12345/onboard/{}",
+                "x".repeat(1025)
+            ))
+            .is_err()
+        );
     }
 
     #[tokio::test]

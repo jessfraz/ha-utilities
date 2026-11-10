@@ -39,6 +39,15 @@ export function createConnections({ api, node, providers, updated, connected, on
     customer_not_found: 'This customer could not be found in the configured Bayou workspace.',
     process_interrupted: 'Setup was interrupted. Check the existing connection before continuing.',
   };
+  const serviceErrors = {
+    bayou_not_configured: 'Add a Bayou API key in the app configuration to connect a utility.',
+    bayou_authentication_required: 'Bayou rejected the API key. Check it in the app configuration.',
+    bayou_access_denied: issues.access_denied,
+    bayou_rate_limited: issues.rate_limited,
+    bayou_unavailable: issues.provider_unavailable,
+    bayou_invalid_response: issues.invalid_response,
+    bayou_authorization_link_unavailable: 'Bayou did not return a usable sign-in link. Check status and try again.',
+  };
   async function request(path, options = {}) {
     const active = controller;
     if (!active || !dialog.open) throw new DOMException('Connection closed', 'AbortError');
@@ -54,7 +63,9 @@ export function createConnections({ api, node, providers, updated, connected, on
     error.textContent = failure.status === 403 ? 'A Home Assistant administrator is required to manage utility connections.'
       : failure.status === 409 ? 'This connection changed. Check its status before continuing.'
       : failure.status === 400 || failure.status === 422 ? 'These connection details could not be accepted. Check the utility and selected meters.'
-      : failure.status === 503 ? 'Check that the Bayou API key is configured and the provider is available.'
+      : failure.status === 503 ? (Object.hasOwn(serviceErrors, failure.code)
+        ? serviceErrors[failure.code]
+        : 'Utility connections are temporarily unavailable. Try again shortly.')
       : failure.message;
     if (failure.status === 401) onError(failure);
   }

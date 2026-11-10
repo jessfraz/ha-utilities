@@ -20,7 +20,7 @@ from .client import (
     UtilitiesClient,
     normalize_backend_url,
 )
-from .const import CONF_BACKEND_URL, CONF_TOKEN, DOMAIN
+from .const import CONF_ADDON_SLUG, CONF_BACKEND_URL, CONF_TOKEN, DOMAIN
 from .models import record, valid_system
 
 
@@ -67,7 +67,7 @@ class UtilitiesConfigFlow(ConfigFlow, domain=DOMAIN):
         self._discovered = {
             CONF_BACKEND_URL: origin,
             CONF_TOKEN: token,
-            "addon_slug": discovery_info.slug,
+            CONF_ADDON_SLUG: discovery_info.slug,
         }
         self.context["title_placeholders"] = {"name": "Utilities"}
         return await self.async_step_hassio_confirm()

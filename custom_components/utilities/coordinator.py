@@ -12,6 +12,8 @@ from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.util import dt as dt_util
 
+from ._app_kit.repairs import VersionRepairs
+from ._app_kit.versions import ReleaseVersion
 from .client import ResponseTooLarge, UtilitiesClient
 from .const import DOMAIN, MAX_CALENDAR_ROWS
 from .energy import async_update as async_update_energy
@@ -28,7 +30,6 @@ from .models import (
 
 _LOGGER = logging.getLogger(__name__)
 REPAIRS = (
-    "version_mismatch",
     "provider_credentials",
     "provider_auth",
     "coverage_incomplete",
@@ -45,7 +46,6 @@ class UtilitiesCoordinator(DataUpdateCoordinator[Snapshot]):
         hass: HomeAssistant,
         entry: ConfigEntry,
         client: UtilitiesClient,
-        version: str,
     ) -> None:
         super().__init__(
             hass,
@@ -55,10 +55,10 @@ class UtilitiesCoordinator(DataUpdateCoordinator[Snapshot]):
             update_interval=timedelta(minutes=5),
         )
         self.client = client
-        self.integration_version = version
         self.entry = entry
         self.active = True
         self.backend_version: str | None = None
+        self.version_repairs: VersionRepairs | None = None
 
     @callback
     def stop(self) -> None:
@@ -127,6 +127,14 @@ class UtilitiesCoordinator(DataUpdateCoordinator[Snapshot]):
             if not valid_system(system):
                 raise ValueError("Unexpected backend")
             self.backend_version = text(system.get("version"))
+            if self.active and self.version_repairs is not None:
+                try:
+                    version = ReleaseVersion.parse(self.backend_version)
+                except ValueError:
+                    # A development build cannot establish released version parity.
+                    pass
+                else:
+                    self.version_repairs.async_report(version)
             summary = Summary.parse(await self.read("/v1/summary"))
             today = dt_util.now().date()
             collections, complete = await self.collections(
@@ -153,7 +161,6 @@ class UtilitiesCoordinator(DataUpdateCoordinator[Snapshot]):
             states = {row.state for row in summary.coverage}
             reasons = {row.reason for row in summary.coverage}
             issues = {
-                "version_mismatch": self.backend_version != self.integration_version,
                 "provider_credentials": "not_configured" in states,
                 "provider_auth": bool(
                     reasons
