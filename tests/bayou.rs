@@ -422,6 +422,9 @@ async fn all_history_reads_undated_bills_and_provider_bounded_intervals() {
                 Reply::ok(serde_json::to_string(&vec![bill]).unwrap())
             }
             "/api/v2/customers/71001/intervals" => {
+                if !query["start"].ends_with('Z') || !query["end"].ends_with('Z') {
+                    return Reply::status(400);
+                }
                 assert_eq!(query["meter_id"], METER_ID);
                 assert_eq!(query["account_number"], ACCOUNT_ID);
                 assert_eq!(query["latest_only"], "true");
@@ -476,6 +479,79 @@ async fn all_history_reads_undated_bills_and_provider_bounded_intervals() {
 }
 
 #[tokio::test]
+async fn history_metadata_probe_uses_z_utc_dates_before_reading_usage() {
+    #[derive(Serialize)]
+    struct HistoryMetadata {
+        meters: Vec<IntervalMeter>,
+        first_interval_discovered: &'static str,
+        last_interval_discovered: &'static str,
+    }
+
+    let fixture = Fixture::new(|request| {
+        let query = request
+            .url
+            .query_pairs()
+            .collect::<std::collections::HashMap<_, _>>();
+        match request.url.path() {
+            "/api/v2/customers/71001" => Reply::ok(serde_json::to_string(&customer()).unwrap()),
+            "/api/v2/customers/71001/bills" => Reply::ok("[]"),
+            "/api/v2/customers/71001/intervals" => {
+                if !query["start"].ends_with('Z') || !query["end"].ends_with('Z') {
+                    return Reply::status(400);
+                }
+                assert_eq!(query["account_number"], ACCOUNT_ID);
+                if query.contains_key("meter_id") {
+                    assert_eq!(query["meter_id"], METER_ID);
+                    assert_eq!(query["latest_only"], "true");
+                    assert_eq!(query["start"], "2026-10-01T00:00:00Z");
+                    assert_eq!(query["end"], "2026-10-04T00:00:00Z");
+                    Reply::ok(interval_body(vec![daily(
+                        "2026-10-01T07:00:00Z",
+                        "2026-10-01T07:15:00Z",
+                        100,
+                    )]))
+                } else {
+                    assert_eq!(query["start"], "2026-10-05T00:00:00Z");
+                    assert_eq!(query["end"], "2026-10-06T00:00:00Z");
+                    Reply::ok(
+                        serde_json::to_string(&HistoryMetadata {
+                            meters: Vec::new(),
+                            first_interval_discovered: "2026-10-01T07:00:00Z",
+                            last_interval_discovered: "2026-10-01T07:00:00Z",
+                        })
+                        .unwrap(),
+                    )
+                }
+            }
+            _ => Reply::status(404),
+        }
+    })
+    .await;
+    let adapter = fixture.adapter();
+    let mut request = HistoryRequest {
+        binding: binding(),
+        continuation: None,
+        observed_at: time("2026-10-04T12:00:00Z"),
+    };
+    let first = adapter.sync_history(request.clone()).await.unwrap();
+    request.continuation = first.continuation;
+    assert!(request.continuation.is_some());
+    let last = adapter.sync_history(request).await.unwrap();
+    assert!(last.continuation.is_none());
+    let usage = last
+        .observations
+        .iter()
+        .find_map(|row| match row {
+            Observation::Usage(usage) => Some(usage),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(usage.quantity, Decimal::from(100));
+    assert_eq!(usage.start, time("2026-10-01T07:00:00Z"));
+    fixture.assert_read_only_auth();
+}
+
+#[tokio::test]
 async fn sce_intervals_use_wire_meter_id_without_changing_bill_or_usage_identity() {
     let fixture = Fixture::new(|request| {
         let pairs = request
@@ -496,6 +572,9 @@ async fn sce_intervals_use_wire_meter_id_without_changing_bill_or_usage_identity
                 Reply::ok(serde_json::to_string(&vec![data]).unwrap())
             }
             "/api/v2/customers/71001/intervals" => {
+                if !pairs["start"].ends_with('Z') || !pairs["end"].ends_with('Z') {
+                    return Reply::status(400);
+                }
                 assert_eq!(pairs["account_number"], ACCOUNT_ID);
                 assert_eq!(pairs["latest_only"], "true");
                 if pairs["meter_id"] != SCE_INTERVAL_METER {

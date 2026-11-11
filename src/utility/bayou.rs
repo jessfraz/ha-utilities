@@ -8,7 +8,7 @@
 use std::{borrow::Cow, str::FromStr, time::Duration};
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use chrono::{DateTime, Days, NaiveDate, Utc};
+use chrono::{DateTime, Days, NaiveDate, SecondsFormat, Utc};
 use reqwest::{Client, StatusCode};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -390,11 +390,12 @@ impl Bayou {
         // Retaining only starts in this day avoids duplicate observations.
         let query_end = midnight(add_days(window.last_day, 3)?)?;
         let mut url = self.endpoint(&request.binding.customer_id, Some("intervals"))?;
+        // Bayou's interval endpoint requires UTC timestamps ending in Z.
         url.query_pairs_mut()
             .append_pair("account_number", &request.binding.provider_account)
             .append_pair("meter_id", &meter_id)
-            .append_pair("start", &start.to_rfc3339())
-            .append_pair("end", &query_end.to_rfc3339())
+            .append_pair("start", &start.to_rfc3339_opts(SecondsFormat::Secs, true))
+            .append_pair("end", &query_end.to_rfc3339_opts(SecondsFormat::Secs, true))
             .append_pair("latest_only", "true");
         let response: IntervalResponse = self.get(url).await?;
         let mut meters = response.meters();
@@ -587,8 +588,14 @@ impl Utility for Bayou {
             let mut url = self.endpoint(&request.binding.customer_id, Some("intervals"))?;
             url.query_pairs_mut()
                 .append_pair("account_number", &request.binding.provider_account)
-                .append_pair("start", &midnight(tomorrow)?.to_rfc3339())
-                .append_pair("end", &midnight(add_days(tomorrow, 1)?)?.to_rfc3339());
+                .append_pair(
+                    "start",
+                    &midnight(tomorrow)?.to_rfc3339_opts(SecondsFormat::Secs, true),
+                )
+                .append_pair(
+                    "end",
+                    &midnight(add_days(tomorrow, 1)?)?.to_rfc3339_opts(SecondsFormat::Secs, true),
+                );
             let response: IntervalResponse = self.get(url).await?;
             bounds = response.history_bounds()?;
         }
