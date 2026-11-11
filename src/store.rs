@@ -1,5 +1,6 @@
 //! Reconciled observations, indexed keyset reads, and durable sync lifecycle.
 pub(crate) mod connections;
+mod consolidation;
 mod imports;
 use crate::{
     config::{AccountBinding, Config},

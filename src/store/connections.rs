@@ -64,6 +64,22 @@ impl ConnectionRow {
     }
 }
 
+pub(crate) fn binding_hash(binding: &AccountBinding) -> Result<String, StoreError> {
+    let identity = (
+        &binding.deployment,
+        &binding.provider,
+        &binding.customer_id,
+        &binding.provider_account,
+        &binding.currency,
+        binding
+            .services
+            .iter()
+            .map(|service| (&service.id, &service.provider_service, service.kind))
+            .collect::<Vec<_>>(),
+    );
+    Ok(URL_SAFE_NO_PAD.encode(Sha256::digest(serde_json::to_vec(&identity)?)))
+}
+
 impl Store {
     pub async fn bindings(&self, deployment: &str) -> Result<Vec<AccountBinding>, StoreError> {
         let values: Vec<String> = sqlx::query_scalar(queries::BINDINGS)
@@ -94,20 +110,7 @@ impl Store {
         binding: &AccountBinding,
         connection: Option<&str>,
     ) -> Result<(), StoreError> {
-        // Display text never participates in the immutable binding identity.
-        let identity = (
-            &binding.deployment,
-            &binding.provider,
-            &binding.customer_id,
-            &binding.provider_account,
-            &binding.currency,
-            binding
-                .services
-                .iter()
-                .map(|service| (&service.id, &service.provider_service, service.kind))
-                .collect::<Vec<_>>(),
-        );
-        let hash = URL_SAFE_NO_PAD.encode(Sha256::digest(serde_json::to_vec(&identity)?));
+        let hash = binding_hash(binding)?;
         sqlx::query(crate::store::queries::REGISTER)
             .bind(&binding.id)
             .bind(&hash)

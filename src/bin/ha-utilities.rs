@@ -3,7 +3,10 @@ use clap::{Args, Parser, Subcommand};
 use ha_utilities::{
     client::{Client, ClientError, Transport},
     config::read_secret,
-    imports::{ImportReceipt, ImportRequest, MAX_DOCUMENT_BYTES, MAX_IMPORT_REQUEST_BYTES, digest},
+    imports::{
+        ImportAccountConsolidation, ImportReceipt, ImportRequest, MAX_DOCUMENT_BYTES,
+        MAX_IMPORT_REQUEST_BYTES, digest,
+    },
     models::{
         BindConnection, ConnectionProvider, ConnectionSelection, CreateConnection, ListQuery,
         SyncInput,
@@ -96,6 +99,10 @@ enum Command {
         /// Validate the manifest and source hashes locally.
         #[arg(long)]
         check: bool,
+    },
+    /// Consolidate manual accounts using a reviewed JSON request.
+    ConsolidateImports {
+        request: PathBuf,
     },
 }
 
@@ -408,6 +415,26 @@ async fn ingest(
 async fn run(cli: Cli) -> Result<(), ClientError> {
     let client = || configured_client(&cli.client);
     match cli.command {
+        Command::ConsolidateImports { request } => {
+            let file = File::open(request).map_err(|_| ClientError::new("invalid_import", None))?;
+            let mut body = Vec::new();
+            file.take(
+                u64::try_from(MAX_IMPORT_REQUEST_BYTES)
+                    .map_err(|_| ClientError::new("request_too_large", None))?
+                    + 1,
+            )
+            .read_to_end(&mut body)
+            .map_err(|_| ClientError::new("invalid_import", None))?;
+            if body.len() > MAX_IMPORT_REQUEST_BYTES {
+                return Err(ClientError::new("request_too_large", None));
+            }
+            let request: ImportAccountConsolidation = serde_json::from_slice(&body)
+                .map_err(|_| ClientError::new("invalid_import", None))?;
+            print(
+                &client()?.consolidate_import_accounts(&request).await?,
+                cli.json,
+            )
+        }
         Command::Ingest { bundle, check } => ingest(&bundle, check, &cli.client, cli.json).await,
         Command::Health => print(&client()?.health().await?, cli.json),
         Command::System => print(&client()?.system().await?, cli.json),

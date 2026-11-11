@@ -552,6 +552,46 @@ async def test_bridge_import_routes_require_admin_and_bound_their_bodies(
     )
 
 
+async def test_bridge_consolidation_is_an_admin_only_bounded_import_command(
+    entry: UtilitiesConfigEntry,
+    backend: Backend,
+    hass_client: ClientSessionGenerator,
+    hass_user_token: str,
+) -> None:
+    user = await hass_client(hass_user_token)
+    admin = await hass_client()
+    path = "imports/consolidate"
+    metadata = {"Content-Type": "application/json"}
+    body = b'{"source":{},"target":{}}'
+    backend.responses[f"/v1/{path}"] = (200, b'{"replayed":false}', {})
+    backend.requests.clear()
+    assert (
+        await user.post(f"{PREFIX}/{path}", data=body, headers=metadata)
+    ).status == 403
+    assert (await admin.get(f"{PREFIX}/{path}")).status == 405
+    assert (await admin.post(f"{PREFIX}/{path}", data=body)).status == 415
+    assert (
+        await admin.post(
+            f"{PREFIX}/{path}",
+            data=b"x" * (MAX_IMPORT_REQUEST_BYTES + 1),
+            headers=metadata,
+        )
+    ).status == 413
+    assert not backend.requests
+    response = await admin.post(f"{PREFIX}/{path}", data=body, headers=metadata)
+    assert response.status == 200
+    assert response.headers["Cache-Control"] == "no-store"
+    assert len(backend.requests) == 1
+    received = backend.requests[0]
+    assert (received.method, received.path, received.content_type, received.body) == (
+        "POST",
+        f"/v1/{path}",
+        "application/json",
+        body,
+    )
+    assert received.authorization == f"Bearer {TOKEN}"
+
+
 async def test_hosted_connections_require_admin_even_for_the_authorization_link(
     entry: UtilitiesConfigEntry,
     backend: Backend,

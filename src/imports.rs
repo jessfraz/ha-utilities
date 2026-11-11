@@ -96,6 +96,41 @@ pub struct ImportAccountPurgeReceipt {
     pub documents: u64,
 }
 
+/// Move manual records into one account while retaining their intake identities.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ImportAccountConsolidation {
+    pub source: ImportAccount,
+    pub target: ImportAccount,
+    pub currency: String,
+    pub expected_source_records: u64,
+    pub expected_target_records: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+pub struct ImportAccountConsolidationReceipt {
+    pub account_id: String,
+    pub absorbed_account_id: String,
+    pub records_moved: u64,
+    pub replayed: bool,
+}
+
+impl ImportAccountConsolidation {
+    pub fn validate(&self) -> Result<(), ImportError> {
+        self.source.validate(&self.currency)?;
+        self.target.validate(&self.currency)?;
+        if self.source.id == self.target.id
+            || self.source.provider != self.target.provider
+            || self.source.start_on != self.target.start_on
+            || self.expected_source_records == 0
+            || self.expected_target_records == 0
+        {
+            return Err(ImportError::Invalid);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ImportRecord {
@@ -435,19 +470,17 @@ fn service_matches(provider: ImportProvider, service: ServiceKind) -> bool {
     }
 }
 
-impl ImportRequest {
-    pub fn validate(&self) -> Result<(), ImportError> {
-        let account = &self.account;
+impl ImportAccount {
+    fn validate(&self, currency: &str) -> Result<(), ImportError> {
+        let account = self;
         let mut service_ids = BTreeSet::new();
         if !valid_id(&account.id)
             || account
                 .provider_account_sha256
                 .as_deref()
                 .is_some_and(|d| !valid_digest(d))
-            || !matches!(self.currency.as_str(), "USD" | "CAD")
+            || !matches!(currency, "USD" | "CAD")
             || account.services.len() > 64
-            || self.records.is_empty()
-            || self.records.len() > 200
             || account.services.iter().any(|s| {
                 !valid_id(&s.id)
                     || !service_matches(account.provider, s.kind)
@@ -456,10 +489,20 @@ impl ImportRequest {
         {
             return Err(ImportError::Invalid);
         }
+        Ok(())
+    }
+}
+
+impl ImportRequest {
+    pub fn validate(&self) -> Result<(), ImportError> {
+        self.account.validate(&self.currency)?;
+        if self.records.is_empty() || self.records.len() > 200 {
+            return Err(ImportError::Invalid);
+        }
         let mut ids = BTreeSet::new();
         for record in &self.records {
-            record.validate(account)?;
-            if !ids.insert(record.id(&account.id)?) {
+            record.validate(&self.account)?;
+            if !ids.insert(record.id(&self.account.id)?) {
                 return Err(ImportError::Invalid);
             }
         }
@@ -847,6 +890,7 @@ impl ImportRecord {
         binding: &AccountBinding,
         id: &str,
         observed_at: DateTime<Utc>,
+        origin_id: &str,
     ) -> Result<Option<Observation>, ImportError> {
         let money = |minor_units| Money {
             minor_units,
@@ -902,7 +946,7 @@ impl ImportRecord {
             }),
             Self::Payment(value) => Observation::Payment(Payment {
                 bill_id: self
-                    .bill_link(&account_id)
+                    .bill_link(origin_id)
                     .map_err(crate::store::StoreError::from)?,
                 id,
                 account_id,

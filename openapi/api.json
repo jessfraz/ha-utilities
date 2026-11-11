@@ -873,6 +873,64 @@
         ],
         "type": "object"
       },
+      "ImportAccountConsolidation": {
+        "additionalProperties": false,
+        "description": "Move manual records into one account while retaining their intake identities.",
+        "properties": {
+          "currency": {
+            "type": "string"
+          },
+          "expected_source_records": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "expected_target_records": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "source": {
+            "$ref": "#/components/schemas/ImportAccount"
+          },
+          "target": {
+            "$ref": "#/components/schemas/ImportAccount"
+          }
+        },
+        "required": [
+          "currency",
+          "expected_source_records",
+          "expected_target_records",
+          "source",
+          "target"
+        ],
+        "type": "object"
+      },
+      "ImportAccountConsolidationReceipt": {
+        "properties": {
+          "absorbed_account_id": {
+            "type": "string"
+          },
+          "account_id": {
+            "type": "string"
+          },
+          "records_moved": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "replayed": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "absorbed_account_id",
+          "account_id",
+          "records_moved",
+          "replayed"
+        ],
+        "type": "object"
+      },
       "ImportAccountPurge": {
         "additionalProperties": false,
         "properties": {
@@ -3305,6 +3363,52 @@
           }
         },
         "summary": "Remove an import-only account and its exclusively linked source documents.",
+        "tags": [
+          "imports"
+        ]
+      }
+    },
+    "/v1/imports/consolidate": {
+      "post": {
+        "operationId": "consolidate_import_accounts",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ImportAccountConsolidation"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ImportAccountConsolidationReceipt"
+                }
+              }
+            },
+            "description": "successful operation",
+            "headers": {
+              "cache-control": {
+                "required": true,
+                "schema": {
+                  "type": "string"
+                },
+                "style": "simple"
+              }
+            }
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Consolidate manual ownership without changing record or collector identities.",
         "tags": [
           "imports"
         ]

@@ -37,6 +37,7 @@ _ROUTES = (
     (re.compile(rf"bills/{_RECORD_ID}|sync/{_ID}"), {"GET"}, set()),
     (re.compile("sync"), {"GET", "POST"}, set()),
     (re.compile("imports"), {"POST"}, set()),
+    (re.compile("imports/consolidate"), {"POST"}, set()),
     (re.compile(r"documents/[0-9a-f]{64}"), {"PUT"}, set()),
     (re.compile("connections"), {"GET", "POST"}, set()),
     (re.compile("providers/bayou/utilities"), {"GET"}, set()),
@@ -131,7 +132,7 @@ class UtilitiesView(HomeAssistantView):
         )
         if not await authorized(self._hass, entry, coordinator, user_id, admin=admin):
             raise web.HTTPForbidden
-        import_request = path == "imports"
+        import_request = path in {"imports", "imports/consolidate"}
         document_upload = request.method == "PUT"
         max_bytes = MAX_REQUEST_BYTES
         content_type = "application/json"
