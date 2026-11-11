@@ -15,6 +15,7 @@ from . import UtilitiesConfigEntry
 from .client import ResponseTooLarge
 from .const import DOMAIN
 from .coordinator import UtilitiesCoordinator
+from .models import CollectionCoverage
 
 
 async def async_setup_entry(
@@ -44,14 +45,16 @@ class CollectionCalendar(CoordinatorEntity[UtilitiesCoordinator], CalendarEntity
             super().available
             and not self.coordinator.data.summary.stale
             and (
-                self.coordinator.data.collections_complete
+                self.coordinator.data.collections_coverage
+                is not CollectionCoverage.INCOMPLETE
                 or bool(self.coordinator.data.collections)
             )
         )
 
     def _set_coverage(self) -> None:
         self._attr_extra_state_attributes = {
-            "coverage_complete": self.coordinator.data.collections_complete
+            "coverage_complete": self.coordinator.data.collections_complete,
+            "coverage_status": self.coordinator.data.collections_coverage.value,
         }
 
     @callback
@@ -80,7 +83,7 @@ class CollectionCalendar(CoordinatorEntity[UtilitiesCoordinator], CalendarEntity
         if end_date <= start_date or end_date - start_date > timedelta(days=366):
             raise HomeAssistantError("Request a calendar window of at most one year")
         try:
-            rows, complete = await coordinator.collections(
+            rows, coverage = await coordinator.collections(
                 dt_util.as_local(start_date).date().isoformat(),
                 dt_util.as_local(end_date - timedelta.resolution).date().isoformat(),
             )
@@ -94,12 +97,13 @@ class CollectionCalendar(CoordinatorEntity[UtilitiesCoordinator], CalendarEntity
             raise HomeAssistantError("Cannot read the collection schedule") from err
         if not coordinator.active or coordinator.data.summary.stale:
             raise HomeAssistantError("Collection data is unavailable or stale")
+        complete = coverage is CollectionCoverage.COMPLETE
         events = [
             event
             for row in rows
             if (event := row.event(complete=complete)).start_datetime_local < end_date
             and event.end_datetime_local > start_date
         ]
-        if not events and not complete:
+        if not events and coverage is CollectionCoverage.INCOMPLETE:
             raise HomeAssistantError("Collection coverage is incomplete")
         return events

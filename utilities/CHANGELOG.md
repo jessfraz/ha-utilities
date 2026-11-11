@@ -1,3 +1,8 @@
+# 0.1.14
+
+Keep the collection calendar available when a provider explicitly reports no
+collection support. Preserve errors for missing, stale or incomplete coverage.
+
 # 0.1.13
 
 Keep sync controls and progress in each live connection's Settings dialog.
