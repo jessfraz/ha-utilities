@@ -457,6 +457,7 @@ async fn imported_accounts_remain_outside_provider_sync_and_freshness() {
     assert_eq!(summary.import_only_accounts, 1);
     assert!(summary.last_imported_at.is_some());
     assert!(!summary.manual_accounts_stale);
+    assert!(summary.stale_manual_accounts.is_empty());
     assert!(summary.stale_automatic_accounts.is_empty());
 
     let sync = format!("{}/v1/sync", app.url);

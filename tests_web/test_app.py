@@ -1,6 +1,8 @@
 """Exercise real read-model views, paging, filters, and recoverable failures."""
 
+import asyncio
 import re
+import sqlite3
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
@@ -9,7 +11,7 @@ from urllib.parse import parse_qs, urlsplit
 
 import pytest
 from aiohttp import ClientSession, web
-from playwright.async_api import Page, Request, Route, async_playwright, expect
+from playwright.async_api import Locator, Page, Request, Route, async_playwright, expect
 from pytest_aiohttp.plugin import AiohttpServer
 
 from tests_web.conftest import WebBackend
@@ -22,6 +24,8 @@ async def open_app(page: Page, backend: WebBackend) -> None:
         page.get_by_role("heading", name="Overview", exact=True)
     ).to_be_visible()
     await expect(page.locator("#content")).to_have_attribute("aria-busy", "false")
+    await expect(page.get_by_role("region", name="Saved utility data")).to_be_visible()
+    await expect(page.locator(".coverage-panel")).to_have_count(0)
 
 
 @pytest.mark.parametrize("web_backend", ["account_cards"], indirect=True)
@@ -148,6 +152,15 @@ async def test_settings_show_sources_categories_and_collapsed_diagnostics(
     await expect(page.get_by_label("Utility providers")).to_be_hidden()
     await expect(page.get_by_role("heading", name="Data coverage")).to_be_hidden()
     await page.set_viewport_size({"width": 390, "height": 844})
+    await assert_horizontal_visibility(
+        page, page.get_by_role("button", name="Settings", exact=True)
+    )
+    await expect(page.locator("#freshness-badge .badge")).to_have_text(
+        [
+            "Bayou · Electricity (SCE) · Needs attention",
+            "Waste Management · Waste service · Needs attention",
+        ]
+    )
     await page.screenshot(path=str(tmp_path / "settings-mobile.png"), full_page=True)
     assert await page.evaluate(
         "document.documentElement.scrollWidth <= window.innerWidth"
@@ -158,6 +171,14 @@ async def test_settings_show_sources_categories_and_collapsed_diagnostics(
     await diagnostics.get_by_text("Diagnostics", exact=True).click()
     await expect(page.get_by_label("Utility providers")).to_be_hidden()
     await expect(page.get_by_role("heading", name="Data coverage")).to_be_hidden()
+
+
+async def assert_horizontal_visibility(page: Page, locator: Locator) -> None:
+    viewport = page.viewport_size
+    assert viewport is not None
+    box = await locator.bounding_box()
+    assert box is not None
+    assert box["x"] >= 0 and box["x"] + box["width"] <= viewport["width"]
 
 
 @pytest.mark.parametrize("web_backend", ["bayou_only"], indirect=True)
@@ -216,6 +237,9 @@ async def test_native_sign_in_is_masked_and_uses_only_an_httponly_session(
             await expect(page.locator("#content")).to_have_attribute(
                 "aria-busy", "false"
             )
+            await expect(
+                page.get_by_role("region", name="Saved utility data")
+            ).to_be_visible()
             cookie = next(
                 cookie
                 for cookie in await page.context.cookies()
@@ -276,6 +300,9 @@ async def test_relative_assets_and_api_requests_work_behind_a_real_proxy_prefix(
                 await expect(page.locator("#content")).to_have_attribute(
                     "aria-busy", "false"
                 )
+                await expect(
+                    page.get_by_role("region", name="Saved utility data")
+                ).to_be_visible()
                 await page.get_by_role("button", name="Bills", exact=True).click()
                 await expect(page.locator(".data-table tbody tr")).to_have_count(25)
                 assert all(
@@ -304,6 +331,9 @@ async def test_bills_page_filter_and_honest_read_only_detail(
     waste_badges = account_badges.filter(has_text=re.compile("^Waste service$"))
     await expect(energy_badges).not_to_have_count(0)
     await expect(waste_badges).not_to_have_count(0)
+    await expect(
+        page.locator(".data-table tbody tr td:nth-child(2) small")
+    ).to_have_count(0)
     energy_colors: list[str] = await energy_badges.evaluate_all(
         "(badges) => badges.map((badge) => getComputedStyle(badge).backgroundColor)"
     )
@@ -317,6 +347,11 @@ async def test_bills_page_filter_and_honest_read_only_detail(
     await page.screenshot(path=str(tmp_path / "bills-dark.png"))
     await page.emulate_media(color_scheme="light")
     await page.set_viewport_size({"width": 390, "height": 844})
+    first_row = page.locator(".data-table tbody tr").first
+    account_box = await first_row.locator(".account-badge").bounding_box()
+    issued_box = await first_row.get_by_role("button").first.bounding_box()
+    assert account_box is not None and issued_box is not None
+    assert account_box["y"] < issued_box["y"]
     await page.screenshot(path=str(tmp_path / "bills-mobile.png"))
     await page.set_viewport_size({"width": 1280, "height": 720})
     await expect(
@@ -343,13 +378,14 @@ async def test_bills_page_filter_and_honest_read_only_detail(
     await expect(page.locator("#content")).to_have_attribute("aria-busy", "false")
     rows = page.locator(".data-table tbody tr")
     assert await rows.count() > 0
-    await expect(rows.first.locator("td").nth(4)).to_contain_text("unlocked")
+    await expect(rows.first.locator("td").nth(4)).to_contain_text("Synced from Bayou")
     first_bill = rows.first.get_by_role("button")
     await first_bill.click()
     dialog = page.get_by_role("dialog", name="Bill details")
     await expect(dialog.locator(".account-badge")).to_have_css(
         "background-color", energy_colors[0]
     )
+    await expect(dialog.get_by_text("unlocked", exact=True)).to_be_visible()
     await expect(
         dialog.get_by_text("Previous-cycle balance", exact=True)
     ).to_be_visible()
@@ -414,6 +450,11 @@ async def test_imported_vendor_bills_include_construction_across_pages(
                         "value": f"{account}-{offset}",
                     },
                     "issued_on": (today - timedelta(days=offset)).isoformat(),
+                    "due_on": None
+                    if offset == 32
+                    else (
+                        today - timedelta(days=offset) + timedelta(days=14)
+                    ).isoformat(),
                     "totals": {"new_charges_minor": 200000 if offset == 32 else 7500},
                     "sources": [{"sha256": digest, "role": "invoice"}],
                     "charges": [
@@ -448,11 +489,19 @@ async def test_imported_vendor_bills_include_construction_across_pages(
                 response.raise_for_status()
 
     page = utility_page
+    requests: list[Request] = []
+    page.on("request", lambda request: requests.append(request))
     await open_app(page, web_backend)
-    vendor = page.get_by_role("region", name="Imported vendors")
-    await expect(vendor.get_by_text("Spectrum", exact=True)).to_have_count(1)
-    await vendor.get_by_role("button", name="View Spectrum bills").click()
+    await expect(
+        page.get_by_role("heading", name="Imported vendors", exact=True)
+    ).to_have_count(0)
+    await page.get_by_role("button", name="Bills", exact=True).click()
     filters = page.get_by_role("form", name="Filter bills")
+    await filters.get_by_label("Account or vendor").select_option(
+        "import_provider/spectrum"
+    )
+    await filters.get_by_role("button", name="Apply filters", exact=True).click()
+    await expect(page.locator("#content")).to_have_attribute("aria-busy", "false")
     await expect(filters.get_by_label("Account or vendor")).to_have_value(
         "import_provider/spectrum"
     )
@@ -467,16 +516,29 @@ async def test_imported_vendor_bills_include_construction_across_pages(
         "(badge) => getComputedStyle(badge).backgroundColor"
     )
     await expect(
-        page.get_by_role("columnheader", name="Source status", exact=True)
+        page.get_by_role("columnheader", name="Source", exact=True)
     ).to_be_visible()
-    await expect(rows.nth(1)).to_contain_text("Document imported")
+    await expect(rows.nth(1)).to_contain_text("Original documents")
     await page.get_by_role("button", name="Load more", exact=True).click()
     await expect(rows).to_have_count(27)
     await expect(rows.last).to_contain_text("Construction account")
     await expect(rows.last.locator(".account-badge")).to_have_css(
         "background-color", vendor_color
     )
-    await rows.last.get_by_role("button").click()
+    await expect(rows.last).to_contain_text("Date unavailable")
+    await page.set_viewport_size({"width": 390, "height": 844})
+    due = today + timedelta(days=7)
+    await expect(rows.nth(1).locator("td").nth(2)).to_have_text(
+        f"{due:%b} {due.day}, {due:%Y}"
+    )
+    for cell in [rows.nth(1).locator("td").nth(index) for index in [1, 2, 3, 4]]:
+        await assert_horizontal_visibility(page, cell)
+    assert not any(
+        urlsplit(request.url).path.endswith("/details") for request in requests
+    )
+    await rows.last.get_by_role(
+        "button", name=re.compile("^View original documents")
+    ).click()
     dialog = page.get_by_role("dialog", name="Bill details")
     await expect(
         dialog.get_by_role("heading", name="Spectrum", exact=True)
@@ -487,8 +549,12 @@ async def test_imported_vendor_bills_include_construction_across_pages(
     )
     await expect(dialog.get_by_text("Aerial construction", exact=True)).to_be_visible()
     await expect(
-        dialog.get_by_role("link", name="Invoice", exact=True)
+        dialog.get_by_role("link", name="Download invoice", exact=True)
     ).to_have_attribute("href", f"v1/documents/{digest}")
+    await expect(
+        dialog.get_by_role("link", name="Download invoice", exact=True)
+    ).to_be_focused()
+    await expect(dialog.get_by_text("Date unavailable", exact=True)).to_be_visible()
     await page.keyboard.press("Escape")
     await filters.get_by_label("Account or vendor").select_option(
         "import_provider:spectrum"
@@ -521,7 +587,7 @@ async def test_imported_vendor_bills_include_construction_across_pages(
 
 
 async def test_usage_includes_billed_water_periods_and_source_documents(
-    utility_page: Page, web_backend: WebBackend
+    utility_page: Page, web_backend: WebBackend, tmp_path: Path
 ) -> None:
     today = datetime.now(UTC).date()
     source = b"Fictional water billing evidence."
@@ -605,6 +671,9 @@ async def test_usage_includes_billed_water_periods_and_source_documents(
 
     page = utility_page
     await open_app(page, web_backend)
+    await expect(
+        page.get_by_role("region", name="Account freshness")
+    ).not_to_contain_text("LVMWD")
     await page.get_by_role("button", name="Usage", exact=True).click()
     billed = page.get_by_role("region", name="Billed usage", exact=True)
     rows = billed.get_by_role("table").locator("tbody tr")
@@ -617,6 +686,10 @@ async def test_usage_includes_billed_water_periods_and_source_documents(
     await expect(rows.first.locator("td").first).to_have_text(
         f"{start:%b} {start.day}, {start:%Y} – {through:%b} {through.day}, {through:%Y}"
     )
+    await page.screenshot(path=str(tmp_path / "usage-desktop.png"))
+    await page.emulate_media(color_scheme="dark")
+    await page.screenshot(path=str(tmp_path / "usage-dark.png"))
+    await page.emulate_media(color_scheme="light")
     await rows.first.get_by_role("button").click()
     dialog = page.get_by_role("dialog", name="Bill details")
     await expect(dialog.get_by_text("0 CCF", exact=True)).to_be_visible()
@@ -624,7 +697,7 @@ async def test_usage_includes_billed_water_periods_and_source_documents(
         dialog.get_by_role("table", name="Water meter readings")
     ).to_be_visible()
     await expect(
-        dialog.get_by_role("link", name="Invoice", exact=True)
+        dialog.get_by_role("link", name="Download invoice", exact=True)
     ).to_have_attribute("href", f"v1/documents/{digest}")
     await page.keyboard.press("Escape")
     intervals = page.get_by_role("region", name="Meter intervals", exact=True)
@@ -643,6 +716,101 @@ async def test_usage_includes_billed_water_periods_and_source_documents(
         page.get_by_role("heading", name="No meter intervals reported")
     ).to_be_visible()
     await expect(billed.get_by_role("table").locator("tbody tr")).to_have_count(32)
+    await page.set_viewport_size({"width": 390, "height": 844})
+    await assert_horizontal_visibility(page, rows.first.locator("td.numeric"))
+    await assert_horizontal_visibility(page, rows.first.get_by_role("button"))
+    assert not await page.evaluate("document.documentElement.scrollWidth > innerWidth")
+    await page.evaluate("window.scrollTo(0, 0)")
+    await page.screenshot(path=str(tmp_path / "usage-mobile.png"))
+
+
+async def test_sync_warnings_name_the_affected_provider_and_account(
+    utility_page: Page, web_backend: WebBackend, tmp_path: Path
+) -> None:
+    await utility_page.clock.install()
+
+    def seed_history() -> None:
+        with sqlite3.connect(web_backend.database) as database:
+            database.execute(
+                "UPDATE sync_jobs SET state='complete' WHERE account_id=?",
+                ("demo-wm",),
+            )
+            database.execute(
+                "UPDATE coverage SET payload="
+                "json_set(payload,'$.state','complete','$.reason',NULL) "
+                "WHERE account_id=? AND json_extract(payload,'$.state')!='unsupported'",
+                ("demo-wm",),
+            )
+            database.execute(
+                "DELETE FROM sync_jobs WHERE account_id=?", ("demo-energy",)
+            )
+
+    await asyncio.to_thread(seed_history)
+    page = utility_page
+    await open_app(page, web_backend)
+    await expect(page.locator("#freshness-badge")).to_contain_text(
+        "Bayou · Energy service"
+    )
+    freshness = page.get_by_role("region", name="Account freshness", exact=True)
+    await expect(freshness).to_contain_text("Bayou · Energy service")
+    await expect(freshness).to_contain_text("No successful sync yet.")
+    await expect(freshness).not_to_contain_text("Waste service")
+    await expect(page.locator("#freshness-badge")).not_to_contain_text("Waste service")
+    await expect(
+        page.get_by_role("contentinfo").get_by_role("status")
+    ).not_to_contain_text("Bayou · Energy service")
+    await page.screenshot(path=str(tmp_path / "overview-desktop.png"))
+    await page.set_viewport_size({"width": 390, "height": 844})
+    await page.screenshot(path=str(tmp_path / "overview-mobile.png"))
+    await page.set_viewport_size({"width": 1280, "height": 720})
+    async with ClientSession(
+        headers={"Authorization": f"Bearer {web_backend.token}"}
+    ) as client:
+        async with client.post(
+            f"{web_backend.origin}/v1/sync",
+            json={"account": "demo-energy", "from": "2025-01-01", "to": "2025-01-02"},
+        ) as response:
+            response.raise_for_status()
+            job = await response.json()
+        async with asyncio.timeout(10):
+            while True:
+                async with client.get(
+                    f"{web_backend.origin}/v1/sync/{job['id']}"
+                ) as response:
+                    response.raise_for_status()
+                    current = await response.json()
+                if current["state"] != "running":
+                    assert current["state"] == "failed"
+                    break
+                await asyncio.sleep(0.05)
+
+    await page.get_by_role("button", name="Refresh local utility data").click()
+    await expect(freshness).to_contain_text("Sync failed.")
+    await expect(freshness).to_contain_text("Bayou · Energy service")
+    await expect(freshness).not_to_contain_text("Waste service")
+    await expect(page.locator("#sync-status")).to_have_count(0)
+    await page.get_by_role("button", name="Settings", exact=True).click()
+    await expect(
+        page.locator("#sync-status p").filter(has_text="Sync failed")
+    ).to_contain_text("Bayou · Energy service")
+    await page.get_by_label("Account to sync", exact=True).select_option("demo-energy")
+    await expect(page.locator("#sync-availability")).to_have_text(
+        "Bayou · Energy service · Provider credentials are not configured."
+    )
+
+    async def fail_status(route: Route) -> None:
+        await route.abort()
+
+    await page.route("**/v1/sync", fail_status)
+    await page.clock.run_for(15_001)
+    await expect(page.locator("#sync-status")).to_contain_text(
+        "Bayou · Energy service · Sync status could not be checked. "
+        "The last saved state was failed."
+    )
+    await expect(page.locator("#sync-status")).to_contain_text(
+        "Waste Management · Waste service · Sync status could not be checked. "
+        "The last saved state was complete."
+    )
     await page.set_viewport_size({"width": 390, "height": 844})
     assert not await page.evaluate("document.documentElement.scrollWidth > innerWidth")
 
@@ -684,7 +852,7 @@ async def test_collections_and_usage_filters_keep_units_and_report_exceptions(
     await expect(
         page.get_by_role("button", name="Load more", exact=True)
     ).to_be_hidden()
-    await expect(page.get_by_role("heading", name="Data coverage")).to_have_count(0)
+    await expect(page.locator(".coverage-panel")).to_have_count(0)
     await expect(page.locator(".list-meta [role=status]")).to_be_focused()
 
 
@@ -713,7 +881,7 @@ async def test_failed_refresh_preserves_saved_results_and_recovers(
     await expect(
         page.get_by_role("contentinfo").get_by_role("status")
     ).not_to_contain_text("connection lost")
-    await expect(page.locator(".metrics")).to_be_visible()
+    await expect(page.get_by_role("region", name="Saved utility data")).to_be_visible()
 
 
 async def test_unconfigured_sync_requires_an_explicit_account_without_sending_requests(
@@ -737,16 +905,20 @@ async def test_unconfigured_sync_requires_an_explicit_account_without_sending_re
         page.get_by_role("button", name="Sync account", exact=True)
     ).to_be_disabled()
     await expect(
-        page.get_by_text("Waste Management credentials are not configured.", exact=True)
+        page.get_by_text(
+            "Waste Management · Waste service · "
+            "Provider credentials are not configured.",
+            exact=True,
+        )
     ).to_be_visible()
     assert not [request for request in requests if request.method != "GET"]
+    diagnostics = page.locator("details.diagnostics")
+    await expect(diagnostics).to_have_js_property("open", False)
+    await expect(page.get_by_role("heading", name="Data coverage")).to_be_hidden()
     await expect(page.get_by_text("Not configured", exact=True).first).to_be_hidden()
-    await (
-        page.locator("details.diagnostics")
-        .get_by_text("Diagnostics", exact=True)
-        .click()
-    )
+    await diagnostics.locator("summary").click()
     await expect(page.get_by_text("Not configured", exact=True).first).to_be_visible()
+    await expect(page.get_by_role("heading", name="Data coverage")).to_be_visible()
     await expect(
         page.get_by_role("button", name=re.compile("book|pay|cancel service", re.I))
     ).to_have_count(0)
@@ -800,17 +972,11 @@ async def test_mobile_dark_keyboard_and_empty_state_layout(
                     )
                 if name == "Bills":
                     if width <= 390:
-                        scroll_region = page.get_by_role(
-                            "region",
-                            name="Bills matching the selected filters",
-                            exact=True,
-                        )
-                        await scroll_region.focus()
-                        await expect(scroll_region).to_be_focused()
-                        await page.keyboard.press("ArrowRight")
-                        await expect(scroll_region).not_to_have_js_property(
-                            "scrollLeft", 0
-                        )
+                        row = page.locator(".bills-table tbody tr").first
+                        for index in [1, 2, 3]:
+                            await assert_horizontal_visibility(
+                                page, row.locator("td").nth(index)
+                            )
                     await (
                         page.locator(".data-table tbody tr")
                         .first.get_by_role("button")

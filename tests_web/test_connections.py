@@ -614,9 +614,9 @@ async def test_manual_sync_progress_survives_reload_and_reconciles_overlapping_r
             gate.clear()
             await from_field.fill((today - timedelta(days=30)).isoformat())
             await submit.click()
-            await expect(status).to_contain_text("Syncing Example electricity")
+            await expect(status).to_contain_text("Syncing Bayou · Example electricity")
             await page.reload()
-            await expect(status).to_contain_text("Syncing Example electricity")
+            await expect(status).to_contain_text("Syncing Bayou · Example electricity")
             gate.set()
             await expect(status).to_contain_text("Sync finished with coverage gaps")
             assert fixture.provider.bill_requests.count(billed_on.isoformat()) == 2
@@ -658,9 +658,9 @@ async def test_first_and_manual_sync_share_saved_progress(
             await dialog.get_by_role("button", name="Go to sync settings").click()
 
             status = page.locator("#sync-status")
-            await expect(status).to_contain_text("Syncing Example electricity")
+            await expect(status).to_contain_text("Syncing Bayou · Example electricity")
             await page.reload()
-            await expect(status).to_contain_text("Syncing Example electricity")
+            await expect(status).to_contain_text("Syncing Bayou · Example electricity")
             await page.get_by_label("Account to sync").select_option(
                 label="Example electricity"
             )
@@ -673,9 +673,9 @@ async def test_first_and_manual_sync_share_saved_progress(
 
             gate.clear()
             await submit.click()
-            await expect(status).to_contain_text("Syncing Example electricity")
+            await expect(status).to_contain_text("Syncing Bayou · Example electricity")
             await page.reload()
-            await expect(status).to_contain_text("Syncing Example electricity")
+            await expect(status).to_contain_text("Syncing Bayou · Example electricity")
             gate.set()
             await expect(status).to_contain_text("Sync finished with coverage gaps")
 
@@ -696,7 +696,7 @@ async def test_first_and_manual_sync_share_saved_progress(
             body = (await submitted.value).post_data_json
             assert isinstance(body, dict) and set(body) == {"account", "range"}
             assert body["range"] == "all"
-            await expect(status).to_contain_text("Syncing Example electricity")
+            await expect(status).to_contain_text("Syncing Bayou · Example electricity")
             gate.set()
             await expect(status).to_contain_text("Sync finished with coverage gaps")
             assert fixture.provider.bills_queries[-1] == {"account_number"}

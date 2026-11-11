@@ -291,6 +291,7 @@ impl Store {
             import_only_accounts: 0,
             stale: true,
             stale_automatic_accounts: Vec::new(),
+            stale_manual_accounts: Vec::new(),
             manual_accounts_stale: false,
         };
         for row in query.build().fetch_all(&self.pool).await? {
@@ -457,6 +458,39 @@ impl Store {
                 ))
             })
             .collect()
+    }
+
+    pub(crate) async fn stale_manual_accounts(
+        &self,
+        deployment: &str,
+        accounts: &[String],
+        cutoff: DateTime<Utc>,
+    ) -> Result<Vec<StaleManualAccount>, StoreError> {
+        if accounts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut query = manual_freshness_sql(deployment, accounts);
+        let rows = query
+            .build_query_as::<(String, String, Option<String>)>()
+            .fetch_all(&self.pool)
+            .await?;
+        let mut stale = Vec::new();
+        for (account_id, name, last_synced_at) in rows {
+            let last_synced_at = last_synced_at
+                .as_deref()
+                .map(DateTime::parse_from_rfc3339)
+                .transpose()
+                .map_err(|_| StoreError::InvalidObservation)?
+                .map(|time| time.with_timezone(&Utc));
+            if last_synced_at.is_none_or(|time| time <= cutoff) {
+                stale.push(StaleManualAccount {
+                    account_id,
+                    name,
+                    last_synced_at,
+                });
+            }
+        }
+        Ok(stale)
     }
 
     pub async fn finish_job(
@@ -766,6 +800,10 @@ mod queries {
     pub const SUMMARY_PREFIX: &str =
         "SELECT kind,count(*) AS count FROM observations WHERE account_id IN (";
     pub const FRESHNESS_PREFIX: &str = "SELECT count(*) AS accounts,max(finished_at) AS newest,min(finished_at) AS oldest FROM (SELECT account_id,max(finished_at) AS finished_at FROM sync_jobs WHERE state IN ('complete','partial') AND account_id IN (";
+    pub const MANUAL_FRESHNESS_PREFIX: &str = "SELECT account.id,json_extract(account.binding,'$.name') AS name,max(job.finished_at) AS last_synced_at
+        FROM accounts AS account LEFT JOIN sync_jobs AS job
+        ON job.account_id=account.id AND job.state IN ('complete','partial')
+        WHERE account.deployment=";
     pub const START_JOB: &str = "INSERT INTO sync_jobs(id,account_id,state,started_at,scheduled_for,initial_history) VALUES(?,?,'running',strftime('%Y-%m-%dT%H:%M:%fZ','now'),?,?) RETURNING id,account_id,state,started_at,finished_at,observations,error";
     pub const MARK_AUTOMATIC_START: &str = "UPDATE accounts SET automatic_started_at=COALESCE(automatic_started_at,strftime('%Y-%m-%dT%H:%M:%fZ','now')) WHERE id=? AND binding IS NOT NULL AND import_only=0 AND initial_history_finished_at IS NULL";
     pub const FINISH_INITIAL_HISTORY: &str = "UPDATE accounts SET initial_history_finished_at=COALESCE(initial_history_finished_at,strftime('%Y-%m-%dT%H:%M:%fZ','now')) WHERE id=?";
@@ -817,12 +855,25 @@ fn freshness_sql(accounts: &[String]) -> QueryBuilder<Sqlite> {
     query
 }
 
+fn manual_freshness_sql(deployment: &str, accounts: &[String]) -> QueryBuilder<Sqlite> {
+    let mut query = QueryBuilder::new(queries::MANUAL_FRESHNESS_PREFIX);
+    query
+        .push_bind(deployment)
+        .push(" AND account.binding IS NOT NULL AND account.import_only=0 AND account.id IN (");
+    bind_accounts(&mut query, accounts);
+    query.push(") GROUP BY account.id ORDER BY account.id");
+    query
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{
         config::Config,
         models::*,
-        store::{Store, StoreError, bind_accounts, freshness_sql, list_sql, queries, summary_sql},
+        store::{
+            Store, StoreError, bind_accounts, freshness_sql, list_sql, manual_freshness_sql,
+            queries, summary_sql,
+        },
         utility::SyncPage,
     };
     use chrono::{Duration, Utc};
@@ -999,6 +1050,14 @@ mod tests {
         explain("summary", &store, summary.build()).await;
         let mut freshness = freshness_sql(&accounts);
         explain("freshness", &store, freshness.build()).await;
+        let mut manual_freshness = manual_freshness_sql(&config.deployment, &accounts);
+        let plans = explain("manual_freshness", &store, manual_freshness.build()).await;
+        assert!(
+            plans
+                .iter()
+                .any(|plan| plan.contains("sync_account_finished"))
+        );
+        assert!(!plans.iter().any(|plan| plan == "SCAN job"));
         let mut detail = QueryBuilder::<Sqlite>::new(queries::BILL_PREFIX);
         detail
             .push_bind("demo-wm:bill:00001")
@@ -1378,6 +1437,110 @@ mod tests {
         assert!(
             store
                 .stale_automatic_accounts(&config.deployment, cutoff)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_freshness_uses_latest_success_per_active_selected_account() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(&directory.path().join("manual-freshness.sqlite3"))
+            .await
+            .unwrap();
+        let mut config: Config = toml::from_str(include_str!("../config/example.toml")).unwrap();
+        let template = config.accounts[0].clone();
+        config.accounts = [
+            "boundary",
+            "failed",
+            "fresh",
+            "partial",
+            "never",
+            "inactive",
+            "imported",
+            "foreign",
+            "unselected",
+        ]
+        .into_iter()
+        .map(|id| {
+            let mut account = template.clone();
+            account.id = id.to_owned();
+            account.name = format!("Service {id}");
+            account.provider_account = id.to_owned();
+            account.services[0].id = format!("{id}-service");
+            account
+        })
+        .collect();
+        store.register(&config).await.unwrap();
+        let cutoff = Utc::now() - Duration::hours(24);
+        for (account, state, finished) in [
+            ("boundary", SyncState::Complete, cutoff),
+            ("failed", SyncState::Complete, cutoff - Duration::hours(1)),
+            ("failed", SyncState::Failed, cutoff + Duration::hours(23)),
+            (
+                "fresh",
+                SyncState::Complete,
+                cutoff + Duration::milliseconds(1),
+            ),
+            ("partial", SyncState::Complete, cutoff - Duration::days(1)),
+            ("partial", SyncState::Partial, cutoff + Duration::hours(1)),
+        ] {
+            let job = store.start_job(account).await.unwrap();
+            store.finish_job(&job.id, state, 0, None).await.unwrap();
+            sqlx::query("UPDATE sync_jobs SET finished_at=? WHERE id=?")
+                .bind(finished.to_rfc3339())
+                .bind(&job.id)
+                .execute(store.pool())
+                .await
+                .unwrap();
+        }
+        // A newer running job does not count as a completed refresh.
+        store.start_job("failed").await.unwrap();
+        sqlx::query("UPDATE accounts SET binding=NULL WHERE id='inactive'")
+            .execute(store.pool())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE accounts SET import_only=1 WHERE id='imported'")
+            .execute(store.pool())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE accounts SET deployment='other' WHERE id='foreign'")
+            .execute(store.pool())
+            .await
+            .unwrap();
+        let selected = config
+            .accounts
+            .iter()
+            .filter(|account| account.id != "unselected")
+            .map(|account| account.id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            store
+                .stale_manual_accounts(&config.deployment, &selected, cutoff)
+                .await
+                .unwrap(),
+            vec![
+                StaleManualAccount {
+                    account_id: "boundary".to_owned(),
+                    name: "Service boundary".to_owned(),
+                    last_synced_at: Some(cutoff),
+                },
+                StaleManualAccount {
+                    account_id: "failed".to_owned(),
+                    name: "Service failed".to_owned(),
+                    last_synced_at: Some(cutoff - Duration::hours(1)),
+                },
+                StaleManualAccount {
+                    account_id: "never".to_owned(),
+                    name: "Service never".to_owned(),
+                    last_synced_at: None,
+                },
+            ]
+        );
+        assert!(
+            store
+                .stale_manual_accounts(&config.deployment, &[], cutoff)
                 .await
                 .unwrap()
                 .is_empty()

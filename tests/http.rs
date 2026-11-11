@@ -45,6 +45,68 @@ async fn optional_service_names_preserve_binding_identity_and_existing_bills() {
         .find(|account| account.id == "demo-wm")
         .unwrap();
     assert_eq!(wm.services[0].name, "Waste");
+}
+
+#[tokio::test]
+async fn summary_names_only_stale_manual_accounts_and_clears_removed_accounts() {
+    let app = support::App::start().await;
+    let fresh = &app.config.accounts[0];
+    let stale = &app.config.accounts[1];
+    let now = chrono::Utc::now();
+    let last_synced_at = now - chrono::Duration::hours(25);
+    for (account, state, at) in [
+        (fresh, SyncState::Complete, now),
+        (stale, SyncState::Partial, last_synced_at),
+        (stale, SyncState::Failed, now),
+    ] {
+        let job = app.store.start_job(&account.id).await.unwrap();
+        app.store.finish_job(&job.id, state, 0, None).await.unwrap();
+        sqlx::query("UPDATE sync_jobs SET finished_at=? WHERE id=?")
+            .bind(at.to_rfc3339())
+            .bind(&job.id)
+            .execute(app.store.pool())
+            .await
+            .unwrap();
+    }
+    let client = reqwest::Client::new();
+    let summary: Summary = client
+        .get(format!("{}/v1/summary", app.url))
+        .bearer_auth(support::TOKEN)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        summary.stale_manual_accounts,
+        vec![StaleManualAccount {
+            account_id: stale.id.clone(),
+            name: stale.name.clone(),
+            last_synced_at: Some(last_synced_at),
+        }]
+    );
+    assert!(summary.manual_accounts_stale);
+    assert!(summary.stale_automatic_accounts.is_empty());
+
+    let mut config = (*app.config).clone();
+    config.accounts.retain(|account| account.id == fresh.id);
+    app.store.register(&config).await.unwrap();
+    let summary: Summary = client
+        .get(format!("{}/v1/summary", app.url))
+        .bearer_auth(support::TOKEN)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(summary.stale_manual_accounts.is_empty());
+    assert!(!summary.manual_accounts_stale);
     app.close().await;
 }
 

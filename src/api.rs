@@ -555,13 +555,16 @@ async fn summary(request: RequestContext<Arc<Context>>) -> Result<PrivateOk<Summ
             .filter_map(|account| (account.mode == IngestionMode::Live).then_some(account.id))
             .collect::<Vec<_>>()
     };
-    summary.manual_accounts_stale = !manual.is_empty()
-        && context
-            .store
-            .freshness(&manual)
-            .await
-            .map_err(store_error)?
-            .1;
+    summary.stale_manual_accounts = context
+        .store
+        .stale_manual_accounts(
+            &context.config.deployment,
+            &manual,
+            chrono::Utc::now() - chrono::Duration::hours(24),
+        )
+        .await
+        .map_err(store_error)?;
+    summary.manual_accounts_stale = !summary.stale_manual_accounts.is_empty();
     Ok(private(summary))
 }
 #[endpoint {method=GET,path="/v1/bills",tags=["utilities"]}]

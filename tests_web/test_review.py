@@ -50,12 +50,19 @@ async def test_sync_is_disabled_with_a_reason_for_each_unconfigured_provider(
     await page.get_by_label("Account to sync", exact=True).select_option("demo-wm")
     await expect(submit).to_be_disabled()
     await expect(
-        page.get_by_text("Waste Management credentials are not configured.", exact=True)
+        page.get_by_text(
+            "Waste Management · Waste service · "
+            "Provider credentials are not configured.",
+            exact=True,
+        )
     ).to_be_visible()
     await page.get_by_label("Account to sync", exact=True).select_option("demo-energy")
     await expect(submit).to_be_disabled()
     await expect(
-        page.get_by_text("Bayou credentials are not configured.", exact=True)
+        page.get_by_text(
+            "Bayou · Energy service · Provider credentials are not configured.",
+            exact=True,
+        )
     ).to_be_visible()
 
 
@@ -129,6 +136,9 @@ async def test_expired_ingress_session_points_back_to_home_assistant_not_native_
                 await expect(page.locator("#content")).to_have_attribute(
                     "aria-busy", "false"
                 )
+                await expect(
+                    page.get_by_role("region", name="Saved utility data")
+                ).to_be_visible()
                 authenticated = False
                 await page.get_by_role(
                     "button", name="Refresh local utility data"
@@ -178,5 +188,11 @@ async def test_overview_and_bill_table_explain_missing_balances_and_provider_sta
     await page.get_by_role("button", name="Apply filters", exact=True).click()
     await expect(page.locator(".data-table tbody tr")).to_have_count(25)
     await expect(
-        page.get_by_text("Data access status, not payment", exact=True).first
+        page.get_by_text("Synced from Bayou", exact=True).first
+    ).to_be_visible()
+    await page.locator(".data-table tbody tr").first.get_by_role("button").click()
+    dialog = page.get_by_role("dialog", name="Bill details")
+    await expect(dialog.get_by_text("unlocked", exact=True)).to_be_visible()
+    await expect(
+        dialog.get_by_text(re.compile("not whether a payment settled"))
     ).to_be_visible()

@@ -1991,6 +1991,26 @@
         ],
         "type": "object"
       },
+      "StaleManualAccount": {
+        "properties": {
+          "account_id": {
+            "type": "string"
+          },
+          "last_synced_at": {
+            "format": "date-time",
+            "nullable": true,
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "account_id",
+          "name"
+        ],
+        "type": "object"
+      },
       "Summary": {
         "properties": {
           "accounts": {
@@ -2041,6 +2061,13 @@
             "default": [],
             "items": {
               "$ref": "#/components/schemas/StaleAutomaticAccount"
+            },
+            "type": "array"
+          },
+          "stale_manual_accounts": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/StaleManualAccount"
             },
             "type": "array"
           },
@@ -2245,7 +2272,7 @@
   "info": {
     "description": "Local utility observations and explicit coverage. Bearer owner credential or authenticated HA bridge. Sync reads providers only; no payments or service changes.",
     "title": "Utilities API",
-    "version": "0.1.9"
+    "version": "0.1.10"
   },
   "openapi": "3.0.3",
   "paths": {

@@ -33,6 +33,10 @@ p { line-height: 1.55; }
 .freshness.attention { border-left-color: var(--warning); }
 .freshness p { margin: 3px 0 0; font-size: 13px; color: var(--muted); }
 .freshness strong { font-size: 14px; font-weight: 600; }
+.freshness-accounts { display: grid; gap: 12px; }
+#freshness-badge { max-width: 100%; overflow-wrap: anywhere; }
+.freshness-badges { display: flex; flex-wrap: wrap; gap: 6px; margin: 0; min-width: 0; }
+.freshness-badges .badge { max-width: 100%; }
 .two-column { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 24px; margin-bottom: 24px; }
 .two-column > :only-child { grid-column: 1 / -1; }
 .panel { min-width: 0; border: 1px solid var(--line); border-radius: 8px; background: var(--paper); overflow: hidden; }
@@ -72,6 +76,9 @@ td.numeric { font-family: var(--mono); }
 .list-meta { display: flex; justify-content: space-between; align-items: center; gap: 16px; margin-top: 12px; color: var(--muted); font-size: 12px; }
 .list-meta p { margin: 0; }
 .coverage-panel { margin-top: 24px; }
+.diagnostics > summary { min-height: 44px; padding: 17px 20px; font-size: 14px; font-weight: 600; cursor: pointer; }
+.diagnostics[open] > summary { border-bottom: 1px solid var(--line); }
+.diagnostics .coverage-panel { margin: 0; border: 0; border-radius: 0; }
 .coverage-table td, .coverage-table th { padding: 12px 16px; }
 .coverage-table td { font-size: 12px; }
 .coverage-table td:last-child { white-space: nowrap; }
@@ -195,4 +202,26 @@ dd { margin: 0; overflow-wrap: anywhere; }
   .toolbar .form-field { max-width: none; }
   .coverage-table { min-width: 620px; }
   .data-table { min-width: 620px; }
+}
+@media (max-width: 600px) {
+  .responsive-table { display: block; min-width: 0; }
+  .responsive-table thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+  .responsive-table tbody { display: grid; gap: 12px; }
+  .responsive-table tr { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 4px 16px; padding: 12px 16px; border: 1px solid var(--line); border-radius: 6px; background: var(--paper); }
+  .responsive-table td { min-width: 0; border: 0; padding: 4px 0; overflow-wrap: anywhere; }
+  .responsive-table td[data-label]::before { content: attr(data-label); display: block; color: var(--muted); font-size: 11px; font-weight: 500; }
+  .responsive-table td.numeric { font-size: 19px; font-weight: 600; }
+  .responsive-table .record-button { margin-block: 0; }
+  .bills-table tr { grid-template-areas: 'account account' 'issued total' 'due total' 'source source'; }
+  .bills-table td:nth-child(1) { grid-area: issued; }
+  .bills-table td:nth-child(2) { grid-area: account; }
+  .bills-table td:nth-child(3) { grid-area: due; }
+  .bills-table td:nth-child(4) { grid-area: total; }
+  .bills-table td:nth-child(5) { grid-area: source; }
+  .billed-usage-table tbody { padding: 12px; }
+  .billed-usage-table tr { grid-template-areas: 'service quantity' 'period period' 'source source'; }
+  .billed-usage-table td:nth-child(1) { grid-area: period; }
+  .billed-usage-table td:nth-child(2) { grid-area: service; }
+  .billed-usage-table td:nth-child(3) { grid-area: quantity; }
+  .billed-usage-table td:nth-child(4) { grid-area: source; }
 }

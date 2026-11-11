@@ -467,7 +467,16 @@ pub struct Summary {
     #[serde(default)]
     pub stale_automatic_accounts: Vec<StaleAutomaticAccount>,
     #[serde(default)]
+    pub stale_manual_accounts: Vec<StaleManualAccount>,
+    #[serde(default)]
     pub manual_accounts_stale: bool,
+}
+
+#[derive(JsonSchema, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct StaleManualAccount {
+    pub account_id: String,
+    pub name: String,
+    pub last_synced_at: Option<DateTime<Utc>>,
 }
 
 #[derive(JsonSchema, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
