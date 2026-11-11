@@ -92,6 +92,12 @@ async def test_settings_show_sources_categories_and_collapsed_diagnostics(
         await page.get_by_role("button", name=view, exact=True).click()
         await expect(page.locator("#content")).to_have_attribute("aria-busy", "false")
         await expect(page.locator(".coverage-panel")).to_have_count(0)
+        if view == "Bills":
+            await expect(
+                page.get_by_role(
+                    "button", name=re.compile(r"^View Waste Management bill issued")
+                ).first
+            ).to_be_visible()
     await page.get_by_role("button", name="Settings", exact=True).click()
     await expect(
         page.get_by_role("heading", name="Utility accounts", exact=True)
@@ -121,10 +127,17 @@ async def test_settings_show_sources_categories_and_collapsed_diagnostics(
     await expect(water.locator("li")).to_have_count(0)
     await expect(water.locator(".account-services")).to_have_count(0)
     waste = cards.filter(
-        has=page.get_by_role("heading", name="Waste service", exact=True)
+        has=page.get_by_role("heading", name="Waste Management", exact=True)
     )
     await expect(waste.get_by_text("Waste Management API", exact=True)).to_have_count(1)
-    await expect(waste.get_by_text("Waste Management", exact=True)).to_have_count(0)
+    await expect(waste.get_by_text("Waste Management", exact=True)).to_have_count(1)
+    await page.get_by_label("Account to sync", exact=True).select_option("demo-wm")
+    await expect(page.locator("#sync-availability")).to_have_text(
+        "Waste Management · Provider credentials are not configured."
+    )
+    await expect(page.locator("#sync-status")).not_to_contain_text(
+        "Waste Management · Waste Management"
+    )
     internet = cards.filter(
         has=page.get_by_role("heading", name="Starlink", exact=True)
     )
@@ -158,7 +171,7 @@ async def test_settings_show_sources_categories_and_collapsed_diagnostics(
     await expect(page.locator("#freshness-badge .badge")).to_have_text(
         [
             "Bayou · Electricity (SCE) · Needs attention",
-            "Waste Management · Waste service · Needs attention",
+            "Waste Management · Needs attention",
         ]
     )
     await page.screenshot(path=str(tmp_path / "settings-mobile.png"), full_page=True)

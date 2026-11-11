@@ -113,8 +113,7 @@ function label(value) { return names[value] ?? String(value).replaceAll('_', ' '
 function accountName(id) { return accounts.find((account) => account.id === id)?.name ?? 'Unknown account'; }
 function providerName(id) { return providers.find((provider) => provider.id === id)?.name ?? label(id); }
 function accountLabel(id) {
-  const account = accounts.find((item) => item.id === id);
-  return account ? `${providerName(account.provider)} · ${account.name}` : 'Unknown account';
+  return accountDisplay(id).label;
 }
 function importedVendors(bindings = accounts) {
   const vendors = new Map();
@@ -127,9 +126,15 @@ function importedVendors(bindings = accounts) {
 }
 function accountDisplay(id) {
   const account = accounts.find((item) => item.id === id);
-  if (account?.source.kind !== 'manual_import') return { name: account?.name ?? 'Unknown account', context: account ? providerName(account.provider) : undefined };
-  const name = providerName(account.provider);
-  return { name, context: account.name === name ? undefined : account.name };
+  if (!account) return { name: 'Unknown account', label: 'Unknown account' };
+  const provider = providerName(account.provider);
+  const manual = account.source.kind === 'manual_import';
+  const distinct = provider !== account.name;
+  return {
+    name: manual ? provider : account.name,
+    context: distinct ? manual ? account.name : provider : undefined,
+    label: distinct ? `${provider} · ${account.name}` : account.name,
+  };
 }
 function accountBadge(id) {
   const account = accounts.find((item) => item.id === id);
