@@ -77,7 +77,9 @@ kind = "electricity"
         values = await asyncio.to_thread(config.read_text)
         await asyncio.to_thread(
             config.write_text,
-            values.replace('name = "Energy service"', 'name = "Electricity (SCE)"'),
+            values.replace(
+                'name = "Energy service"', 'name = "Electricity (SCE)"'
+            ).replace('name = "Waste service"', 'name = "Waste Management"'),
         )
     seed_process = await asyncio.create_subprocess_exec(
         str(seed),
