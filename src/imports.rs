@@ -42,7 +42,6 @@ pub struct ImportRequest {
 #[serde(deny_unknown_fields)]
 pub struct ImportAccount {
     pub id: String,
-    pub name: String,
     pub provider: ImportProvider,
     pub start_on: NaiveDate,
     #[serde(default)]
@@ -441,7 +440,6 @@ impl ImportRequest {
         let account = &self.account;
         let mut service_ids = BTreeSet::new();
         if !valid_id(&account.id)
-            || !text(&account.name, 100)
             || account
                 .provider_account_sha256
                 .as_deref()
@@ -452,7 +450,6 @@ impl ImportRequest {
             || self.records.len() > 200
             || account.services.iter().any(|s| {
                 !valid_id(&s.id)
-                    || (!s.name.is_empty() && !text(&s.name, 100))
                     || !service_matches(account.provider, s.kind)
                     || !service_ids.insert(&s.id)
             })
@@ -482,7 +479,6 @@ impl ImportRequest {
             .iter()
             .map(|service| ServiceBinding {
                 id: service.id.clone(),
-                name: (!service.name.is_empty()).then(|| service.name.clone()),
                 provider_service: service.id.clone(),
                 kind: service.kind,
             })
@@ -490,7 +486,6 @@ impl ImportRequest {
         services.sort_by(|a, b| a.id.cmp(&b.id));
         AccountBinding {
             id: account.id.clone(),
-            name: account.name.clone(),
             deployment: deployment.to_owned(),
             provider: account.provider.issuer(),
             customer_id: "document_import".to_owned(),

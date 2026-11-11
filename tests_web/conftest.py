@@ -1,10 +1,12 @@
 """Own the real server and fictional seed for each browser test."""
 
 import asyncio
+import json
 import os
 import shutil
 import signal
 import socket
+import sqlite3
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -54,7 +56,6 @@ async def web_backend(
             """deployment = "demo"
 [[accounts]]
 id = "demo-energy"
-name = "Energy service"
 deployment = "demo"
 provider = "bayou"
 customer_id = "900000002"
@@ -62,7 +63,6 @@ provider_account = "DEMO-ACCOUNT"
 currency = "USD"
 [[accounts.services]]
 id = "demo-electric"
-name = "Electricity"
 provider_service = "DEMO-METER"
 kind = "electricity"
 """,
@@ -72,14 +72,6 @@ kind = "electricity"
         await asyncio.to_thread(
             config.write_text,
             original.replace('id = "demo-energy"', 'id = "import_provider:spectrum"'),
-        )
-    elif getattr(request, "param", None) == "account_cards":
-        values = await asyncio.to_thread(config.read_text)
-        await asyncio.to_thread(
-            config.write_text,
-            values.replace(
-                'name = "Energy service"', 'name = "Electricity (SCE)"'
-            ).replace('name = "Waste service"', 'name = "Waste Management"'),
         )
     seed_process = await asyncio.create_subprocess_exec(
         str(seed),
@@ -93,6 +85,42 @@ kind = "electricity"
     assert await asyncio.to_thread(config.is_file), (
         "The seed requires explicit fictional account bindings"
     )
+    if getattr(request, "param", None) == "account_cards":
+
+        def attach_company() -> None:
+            progress = {
+                "state": "connected",
+                "customer_id": "fictional-customer",
+                "auth_status": "authenticated",
+                "has_filled_credentials": True,
+                "bills_ready": True,
+                "intervals_ready": True,
+                "accounts": [],
+                "linked_account_ids": ["demo-energy"],
+                "issue": None,
+            }
+            with sqlite3.connect(database) as connection:
+                connection.execute(
+                    "INSERT INTO utility_connections(id,deployment,request_id,"
+                    "external_id,utility_id,utility_name,currency,progress) "
+                    "VALUES(?,?,?,?,?,?,?,?)",
+                    (
+                        "fixture-connection",
+                        "demo",
+                        "fixture-request",
+                        "fixture-external",
+                        "speculoos_power",
+                        "Speculoos Power",
+                        "USD",
+                        json.dumps(progress),
+                    ),
+                )
+                connection.execute(
+                    "UPDATE accounts SET connection_id=? WHERE id=?",
+                    ("fixture-connection", "demo-energy"),
+                )
+
+        await asyncio.to_thread(attach_company)
     token_file = tmp_path / "token"
     await asyncio.to_thread(token_file.write_text, TOKEN)
     with socket.socket() as listener:

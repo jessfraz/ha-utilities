@@ -178,7 +178,6 @@ impl WasteManagement {
             .map(|s| {
                 Observation::Service(Service {
                     id: s.id.clone(),
-                    name: s.name().to_owned(),
                     kind: s.kind,
                 })
             })

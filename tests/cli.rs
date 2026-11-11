@@ -141,13 +141,11 @@ async fn actual_ingest_cli_checks_every_source_then_replays_without_duplicates()
         imports: [ImportRequest {
             account: ImportAccount {
                 id: "example-import-water".into(),
-                name: "Example water".into(),
                 provider: ha_utilities::imports::ImportProvider::Lvmwd,
                 start_on: "2025-01-01".parse().unwrap(),
                 provider_account_sha256: None,
                 services: vec![Service {
                     id: "example-import-water-meter".into(),
-                    name: "Water meter".into(),
                     kind: ServiceKind::Water,
                 }],
             },

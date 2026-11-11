@@ -76,6 +76,22 @@ class Backend:
     coverage: list[dict[str, object]] = field(default_factory=lambda: [coverage()])
     collections: list[dict[str, object]] = field(default_factory=lambda: [collection()])
     usage: list[dict[str, object]] = field(default_factory=list)
+    accounts: list[dict[str, object]] = field(
+        default_factory=lambda: [
+            {
+                "id": "example-account",
+                "provider": "bayou",
+                "connection_id": "example-connection",
+                "services": [{"id": "example-electric", "kind": "electricity"}],
+                "source": {"kind": "live", "provider": "bayou"},
+            }
+        ]
+    )
+    connections: list[dict[str, object]] = field(
+        default_factory=lambda: [
+            {"id": "example-connection", "utility_name": "Example Electric Company"}
+        ]
+    )
     responses: dict[str, tuple[int, bytes, dict[str, str]]] = field(
         default_factory=dict
     )
@@ -174,24 +190,9 @@ class Backend:
                     }
                 )
             case "/v1/accounts":
-                return web.json_response(
-                    self.page(
-                        [
-                            {
-                                "id": "example-account",
-                                "name": "Example account",
-                                "provider": "bayou",
-                                "services": [
-                                    {
-                                        "id": "example-electric",
-                                        "name": "Example electricity",
-                                        "kind": "electricity",
-                                    }
-                                ],
-                            }
-                        ]
-                    )
-                )
+                return web.json_response(self.page(self.accounts))
+            case "/v1/connections":
+                return web.json_response(self.page(self.connections))
             case "/v1/providers" | "/v1/balances":
                 return web.json_response(self.page([]))
             case "/v1/sync":

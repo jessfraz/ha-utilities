@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
+from enum import StrEnum
 from typing import Literal
 
 from homeassistant.components.calendar import CalendarEvent
@@ -136,20 +137,81 @@ def page(
 @dataclass(frozen=True, slots=True)
 class StaleAutomaticAccount:
     account_id: str
-    name: str
     last_data_at: datetime | None
 
     @classmethod
     def parse(cls, value: object) -> StaleAutomaticAccount:
         row = record(value)
-        name = row.get("name")
-        if not isinstance(name, str) or not name.strip():
-            raise ValueError("Expected automatic account name")
         return cls(
             text(row.get("account_id")),
-            name,
             optional_timestamp(row.get("last_data_at")),
         )
+
+
+class ProviderId(StrEnum):
+    WASTE_MANAGEMENT = "waste_management"
+    BAYOU = "bayou"
+    LVMWD = "lvmwd"
+    SUPERIOR_PROPANE = "superior_propane"
+    STARLINK = "starlink"
+    SPECTRUM = "spectrum"
+
+    @property
+    def label(self) -> str:
+        return {
+            self.WASTE_MANAGEMENT: "Waste Management",
+            self.BAYOU: "Bayou",
+            self.LVMWD: "LVMWD",
+            self.SUPERIOR_PROPANE: "Superior Propane",
+            self.STARLINK: "Starlink",
+            self.SPECTRUM: "Spectrum",
+        }[self]
+
+
+class ServiceKind(StrEnum):
+    WASTE = "waste"
+    RECYCLING = "recycling"
+    ELECTRICITY = "electricity"
+    GAS = "gas"
+    WATER = "water"
+    PROPANE = "propane"
+    INTERNET = "internet"
+
+
+@dataclass(frozen=True, slots=True)
+class AccountIdentity:
+    id: str
+    provider: ProviderId
+    connection_id: str | None
+    kinds: tuple[ServiceKind, ...]
+
+    @classmethod
+    def parse(cls, value: object) -> AccountIdentity:
+        row = record(value)
+        services = row.get("services")
+        if not isinstance(services, list) or len(services) > 100:
+            raise ValueError("Expected bounded services")
+        kinds = []
+        for service in services:
+            entry = record(service)
+            text(entry.get("id"))
+            kinds.append(ServiceKind(text(entry.get("kind"))))
+        connection_id = row.get("connection_id")
+        return cls(
+            text(row.get("id")),
+            ProviderId(text(row.get("provider"))),
+            None if connection_id is None else text(connection_id),
+            tuple(dict.fromkeys(kinds)),
+        )
+
+    def label(self, connections: dict[str, str]) -> str:
+        company = (
+            connections.get(self.connection_id, self.provider.label)
+            if self.provider is ProviderId.BAYOU and self.connection_id is not None
+            else self.provider.label
+        )
+        kinds = ", ".join(kind.value.title() for kind in self.kinds)
+        return f"{company} ({kinds})" if kinds else company
 
 
 @dataclass(frozen=True, slots=True)

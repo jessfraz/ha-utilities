@@ -37,20 +37,18 @@ async def test_settings_show_sources_categories_and_collapsed_diagnostics(
     imported_accounts = [
         {
             "id": "fictional-water",
-            "name": "Water",
             "provider": "lvmwd",
             "services": [
-                {"id": "water-meter", "name": "Water", "kind": "water"},
-                {"id": "second-water-meter", "name": "Water", "kind": "water"},
+                {"id": "water-meter", "kind": "water"},
+                {"id": "second-water-meter", "kind": "water"},
             ],
         },
         {
             "id": "fictional-internet",
-            "name": "Internet (Starlink)",
             "provider": "starlink",
             "services": [
-                {"id": "fixed-dish", "name": "Fixed dish", "kind": "internet"},
-                {"id": "portable-dish", "name": "Portable dish", "kind": "internet"},
+                {"id": "fixed-dish", "kind": "internet"},
+                {"id": "portable-dish", "kind": "internet"},
             ],
         },
     ]
@@ -108,7 +106,7 @@ async def test_settings_show_sources_categories_and_collapsed_diagnostics(
 
     cards = page.locator(".account-grid article")
     electricity = cards.filter(
-        has=page.get_by_role("heading", name="Electricity (SCE)", exact=True)
+        has=page.get_by_role("heading", name="Speculoos Power", exact=True)
     )
     await expect(electricity.get_by_text("Bayou", exact=True)).to_have_count(1)
     await expect(
@@ -129,11 +127,12 @@ async def test_settings_show_sources_categories_and_collapsed_diagnostics(
     waste = cards.filter(
         has=page.get_by_role("heading", name="Waste Management", exact=True)
     )
-    await expect(waste.get_by_text("Waste Management API", exact=True)).to_have_count(1)
+    await expect(waste.get_by_text("API", exact=True)).to_have_count(1)
     await expect(waste.get_by_text("Waste Management", exact=True)).to_have_count(1)
+    assert (await waste.inner_text()).count("Waste Management") == 1
     await page.get_by_label("Account to sync", exact=True).select_option("demo-wm")
     await expect(page.locator("#sync-availability")).to_have_text(
-        "Waste Management · Provider credentials are not configured."
+        "Provider credentials are not configured."
     )
     await expect(page.locator("#sync-status")).not_to_contain_text(
         "Waste Management · Waste Management"
@@ -154,10 +153,7 @@ async def test_settings_show_sources_categories_and_collapsed_diagnostics(
     await page.emulate_media(color_scheme="dark")
     await page.screenshot(path=str(tmp_path / "settings-dark.png"), full_page=True)
     await page.emulate_media(color_scheme="light")
-    await internet.get_by_text("Services", exact=True).click()
-    await expect(internet.locator(".account-services .capabilities span")).to_have_text(
-        ["Fixed dish", "Portable dish"]
-    )
+    await expect(internet.locator(".account-services")).to_have_count(0)
     await expect(cards.locator("ul, ol, li")).to_have_count(0)
 
     diagnostics = page.locator("details.diagnostics")
@@ -170,7 +166,7 @@ async def test_settings_show_sources_categories_and_collapsed_diagnostics(
     )
     await expect(page.locator("#freshness-badge .badge")).to_have_text(
         [
-            "Bayou · Electricity (SCE) · Needs attention",
+            "Speculoos Power · Needs attention",
             "Waste Management · Needs attention",
         ]
     )
@@ -184,6 +180,17 @@ async def test_settings_show_sources_categories_and_collapsed_diagnostics(
     await diagnostics.get_by_text("Diagnostics", exact=True).click()
     await expect(page.get_by_label("Utility providers")).to_be_hidden()
     await expect(page.get_by_role("heading", name="Data coverage")).to_be_hidden()
+
+
+async def assert_mobile_field_labels_match(row: Locator) -> None:
+    fonts: list[str] = await row.locator("td").evaluate_all(
+        "(cells) => cells.map((cell) => getComputedStyle(cell, '::before').fontFamily)"
+    )
+    assert len(fonts) >= 3 and len(set(fonts)) == 1
+    numeric_font: str = await row.locator(".numeric-value").evaluate(
+        "(value) => getComputedStyle(value).fontFamily"
+    )
+    assert numeric_font != fonts[0]
 
 
 async def assert_horizontal_visibility(page: Page, locator: Locator) -> None:
@@ -340,8 +347,8 @@ async def test_bills_page_filter_and_honest_read_only_detail(
     await page.get_by_role("button", name="Bills", exact=True).click()
     await expect(page.locator(".data-table tbody tr")).to_have_count(25)
     account_badges = page.locator(".data-table .account-badge")
-    energy_badges = account_badges.filter(has_text=re.compile("^Energy service$"))
-    waste_badges = account_badges.filter(has_text=re.compile("^Waste service$"))
+    energy_badges = account_badges.filter(has_text=re.compile("^Bayou$"))
+    waste_badges = account_badges.filter(has_text=re.compile("^Waste Management$"))
     await expect(energy_badges).not_to_have_count(0)
     await expect(waste_badges).not_to_have_count(0)
     await expect(
@@ -365,6 +372,8 @@ async def test_bills_page_filter_and_honest_read_only_detail(
     issued_box = await first_row.get_by_role("button").first.bounding_box()
     assert account_box is not None and issued_box is not None
     assert account_box["y"] < issued_box["y"]
+    await assert_mobile_field_labels_match(page.locator(".data-table tbody tr").first)
+    await page.mouse.move(0, 0)
     await page.screenshot(path=str(tmp_path / "bills-mobile.png"))
     await page.set_viewport_size({"width": 1280, "height": 720})
     await expect(
@@ -391,7 +400,7 @@ async def test_bills_page_filter_and_honest_read_only_detail(
     await expect(page.locator("#content")).to_have_attribute("aria-busy", "false")
     rows = page.locator(".data-table tbody tr")
     assert await rows.count() > 0
-    await expect(rows.first.locator("td").nth(4)).to_contain_text("Synced from Bayou")
+    await expect(rows.first.locator("td").nth(4)).to_contain_text("Provider API")
     first_bill = rows.first.get_by_role("button")
     await first_bill.click()
     dialog = page.get_by_role("dialog", name="Bill details")
@@ -428,7 +437,7 @@ async def test_bills_page_filter_and_honest_read_only_detail(
 async def test_imported_vendor_bills_include_construction_across_pages(
     utility_page: Page, web_backend: WebBackend
 ) -> None:
-    """Use real imported accounts with distinct names and a shared provider."""
+    """Keep construction invoices under Spectrum with the Internet type."""
     today = datetime.now(UTC).date()
     source = b"Fictional Spectrum billing evidence."
     digest = sha256(source).hexdigest()
@@ -439,19 +448,15 @@ async def test_imported_vendor_bills_include_construction_across_pages(
             f"{web_backend.origin}/v1/documents/{digest}", data=source
         ) as response:
             response.raise_for_status()
-        for account, name, service, service_name, offsets in [
+        for account, service, offsets in [
             (
                 "fixture-internet",
-                "Home internet",
                 "internet",
-                "Internet service",
                 range(7, 32),
             ),
             (
                 "fixture-construction",
-                "Construction account",
                 "installation",
-                "Internet construction",
                 [32],
             ),
         ]:
@@ -488,12 +493,9 @@ async def test_imported_vendor_bills_include_construction_across_pages(
                 json={
                     "account": {
                         "id": account,
-                        "name": name,
                         "provider": "spectrum",
                         "start_on": (today - timedelta(days=60)).isoformat(),
-                        "services": [
-                            {"id": service, "name": service_name, "kind": "internet"}
-                        ],
+                        "services": [{"id": service, "kind": "internet"}],
                     },
                     "currency": "USD",
                     "records": records,
@@ -534,7 +536,8 @@ async def test_imported_vendor_bills_include_construction_across_pages(
     await expect(rows.nth(1)).to_contain_text("Original documents")
     await page.get_by_role("button", name="Load more", exact=True).click()
     await expect(rows).to_have_count(27)
-    await expect(rows.last).to_contain_text("Construction account")
+    await expect(rows.last).to_contain_text("Spectrum")
+    await expect(rows.last).not_to_contain_text("Construction account")
     await expect(rows.last.locator(".account-badge")).to_have_css(
         "background-color", vendor_color
     )
@@ -556,7 +559,9 @@ async def test_imported_vendor_bills_include_construction_across_pages(
     await expect(
         dialog.get_by_role("heading", name="Spectrum", exact=True)
     ).to_be_visible()
-    await expect(dialog.get_by_text("Construction account", exact=True)).to_be_visible()
+    await expect(dialog.get_by_text("Construction account", exact=True)).to_have_count(
+        0
+    )
     await expect(dialog.locator(".account-badge")).to_have_css(
         "background-color", vendor_color
     )
@@ -573,7 +578,7 @@ async def test_imported_vendor_bills_include_construction_across_pages(
         "import_provider:spectrum"
     )
     await filters.get_by_role("button", name="Apply filters").click()
-    await expect(rows.last).to_contain_text("Energy service")
+    await expect(rows.last).to_contain_text("Bayou")
     await expect(rows.get_by_text("Spectrum", exact=True)).to_have_count(0)
 
     await page.get_by_role("button", name="Settings", exact=True).click()
@@ -665,13 +670,11 @@ async def test_usage_includes_billed_water_periods_and_source_documents(
             json={
                 "account": {
                     "id": "fixture-water",
-                    "name": "Water service",
                     "provider": "lvmwd",
                     "start_on": (today - timedelta(days=365)).isoformat(),
                     "services": [
                         {
                             "id": "fixture-water-meter",
-                            "name": "Water meter",
                             "kind": "water",
                         }
                     ],
@@ -690,10 +693,34 @@ async def test_usage_includes_billed_water_periods_and_source_documents(
     await page.get_by_role("button", name="Usage", exact=True).click()
     billed = page.get_by_role("region", name="Billed usage", exact=True)
     rows = billed.get_by_role("table").locator("tbody tr")
-    await expect(rows).to_have_count(32)
+    await expect(rows).to_have_count(10)
     await expect(rows.first).to_contain_text("0 CCF")
+    seen: list[str] = await rows.get_by_role("button").evaluate_all(
+        "(buttons) => buttons.map((b) => b.getAttribute('aria-label'))"
+    )
+    next_page = billed.get_by_role("button", name="Next billed usage", exact=True)
+    previous_page = billed.get_by_role(
+        "button", name="Previous billed usage", exact=True
+    )
+    await expect(previous_page).to_be_disabled()
+    for count in [10, 10, 2]:
+        await next_page.click()
+        await expect(billed).to_be_focused()
+        await expect(rows).to_have_count(count)
+        seen.extend(
+            await rows.get_by_role("button").evaluate_all(
+                "(buttons) => buttons.map((b) => b.getAttribute('aria-label'))"
+            )
+        )
+    assert len(seen) == len(set(seen)) == 32
     await expect(rows.last).to_contain_text("12.75 m³")
-    await expect(rows.first).to_contain_text("Water meter")
+    await expect(next_page).to_be_disabled()
+    for _ in range(3):
+        await previous_page.click()
+    await expect(previous_page).to_be_disabled()
+    await expect(rows).to_have_count(10)
+    await expect(rows.first).to_contain_text("0 CCF")
+    await expect(rows.first.get_by_text("Water", exact=True)).to_be_visible()
     start = today - timedelta(days=24)
     through = today - timedelta(days=17)
     await expect(rows.first.locator("td").first).to_have_text(
@@ -721,19 +748,25 @@ async def test_usage_includes_billed_water_periods_and_source_documents(
     ).locator("tbody tr")
     await expect(interval_rows).to_have_count(25)
     await expect(interval_rows.first.locator("td").last).to_have_text("Wh")
-    await expect(rows).to_have_count(32)
+    await expect(rows).to_have_count(10)
     await intervals.get_by_label("From", exact=True).fill("2100-01-01")
     await intervals.get_by_label("To", exact=True).fill("2100-01-02")
     await intervals.get_by_role("button", name="Apply filters", exact=True).click()
     await expect(
         page.get_by_role("heading", name="No meter intervals reported")
     ).to_be_visible()
-    await expect(billed.get_by_role("table").locator("tbody tr")).to_have_count(32)
+    await expect(billed.get_by_role("table").locator("tbody tr")).to_have_count(10)
     await page.set_viewport_size({"width": 390, "height": 844})
+    await page.evaluate("window.scrollTo(0, 0)")
+    await expect(intervals.get_by_label("Service", exact=True)).to_be_in_viewport(
+        ratio=1
+    )
     await assert_horizontal_visibility(page, rows.first.locator("td.numeric"))
     await assert_horizontal_visibility(page, rows.first.get_by_role("button"))
     assert not await page.evaluate("document.documentElement.scrollWidth > innerWidth")
     await page.evaluate("window.scrollTo(0, 0)")
+    await assert_mobile_field_labels_match(rows.first)
+    await page.mouse.move(0, 0)
     await page.screenshot(path=str(tmp_path / "usage-mobile.png"))
 
 
@@ -744,7 +777,7 @@ async def test_sync_poll_preserves_other_account_warnings(
     await page.clock.install()
     await open_app(page, web_backend)
     status = page.locator("#freshness-badge")
-    await expect(status).to_contain_text("Bayou · Energy service · Needs attention")
+    await expect(status).to_contain_text("Bayou · Needs attention")
 
     def set_sync_state(state: str) -> None:
         with sqlite3.connect(web_backend.database) as database:
@@ -755,18 +788,16 @@ async def test_sync_poll_preserves_other_account_warnings(
 
     await asyncio.to_thread(set_sync_state, "running")
     await page.clock.fast_forward(15000)
-    await expect(status).to_contain_text("Syncing Bayou · Energy service…")
-    await expect(status).to_contain_text(
-        "Waste Management · Waste service · Needs attention"
-    )
-    await expect(status).not_to_contain_text("Bayou · Energy service · Needs attention")
+    await expect(status).to_contain_text("Syncing Bayou…")
+    await expect(status).to_contain_text("Waste Management · Needs attention")
+    await expect(status).not_to_contain_text("Bayou · Needs attention")
     freshness = page.get_by_role("region", name="Account freshness", exact=True)
-    await expect(freshness).not_to_contain_text("Bayou · Energy service")
-    await expect(freshness).to_contain_text("Waste Management · Waste service")
+    await expect(freshness).not_to_contain_text("Bayou")
+    await expect(freshness).to_contain_text("Waste Management")
     await asyncio.to_thread(set_sync_state, "partial")
     await page.clock.fast_forward(1500)
     await expect(status).not_to_contain_text("Syncing")
-    await expect(status).to_contain_text("Bayou · Energy service · Needs attention")
+    await expect(status).to_contain_text("Bayou · Needs attention")
     await expect(page.locator("#sync-status")).to_have_count(0)
 
 
@@ -794,17 +825,17 @@ async def test_sync_warnings_name_the_affected_provider_and_account(
     await asyncio.to_thread(seed_history)
     page = utility_page
     await open_app(page, web_backend)
-    await expect(page.locator("#freshness-badge")).to_contain_text(
-        "Bayou · Energy service"
-    )
+    await expect(page.locator("#freshness-badge")).to_contain_text("Bayou")
     freshness = page.get_by_role("region", name="Account freshness", exact=True)
-    await expect(freshness).to_contain_text("Bayou · Energy service")
+    await expect(freshness).to_contain_text("Bayou")
     await expect(freshness).to_contain_text("No successful sync yet.")
-    await expect(freshness).not_to_contain_text("Waste service")
-    await expect(page.locator("#freshness-badge")).not_to_contain_text("Waste service")
+    await expect(freshness).not_to_contain_text("Waste Management")
+    await expect(page.locator("#freshness-badge")).not_to_contain_text(
+        "Waste Management"
+    )
     await expect(
         page.get_by_role("contentinfo").get_by_role("status")
-    ).not_to_contain_text("Bayou · Energy service")
+    ).not_to_contain_text("Bayou")
     await page.screenshot(path=str(tmp_path / "overview-desktop.png"))
     await page.set_viewport_size({"width": 390, "height": 844})
     await page.screenshot(path=str(tmp_path / "overview-mobile.png"))
@@ -832,16 +863,16 @@ async def test_sync_warnings_name_the_affected_provider_and_account(
 
     await page.get_by_role("button", name="Refresh local utility data").click()
     await expect(freshness).to_contain_text("Sync failed.")
-    await expect(freshness).to_contain_text("Bayou · Energy service")
-    await expect(freshness).not_to_contain_text("Waste service")
+    await expect(freshness).to_contain_text("Bayou")
+    await expect(freshness).not_to_contain_text("Waste Management")
     await expect(page.locator("#sync-status")).to_have_count(0)
     await page.get_by_role("button", name="Settings", exact=True).click()
     await expect(
-        page.locator("#sync-status p").filter(has_text="Sync failed")
-    ).to_contain_text("Bayou · Energy service")
+        page.locator("#sync-status .sync-result").filter(has_text="Sync failed")
+    ).to_contain_text("Bayou")
     await page.get_by_label("Account to sync", exact=True).select_option("demo-energy")
     await expect(page.locator("#sync-availability")).to_have_text(
-        "Bayou · Energy service · Provider credentials are not configured."
+        "Provider credentials are not configured."
     )
 
     async def fail_status(route: Route) -> None:
@@ -850,11 +881,10 @@ async def test_sync_warnings_name_the_affected_provider_and_account(
     await page.route("**/v1/sync", fail_status)
     await page.clock.run_for(15_001)
     await expect(page.locator("#sync-status")).to_contain_text(
-        "Bayou · Energy service · Sync status could not be checked. "
-        "The last saved state was failed."
+        "Bayou · Sync status could not be checked. The last saved state was failed."
     )
     await expect(page.locator("#sync-status")).to_contain_text(
-        "Waste Management · Waste service · Sync status could not be checked. "
+        "Waste Management · Sync status could not be checked. "
         "The last saved state was complete."
     )
     await page.set_viewport_size({"width": 390, "height": 844})
@@ -950,13 +980,9 @@ async def test_unconfigured_sync_requires_an_explicit_account_without_sending_re
     await expect(
         page.get_by_role("button", name="Sync account", exact=True)
     ).to_be_disabled()
-    await expect(
-        page.get_by_text(
-            "Waste Management · Waste service · "
-            "Provider credentials are not configured.",
-            exact=True,
-        )
-    ).to_be_visible()
+    await expect(page.locator("#sync-availability")).to_have_text(
+        "Provider credentials are not configured."
+    )
     assert not [request for request in requests if request.method != "GET"]
     diagnostics = page.locator("details.diagnostics")
     await expect(diagnostics).to_have_js_property("open", False)
@@ -1045,3 +1071,22 @@ async def test_mobile_dark_keyboard_and_empty_state_layout(
             assert not errors
         finally:
             await browser.close()
+
+
+@pytest.mark.parametrize("view", ["Usage", "Trash collections"])
+async def test_mobile_meter_and_collection_cells_are_visible(
+    utility_page: Page, web_backend: WebBackend, tmp_path: Path, view: str
+) -> None:
+    page = utility_page
+    await open_app(page, web_backend)
+    await page.set_viewport_size({"width": 390, "height": 844})
+    await page.get_by_role("button", name=view, exact=True).click()
+    row = page.locator(".data-table tbody tr").first
+    await expect(row).to_be_visible()
+    await row.scroll_into_view_if_needed()
+    await expect(row.locator("td")).to_have_count(5)
+    for cell in await row.locator("td").all():
+        await assert_horizontal_visibility(page, cell)
+        await expect(cell).to_be_in_viewport(ratio=1)
+    await expect(row.locator("td").last).not_to_be_empty()
+    await page.screenshot(path=str(tmp_path / "mobile-record.png"))

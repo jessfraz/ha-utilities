@@ -78,7 +78,6 @@ fn request() -> SyncRequest {
     SyncRequest {
         binding: AccountBinding {
             id: "demo-wm".to_owned(),
-            name: "Waste".to_owned(),
             deployment: "demo".to_owned(),
             provider: ProviderId::WasteManagement,
             customer_id: "900000001".to_owned(),
@@ -86,7 +85,6 @@ fn request() -> SyncRequest {
             currency: "USD".to_owned(),
             services: vec![ServiceBinding {
                 id: "demo-waste".to_owned(),
-                name: Some("Waste".to_owned()),
                 provider_service: "demo-bin".to_owned(),
                 kind: ServiceKind::Waste,
             }],

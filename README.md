@@ -51,7 +51,7 @@ partial, unavailable, and stale data remain distinguishable.
 
 ```sh
 ha-utilities connections utilities
-ha-utilities connections start --utility speculoos_power --name Electricity --accept-provider-settings
+ha-utilities connections start --utility speculoos_power --accept-provider-settings
 ha-utilities connections list
 ha-utilities connections authorize CONNECTION_ID
 ha-utilities connections refresh CONNECTION_ID
@@ -118,9 +118,6 @@ The native owner API can remove an entire import-only account with
 `POST /v1/imports/accounts/{id}/purge`. Confirm the exact `provider` and
 `expected_records` count in the request. The transaction removes the account,
 its records, and source files referenced only by that account.
-
-`POST /v1/connections/{id}/rename` changes a linked utility's display label.
-Supply `expected_name` and `name` to preserve concurrent label edits.
 
 The overview shows reported charges and quantities by bill issue month.
 Open a bill for its printed totals, itemized rates, linked payments, and

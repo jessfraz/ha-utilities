@@ -18,13 +18,12 @@ const BAYOU_KEY: &str = "fictional-bayou-key-for-options";
 async fn native_sync_failure_logs_a_fixed_stage_and_preserves_the_job_error() {
     use ha_utilities::models::{HistoryRange, HistorySyncInput, SyncJob, SyncState};
     let directory = tempfile::tempdir().unwrap();
-    let mut settings = Settings {
+    let settings = Settings {
         wm_token: String::new(),
         wm_client_id: String::new(),
         bayou_api_key: String::new(),
         ..Settings::default()
     };
-    settings.accounts[0].services[0].name = None;
     write_settings(directory.path(), &settings);
     let app = Running::start(directory.path()).await;
     let accounts: Page<Account> = app.get("/v1/accounts").await;
@@ -33,7 +32,10 @@ async fn native_sync_failure_logs_a_fixed_stage_and_preserves_the_job_error() {
         .iter()
         .find(|account| account.id == "demo-wm")
         .unwrap();
-    assert_eq!(wm.services[0].name, "Waste");
+    assert_eq!(
+        wm.services[0].kind,
+        ha_utilities::models::ServiceKind::Waste
+    );
     let response = reqwest::Client::new()
         .post(format!("{}/v1/sync", app.origin))
         .bearer_auth(&app.token)

@@ -1,5 +1,5 @@
 name: Utilities
-version: "0.1.11"
+version: "0.1.12"
 slug: utilities
 description: Read-only utility bills, collections, and meter usage
 url: https://github.com/jessfraz/ha-utilities
@@ -31,7 +31,6 @@ schema:
   deployment: str
   accounts:
     - id: str
-      name: str
       deployment: str
       provider: list(waste_management|bayou)
       customer_id: str
@@ -39,9 +38,8 @@ schema:
       currency: str
       services:
         - id: str
-          name: str?
           provider_service: str
-          kind: list(waste|recycling|electricity|gas|other)
+          kind: list(waste|recycling|electricity|gas)
   wm_token: password
   wm_client_id: password
   bayou_api_key: password

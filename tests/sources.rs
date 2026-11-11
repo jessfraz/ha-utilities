@@ -39,19 +39,16 @@ async fn accounts_expose_durable_sources_and_resolve_optional_device_labels() {
             ImportRequest {
                 account: ImportAccount {
                     id: "fictional-internet".to_owned(),
-                    name: "Internet".to_owned(),
                     provider: ha_utilities::imports::ImportProvider::Starlink,
                     start_on: "2025-01-01".parse().unwrap(),
                     provider_account_sha256: None,
                     services: vec![
                         Service {
                             id: "dish-one".to_owned(),
-                            name: String::new(),
                             kind: ServiceKind::Internet,
                         },
                         Service {
                             id: "dish-two".to_owned(),
-                            name: "Fictional Mini".to_owned(),
                             kind: ServiceKind::Internet,
                         },
                     ],
@@ -88,11 +85,11 @@ async fn accounts_expose_durable_sources_and_resolve_optional_device_labels() {
         .find(|account| account.id == "fictional-internet")
         .unwrap();
     assert_eq!(manual.source, AccountSource::ManualImport);
-    assert_eq!(manual.services[0].name, "Internet");
-    assert_eq!(manual.services[1].name, "Fictional Mini");
+    assert_eq!(manual.services[0].kind, ServiceKind::Internet);
+    assert_eq!(manual.services[1].kind, ServiceKind::Internet);
     let binding = app.store.binding("demo", &manual.id).await.unwrap();
-    assert_eq!(binding.services[0].name, None);
-    assert_eq!(binding.services[1].name.as_deref(), Some("Fictional Mini"));
+    assert_eq!(binding.services[0].id, "dish-one");
+    assert_eq!(binding.services[1].id, "dish-two");
 
     let providers = client.providers().await.unwrap();
     assert_eq!(providers.items.len(), 2);

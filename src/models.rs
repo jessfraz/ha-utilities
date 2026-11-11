@@ -112,28 +112,12 @@ pub enum ServiceKind {
     Water,
     Propane,
     Internet,
-    Other,
-}
-
-impl ServiceKind {
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::Waste => "Waste",
-            Self::Recycling => "Recycling",
-            Self::Electricity => "Electricity",
-            Self::Gas => "Gas",
-            Self::Water => "Water",
-            Self::Propane => "Propane",
-            Self::Internet => "Internet",
-            Self::Other => "Other",
-        }
-    }
 }
 
 #[derive(JsonSchema, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Account {
     pub id: String,
-    pub name: String,
+    pub connection_id: Option<String>,
     pub provider: ProviderId,
     pub services: Vec<Service>,
     pub source: AccountSource,
@@ -229,7 +213,6 @@ pub struct Connection {
     pub request_id: String,
     pub utility_id: String,
     pub utility_name: String,
-    pub name: String,
     pub currency: String,
     #[serde(flatten)]
     pub progress: ConnectionProgress,
@@ -245,16 +228,8 @@ pub struct CreateConnection {
     pub provider: ConnectionProvider,
     pub request_id: String,
     pub utility_id: String,
-    pub name: Option<String>,
     pub currency: String,
     pub accept_provider_settings: bool,
-}
-
-#[derive(JsonSchema, Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct ConnectionRename {
-    pub name: String,
-    pub expected_name: String,
 }
 
 #[derive(JsonSchema, Clone, Debug, Deserialize, Serialize)]
@@ -282,10 +257,9 @@ pub struct ConnectionAuthorization {
 }
 
 #[derive(JsonSchema, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Service {
     pub id: String,
-    #[serde(default)]
-    pub name: String,
     pub kind: ServiceKind,
 }
 
@@ -475,14 +449,12 @@ pub struct Summary {
 #[derive(JsonSchema, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct StaleManualAccount {
     pub account_id: String,
-    pub name: String,
     pub last_synced_at: Option<DateTime<Utc>>,
 }
 
 #[derive(JsonSchema, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct StaleAutomaticAccount {
     pub account_id: String,
-    pub name: String,
     pub last_data_at: Option<DateTime<Utc>>,
 }
 

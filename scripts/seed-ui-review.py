@@ -57,9 +57,9 @@ async def capture(origin: str, token_file: Path, output: Path) -> None:
                     )
                     page = await context.new_page()
                     await page.goto(origin)
-                    await expect(
-                        page.get_by_role("heading", name="Data coverage")
-                    ).to_be_visible()
+                    await expect(page.locator("#content")).to_have_attribute(
+                        "aria-busy", "false"
+                    )
                     for name in [
                         "Overview",
                         "Bills",

@@ -740,7 +740,6 @@ impl Bayou {
         observations.extend(request.binding.services.iter().map(|service| {
             Observation::Service(Service {
                 id: service.id.clone(),
-                name: service.name().to_owned(),
                 kind: service.kind,
             })
         }));

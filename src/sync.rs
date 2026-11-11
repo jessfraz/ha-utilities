@@ -740,7 +740,6 @@ mod tests {
                 deployment: DEPLOYMENT.to_owned(),
                 accounts: vec![AccountBinding {
                     id: ACCOUNT.to_owned(),
-                    name: "Example energy".to_owned(),
                     deployment: DEPLOYMENT.to_owned(),
                     provider: ProviderId::Bayou,
                     currency: "USD".to_owned(),
@@ -748,7 +747,6 @@ mod tests {
                     provider_account: PROVIDER_ACCOUNT.to_owned(),
                     services: vec![ServiceBinding {
                         id: "demo-electric".to_owned(),
-                        name: Some("Electricity".to_owned()),
                         provider_service: METER.to_owned(),
                         kind: ServiceKind::Electricity,
                     }],
@@ -774,7 +772,6 @@ mod tests {
                     provider: crate::models::ConnectionProvider::Bayou,
                     request_id: uuid::Uuid::now_v7().to_string(),
                     utility_id: "speculoos_power".into(),
-                    name: None,
                     currency: "USD".into(),
                     accept_provider_settings: true,
                 };

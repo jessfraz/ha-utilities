@@ -111,8 +111,6 @@ enum Connections {
         utility: String,
         #[arg(long, default_value = "USD")]
         currency: String,
-        #[arg(long)]
-        name: Option<String>,
         /// Accept this Bayou workspace's data-unlocking and billing settings.
         ///
         /// Defaults unlock 12 billing periods, future bills, and both meter types.
@@ -457,7 +455,6 @@ async fn run(cli: Cli) -> Result<(), ClientError> {
                 Connections::Start {
                     utility,
                     currency,
-                    name,
                     accept_provider_settings,
                     request_id,
                 } => print(
@@ -467,7 +464,6 @@ async fn run(cli: Cli) -> Result<(), ClientError> {
                             request_id: request_id.unwrap_or_else(uuid::Uuid::now_v7).to_string(),
                             utility_id: utility,
                             currency,
-                            name,
                             accept_provider_settings,
                         })
                         .await?,

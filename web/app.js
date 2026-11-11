@@ -26,7 +26,7 @@ const names = {
   scheduled: 'Scheduled', completed: 'Completed', exception: 'Exception', unknown: 'Unknown',
   running: 'Syncing', failed: 'Sync failed', interrupted: 'Sync interrupted',
   waste: 'Waste', recycling: 'Recycling', electricity: 'Electricity', gas: 'Gas', water: 'Water',
-  internet: 'Internet', propane: 'Propane', other: 'Other',
+  internet: 'Internet', propane: 'Propane',
 };
 const billingUnits = {
   hundred_cubic_feet: 'CCF', us_gallon: 'US gal', cubic_meter: 'm³', byte: 'B',
@@ -74,6 +74,7 @@ const reasonLabels = {
 let view = readView();
 let accounts = [];
 let providers = [];
+let connections = [];
 let summary = null;
 let health = null;
 let ready = false;
@@ -110,10 +111,20 @@ function node(tag, text, className) {
 }
 
 function label(value) { return names[value] ?? String(value).replaceAll('_', ' '); }
-function accountName(id) { return accounts.find((account) => account.id === id)?.name ?? 'Unknown account'; }
+function accountName(id) {
+  const account = accounts.find((item) => item.id === id);
+  return account ? companyName(account) : 'Unknown utility';
+}
+function companyName(account) {
+  return connections.find((item) => item.id === account.connection_id)?.utility_name ?? providerName(account.provider);
+}
+function companyKey(account) {
+  const connection = connections.find((item) => item.id === account.connection_id);
+  return connection ? `bayou/${connection.utility_id}` : account.provider;
+}
 function providerName(id) { return providers.find((provider) => provider.id === id)?.name ?? label(id); }
 function accountLabel(id) {
-  return accountDisplay(id).label;
+  return accountName(id);
 }
 function importedVendors(bindings = accounts) {
   const vendors = new Map();
@@ -124,36 +135,22 @@ function importedVendors(bindings = accounts) {
   }
   return vendors;
 }
-function accountDisplay(id) {
-  const account = accounts.find((item) => item.id === id);
-  if (!account) return { name: 'Unknown account', label: 'Unknown account' };
-  const provider = providerName(account.provider);
-  const manual = account.source.kind === 'manual_import';
-  const distinct = provider !== account.name;
-  return {
-    name: manual ? provider : account.name,
-    context: distinct ? manual ? account.name : provider : undefined,
-    label: distinct ? `${provider} · ${account.name}` : account.name,
-  };
-}
 function accountBadge(id) {
   const account = accounts.find((item) => item.id === id);
-  const identity = account?.source.kind === 'manual_import' ? account.provider : id;
-  let color = 0;
-  for (const character of identity) color = (color * 31 + character.codePointAt(0)) % 6;
-  return node('span', accountDisplay(id).name, `badge account-badge account-color-${color}`);
+  const identity = account ? companyKey(account) : id;
+  let hash = 2166136261;
+  for (const character of identity) hash = Math.imul(hash ^ character.codePointAt(0), 16777619) >>> 0;
+  return node('span', accountName(id), `badge account-badge account-color-${hash % 6}`);
 }
 function accountCell(id) {
-  const { context } = accountDisplay(id);
   const result = cell();
   result.append(accountBadge(id));
-  if (context && accounts.find((account) => account.id === id)?.source.kind === 'manual_import') result.append(node('small', context));
   return result;
 }
 function serviceName(id) {
   for (const account of accounts) {
     const service = account.services.find((item) => item.id === id);
-    if (service) return service.name;
+    if (service) return label(service.kind);
   }
   return 'Unknown service';
 }
@@ -356,7 +353,7 @@ function updateFreshness() {
   const warnings = accountWarnings();
   if (running.length || warnings.length > 1) {
     value.replaceChildren(
-      ...running.map((job) => node('span', syncDescription(job), 'badge')),
+      ...running.map((job) => node('span', runningSyncDescription(job), 'badge')),
       ...warnings.map((item) => node('span', `${accountLabel(item.accountId)} · Needs attention`, 'badge attention')),
     );
     value.className = 'freshness-badges';
@@ -364,7 +361,7 @@ function updateFreshness() {
     value.textContent = warnings.length ? `${accountLabel(warnings[0].accountId)} · Needs attention` : summary?.last_synced_at ? 'Synced' : 'Connected';
     value.className = `badge${warnings.length ? ' attention' : summary?.last_synced_at ? ' good' : ''}`;
   }
-  shell.setStatus(running.length ? running.map(syncDescription).join(' ')
+  shell.setStatus(running.length ? running.map(runningSyncDescription).join(' ')
     : summary?.last_synced_at ? `Most recent sync ${timestamp(summary.last_synced_at)}` : 'Connected to Utilities');
 }
 
@@ -383,15 +380,17 @@ async function load() {
   retry.hidden = true;
   showNotice(ready ? 'Refreshing local data…' : 'Connecting to Utilities…');
   try {
-    const [system, nextHealth, nextSummary, nextAccounts, nextProviders, nextJobs] = await Promise.all([
+    const [system, nextHealth, nextSummary, nextAccounts, nextProviders, nextConnections, nextJobs] = await Promise.all([
       api('v1/system', { signal: controller.signal }), api('health', { signal: controller.signal }),
       api('v1/summary', { signal: controller.signal }),
       allBindings('v1/accounts', controller.signal), allBindings('v1/providers', controller.signal),
+      allBindings('v1/connections', controller.signal),
       api('v1/sync', { signal: controller.signal }),
     ]);
     if (controller.signal.aborted) return;
     accounts = nextAccounts;
     providers = nextProviders;
+    connections = nextConnections;
     summary = nextSummary;
     health = nextHealth;
     syncJobs = nextJobs;
@@ -452,7 +451,8 @@ function table(headers, caption, className = '') {
   return { wrapper, body };
 }
 function cell(text, numeric = false, heading) {
-  const value = node('td', text, numeric ? 'numeric' : undefined);
+  const value = node('td', numeric ? undefined : text, numeric ? 'numeric' : undefined);
+  if (numeric && text !== undefined) value.append(node('span', text, 'numeric-value'));
   if (heading) value.dataset.label = heading;
   return value;
 }
@@ -527,7 +527,7 @@ async function renderOverview(signal, current) {
     connect.addEventListener('click', () => connectionManager.open());
     setup.append(connect);
     if (connect.disabled) setup.append(node('p', 'Add a Bayou API key in the app configuration to get started.', 'connection-note'));
-    content.replaceChildren(setup, connectionManager.section({ pendingOnly: true }));
+    content.replaceChildren(setup, connectionManager.section({ showStart: false }));
     return;
   }
   const hasCollections = accountsFor('collections').length > 0;
@@ -542,7 +542,7 @@ async function renderOverview(signal, current) {
   const metrics = node('section', undefined, 'metrics');
   metrics.setAttribute('aria-label', 'Saved utility data');
   const vendors = importedVendors();
-  const utilityCount = vendors.size + accounts.filter((account) => account.source.kind === 'live').length;
+  const utilityCount = new Set(accounts.map(companyKey)).size;
   const values = [[utilityCount, vendors.size ? 'Utilities' : 'Utility accounts'], [summary.bills, 'Saved bills'], ...(hasCollections ? [[summary.collections, 'Saved trash collections']] : []), [summary.usage_intervals, 'Usage intervals']];
   for (const [value, title] of values) {
     const metric = node('div', undefined, 'metric');
@@ -575,9 +575,8 @@ async function renderOverview(signal, current) {
     for (const balance of balances.items) {
       const item = node('li');
       const description = node('div');
-      const { name, context } = accountDisplay(balance.account_id);
+      const name = accountName(balance.account_id);
       description.append(node('strong', name));
-      if (context) description.append(node('p', context));
       description.append(node('p', `As of ${timestamp(balance.as_of)}`));
       item.append(description, node('strong', money(balance.amount), 'amount'));
       list.append(item);
@@ -708,7 +707,7 @@ async function renderUsage(signal, current) {
   intervals.setAttribute('aria-label', 'Meter intervals');
   const intervalResults = node('div', undefined, 'panel-body');
   intervals.append(intervalResults);
-  content.replaceChildren(billed, intervals);
+  content.replaceChildren(intervals, billed);
   const history = async () => {
     try {
       const bills = await allBindings('v1/bills', signal, { from: dateOffset(-365), to: dateOffset(0) });
@@ -716,9 +715,25 @@ async function renderUsage(signal, current) {
       const { wrapper, body } = table([
         'Billing period', 'Utility and service', { text: 'Quantity', numeric: true }, 'Bill',
       ], 'Billed usage from saved bills', 'billed-usage-table responsive-table');
-      for (const bill of bills) {
-        for (const item of bill.reported_quantities ?? []) {
-          if (!Object.hasOwn(reportedQuantityNames, item.kind)) continue;
+      const records = bills.flatMap((bill) => (bill.reported_quantities ?? [])
+        .filter((item) => Object.hasOwn(reportedQuantityNames, item.kind))
+        .map((item) => ({ bill, item })));
+      let page = 0;
+      const limit = 10;
+      const pagination = node('div', undefined, 'list-meta billed-pagination');
+      const previous = node('button', 'Previous', 'quiet');
+      const next = node('button', 'Next', 'quiet');
+      previous.type = next.type = 'button';
+      previous.setAttribute('aria-label', 'Previous billed usage');
+      next.setAttribute('aria-label', 'Next billed usage');
+      const range = node('span');
+      range.setAttribute('role', 'status');
+      pagination.append(previous, range, next);
+      billed.tabIndex = -1;
+      function renderPage() {
+        body.replaceChildren();
+        const start = page * limit;
+        for (const { bill, item } of records.slice(start, start + limit)) {
           const row = node('tr');
           const service = accountCell(bill.account_id);
           service.append(node('small', serviceName(item.service_id)));
@@ -733,8 +748,25 @@ async function renderUsage(signal, current) {
           row.append(cell(period, false, 'Billing period'), service, cell(quantity(item.quantity), true, 'Quantity'), source);
           body.append(row);
         }
+        previous.disabled = page === 0;
+        next.disabled = start + limit >= records.length;
+        range.textContent = `${start + 1}–${Math.min(start + limit, records.length)} of ${count(records.length)}`;
       }
-      reported.replaceChildren(body.childElementCount ? wrapper : empty('No billed usage reported', 'Saved bills issued in the past year have no reported water use or propane deliveries.'));
+      function turnPage(delta) {
+        if (signal.aborted || current !== generation) return;
+        page += delta;
+        renderPage();
+        // Keep keyboard readers at the start of the new records, not below them.
+        billed.focus({ preventScroll: true });
+        billed.scrollIntoView({ block: 'start' });
+      }
+      previous.addEventListener('click', () => turnPage(-1));
+      next.addEventListener('click', () => turnPage(1));
+      if (records.length) {
+        renderPage();
+        reported.replaceChildren(wrapper);
+        if (records.length > limit) reported.append(pagination);
+      } else reported.replaceChildren(empty('No billed usage reported', 'Saved bills issued in the past year have no reported water use or propane deliveries.'));
       reported.append(node('p', 'Quantities from bills issued in the past year. Open a bill for its original documents.', 'section-note'));
     } catch (error) {
       if (current === generation && error.name !== 'AbortError') {
@@ -792,7 +824,7 @@ function filterForm(type, state, onSubmit) {
   let selected = state.filters.import_provider ? importProviderPrefix + state.filters.import_provider : state.filters.account;
   const options = [
     ['', 'All accounts'],
-    ...matchingAccounts.filter((item) => type !== 'bills' || item.source.kind === 'live').map((item) => [item.id, item.name]),
+    ...matchingAccounts.filter((item) => type !== 'bills' || item.source.kind === 'live').map((item) => [item.id, accountName(item.id)]),
     ...Array.from(vendors.keys(), (id) => [importProviderPrefix + id, providerName(id)]),
   ];
   if (!options.some(([id]) => id === selected)) {
@@ -839,7 +871,7 @@ function filterForm(type, state, onSubmit) {
 }
 function serviceOptions(account, capability) {
   return [['', 'All services'], ...accountsFor(capability).filter((item) => !account || item.id === account)
-    .flatMap((item) => item.services.map((service) => [service.id, `${service.name} · ${item.name}`]))];
+    .flatMap((item) => item.services.map((service) => [service.id, `${label(service.kind)} · ${accountName(item.id)}`]))];
 }
 
 async function renderList(type, signal, current, target = content) {
@@ -900,15 +932,15 @@ function recordTable(type, items) {
   const headers = type === 'bills' ? ['Issued', 'Account', 'Due', { text: 'Total', numeric: true }, 'Source']
     : type === 'collections' ? ['Scheduled', 'Service', 'Status', 'ETA / completion', 'Exception']
     : ['Interval start', 'Interval end', 'Service', { text: 'Quantity', numeric: true }, 'Unit'];
-  const { wrapper, body } = table(headers, `${label(type)} matching the selected filters`, type === 'bills' ? 'data-table bills-table responsive-table' : 'data-table');
+  const { wrapper, body } = table(headers, `${label(type)} matching the selected filters`, `data-table responsive-table ${type === 'bills' ? 'bills-table' : type === 'collections' ? 'collections-table' : 'intervals-table'}`);
   for (const item of items) {
     const row = node('tr');
     if (type === 'bills') {
       const issued = cell(undefined, false, 'Issued');
       const open = node('button', calendarDate(item.issued_on), 'record-button');
       open.type = 'button';
-      const { name, context } = accountDisplay(item.account_id);
-      open.setAttribute('aria-label', `View ${context ? `${name}, ${context}` : name} bill issued ${calendarDate(item.issued_on)}`);
+      const name = accountName(item.account_id);
+      open.setAttribute('aria-label', `View ${name} bill issued ${calendarDate(item.issued_on)}`);
       open.addEventListener('click', () => openBill(item.id));
       issued.append(open);
       const source = cell();
@@ -918,18 +950,23 @@ function recordTable(type, items) {
         documents.setAttribute('aria-label', `View original documents for ${accountName(item.account_id)} bill issued ${calendarDate(item.issued_on)}`);
         documents.addEventListener('click', () => openBill(item.id, { showDocuments: true }));
         source.append(documents);
-      } else source.append(node('span', `Synced from ${providerName(item.provider)}`));
+      } else {
+        const provider = providerName(item.provider);
+        source.append(node('span', provider === accountName(item.account_id) ? 'Provider API' : `Synced from ${provider}`));
+      }
       row.append(issued, accountCell(item.account_id), cell(calendarDate(item.due_on), false, 'Due'), cell(money(item.total), true, 'Total'), source);
     } else if (type === 'collections') {
-      const service = cell(serviceName(item.service_id));
+      const service = cell(serviceName(item.service_id), false, 'Service');
       service.append(node('small', accountName(item.account_id)));
-      const status = cell(); status.append(badge(item.status));
-      const execution = cell(item.completed_at ? `Completed ${timestamp(item.completed_at)}` : item.eta ? `ETA ${timestamp(item.eta)}` : 'Not reported');
-      row.append(cell(calendarDate(item.scheduled_date)), service, status, execution, node('td', item.exception ?? 'None reported', 'exception-text'));
+      const status = cell(undefined, false, 'Status'); status.append(badge(item.status));
+      const execution = cell(item.completed_at ? `Completed ${timestamp(item.completed_at)}` : item.eta ? `ETA ${timestamp(item.eta)}` : 'Not reported', false, 'ETA / completion');
+      const exception = cell(item.exception ?? 'None reported', false, 'Exception');
+      exception.classList.add('exception-text');
+      row.append(cell(calendarDate(item.scheduled_date), false, 'Scheduled'), service, status, execution, exception);
     } else {
-      const service = cell(serviceName(item.service_id));
+      const service = cell(serviceName(item.service_id), false, 'Service');
       service.append(node('small', accountName(item.account_id)));
-      row.append(cell(timestamp(item.start)), cell(timestamp(item.end)), service, cell(item.quantity, true), cell(item.unit));
+      row.append(cell(timestamp(item.start), false, 'Interval start'), cell(timestamp(item.end), false, 'Interval end'), service, cell(item.quantity, true, 'Quantity'), cell(item.unit, false, 'Unit'));
     }
     body.append(row);
   }
@@ -1063,11 +1100,9 @@ function importedBill(bill, { currency, bill: { record }, related }) {
   const amount = (minor_units) => minor_units == null ? null : money({ currency, minor_units });
   const selectedServices = record.scope === 'selected_services';
   const sheet = node('article', undefined, 'imported-bill');
-  const { context } = accountDisplay(bill.account_id);
   const account = node('h3', undefined, 'billing-account');
   account.append(accountBadge(bill.account_id));
   sheet.append(account);
-  if (context) sheet.append(node('p', context, 'billing-account-context'));
   const totals = node('dl', undefined, 'billing-totals');
   for (const [title, value] of [
     ['Amount due', record.totals.amount_due_minor],
@@ -1176,35 +1211,34 @@ function renderSettings() {
   else {
     const grid = node('div', undefined, 'panel-body');
     grid.classList.add('account-grid');
-    const apiSources = { bayou: 'Bayou', waste_management: 'Waste Management API' };
-    const displayAccounts = [
-      ...syncAccounts,
-      ...Array.from(importedVendors(), ([provider, bindings]) => ({
-        name: providerName(provider), source: { kind: 'manual_import' },
-        services: bindings.flatMap((account) => account.services),
-      })),
-    ];
-    for (const account of displayAccounts) {
+    const apiSources = { bayou: 'Bayou', waste_management: 'API' };
+    const companies = new Map();
+    for (const account of accounts) {
+      const key = companyKey(account);
+      if (!companies.has(key)) companies.set(key, { company: companyName(account), sources: new Set(), connections: new Set(), services: [] });
+      const company = companies.get(key);
+      company.sources.add(account.source.kind === 'manual_import' ? 'Manual import' : apiSources[account.source.provider]);
+      company.services.push(...account.services);
+      if (account.connection_id) company.connections.add(account.connection_id);
+    }
+    for (const account of companies.values()) {
       const card = node('article');
-      card.append(node('h3', account.name));
-      const source = account.source.kind === 'manual_import' ? 'Manual import' : apiSources[account.source.provider];
+      card.append(node('h3', account.company));
       const categories = node('div', undefined, 'capabilities');
       categories.setAttribute('role', 'group');
       categories.setAttribute('aria-label', 'Data source and service categories');
-      if (source) categories.append(node('span', source, 'badge'));
+      for (const source of account.sources) {
+        if (source !== account.company) categories.append(node('span', source, 'badge'));
+      }
       for (const kind of new Set(account.services.map((service) => service.kind))) {
         categories.append(node('span', label(kind), 'badge'));
       }
       card.append(categories);
       if (!account.services.length) card.append(node('p', 'No services connected.'));
-      const serviceNames = new Set(account.services.filter((service) => service.name !== account.name && service.name !== label(service.kind)).map((service) => service.name));
-      if (account.services.length > 1 && serviceNames.size) {
-        const details = node('details', undefined, 'account-services');
-        const services = node('div', undefined, 'capabilities');
-        for (const name of serviceNames) {
-          services.append(node('span', name));
-        }
-        details.append(node('summary', 'Services'), services);
+      for (const [index, id] of [...account.connections].entries()) {
+        const details = node('button', account.connections.size > 1 ? `Connection ${index + 1} details` : 'Connection details', 'text-action');
+        details.type = 'button';
+        details.addEventListener('click', () => connectionManager.open(id));
         card.append(details);
       }
       grid.append(card);
@@ -1237,14 +1271,23 @@ function syncStatus() {
 }
 
 function renderSyncStatus(status) {
-  status.replaceChildren(...syncJobs.map((job) => node('p', syncDescription(job))));
+  status.replaceChildren(...syncJobs.map((job) => {
+    if (job.state === 'running') return node('p', runningSyncDescription(job));
+    const result = node('div', undefined, 'sync-result');
+    const heading = node('div', undefined, 'sync-result-heading');
+    const state = job.state === 'complete' ? 'Complete' : job.state === 'partial' ? 'Coverage gaps' : label(job.state);
+    heading.append(node('strong', accountLabel(job.account_id)), badge(job.state, state));
+    result.append(heading, node('p', `${count(job.observations)} ${job.observations === 1 ? 'observation' : 'observations'} processed.`, 'muted'));
+    if (job.error) result.append(node('p', reasonLabels[job.error] ?? 'Check provider coverage and configuration.'));
+    return result;
+  }));
   status.hidden = syncJobs.length === 0;
 }
 
 function syncForm(syncAccounts) {
   const wrapper = node('div');
   const form = node('form', undefined, 'sync-form');
-  const account = selectField('Account to sync', 'account', [['', 'Choose an account'], ...syncAccounts.map((item) => [item.id, item.name])], '', true);
+  const account = selectField('Account to sync', 'account', [['', 'Choose an account'], ...syncAccounts.map((item) => [item.id, accountName(item.id)])], '', true);
   const [defaultFrom, defaultTo] = defaultSyncDates();
   const from = dateField('From', 'from', defaultFrom);
   const to = dateField('To', 'to', defaultTo);
@@ -1270,10 +1313,10 @@ function syncForm(syncAccounts) {
     submit.disabled = submitting || running || !canSync();
     all.disabled = submit.disabled;
     account.select.disabled = submitting;
-    const context = binding ? accountLabel(binding.id) : '';
-    availability.textContent = submitting ? `${context} · Starting sync…` : running ? `${context} · Already syncing.`
+    availability.classList.toggle('sync-unavailable', !!binding && !canSync());
+    availability.textContent = submitting ? 'Starting sync…' : running ? 'Already syncing.'
       : !binding ? 'Choose an account to sync.'
-      : !canSync() ? `${context} · Provider credentials are not configured.` : '';
+      : !canSync() ? 'Provider credentials are not configured.' : '';
   }
   account.select.addEventListener('change', updateAvailability);
   updateSyncForm = updateAvailability;
@@ -1311,12 +1354,10 @@ function syncForm(syncAccounts) {
   wrapper.append(form, history, availability);
   return wrapper;
 }
-function syncDescription(job) {
-  if (job.state === 'running') return `Syncing ${accountLabel(job.account_id)}…`;
-  const state = job.state === 'complete' ? 'Sync complete' : job.state === 'partial' ? 'Sync finished with coverage gaps' : label(job.state);
-  const records = `${count(job.observations)} ${job.observations === 1 ? 'observation' : 'observations'} processed`;
-  return `${state} · ${accountLabel(job.account_id)} · ${records}${job.error ? '. Check this account’s provider coverage and configuration.' : '.'}`;
+function runningSyncDescription(job) {
+  return `Syncing ${accountLabel(job.account_id)}…`;
 }
+
 function pollSync() {
   clearTimeout(syncTimer);
   syncPollController?.abort();

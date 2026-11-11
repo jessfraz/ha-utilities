@@ -63,7 +63,7 @@ td small { display: block; margin-top: 3px; color: var(--muted); font-size: 11px
 .data-table td { vertical-align: baseline; }
 .data-table td small { font-size: 12px; }
 td.numeric, th.numeric { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
-td.numeric { font-family: var(--mono); }
+.numeric-value { font-family: var(--mono); }
 .record-button { display: inline-flex; align-items: center; min-height: 44px; min-width: 44px; margin-block: -10px; padding: 0; background: transparent; color: var(--ink); font-size: inherit; font-weight: 560; border-radius: 0; text-align: left; text-decoration: underline; text-underline-offset: 4px; }
 .list-meta [tabindex="-1"]:focus-visible { outline: 2px solid var(--focus); outline-offset: 4px; }
 .record-button:hover { background: transparent; }
@@ -75,6 +75,7 @@ td.numeric { font-family: var(--mono); }
 .toolbar button { flex: 0 0 auto; }
 .list-meta { display: flex; justify-content: space-between; align-items: center; gap: 16px; margin-top: 12px; color: var(--muted); font-size: 12px; }
 .list-meta p { margin: 0; }
+.billed-pagination { margin: 0; padding: 12px 16px; border-top: 1px solid var(--line); flex-wrap: wrap; }
 .coverage-panel { margin-top: 24px; }
 .diagnostics > summary { min-height: 44px; padding: 17px 20px; font-size: 14px; font-weight: 600; cursor: pointer; }
 .diagnostics[open] > summary { border-bottom: 1px solid var(--line); }
@@ -95,9 +96,6 @@ td.numeric { font-family: var(--mono); }
 .account-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
 .account-grid article { border: 1px solid var(--line); border-radius: 6px; padding: 16px; }
 .account-grid p { margin: 0; font-size: 12px; color: var(--muted); }
-.account-services { margin-top: 12px; font-size: 13px; }
-.account-services summary { color: var(--muted); cursor: pointer; }
-.account-services .capabilities { margin-top: 8px; }
 .settings-section { margin-bottom: 24px; }
 .sync-form { display: flex; flex-wrap: wrap; gap: 12px; align-items: end; }
 .sync-form .form-field { flex: 1 1 140px; }
@@ -105,6 +103,11 @@ td.numeric { font-family: var(--mono); }
 .sync-form button { flex: 0 0 auto; }
 .sync-status { margin: 16px 0 0; font-size: 13px; }
 .sync-status:empty { display: none; }
+.sync-result { padding: 12px 0; border-top: 1px solid var(--line); }
+.sync-result-heading { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; }
+.sync-result p { margin: 6px 0 0; }
+.sync-result-heading strong { font-weight: 600; }
+.sync-availability.sync-unavailable { color: var(--ink); font-weight: 600; }
 .history-sync { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-top: 16px; }
 .history-sync p { margin: 0; }
 .sync-availability { margin: 12px 0 0; font-size: 13px; color: var(--muted); }
@@ -117,7 +120,6 @@ dd { margin: 0; overflow-wrap: anywhere; }
 #bill-detail:has(.imported-bill) { width: min(780px, calc(100% - 32px)); }
 .imported-bill { display: grid; gap: 16px; }
 .billing-account { font-size: 20px; margin: 0; letter-spacing: -.025em; }
-.billing-account-context { margin: 0; color: var(--muted); font-size: 13px; }
 .billing-totals { grid-template-columns: repeat(auto-fit, minmax(min(100%, 180px), 1fr)); gap: 1px; margin: 0; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; background: var(--line); }
 .billing-totals > div { padding: 16px; background: var(--soft); }
 .billing-totals dd { margin-top: 5px; font-size: clamp(22px, 5vw, 32px); font-weight: 620; letter-spacing: -.035em; font-variant-numeric: tabular-nums; }
@@ -218,6 +220,18 @@ dd { margin: 0; overflow-wrap: anywhere; }
   .bills-table td:nth-child(3) { grid-area: due; }
   .bills-table td:nth-child(4) { grid-area: total; }
   .bills-table td:nth-child(5) { grid-area: source; }
+  .intervals-table tr { grid-template-areas: 'service service' 'start end' 'quantity unit'; }
+  .intervals-table td:nth-child(1) { grid-area: start; }
+  .intervals-table td:nth-child(2) { grid-area: end; }
+  .intervals-table td:nth-child(3) { grid-area: service; }
+  .intervals-table td:nth-child(4) { grid-area: quantity; }
+  .intervals-table td:nth-child(5) { grid-area: unit; }
+  .collections-table tr { grid-template-areas: 'service status' 'scheduled scheduled' 'execution execution' 'exception exception'; }
+  .collections-table td:nth-child(1) { grid-area: scheduled; }
+  .collections-table td:nth-child(2) { grid-area: service; }
+  .collections-table td:nth-child(3) { grid-area: status; }
+  .collections-table td:nth-child(4) { grid-area: execution; }
+  .collections-table td:nth-child(5) { grid-area: exception; }
   .billed-usage-table tbody { padding: 12px; }
   .billed-usage-table tr { grid-template-areas: 'service quantity' 'period period' 'source source'; }
   .billed-usage-table td:nth-child(1) { grid-area: period; }

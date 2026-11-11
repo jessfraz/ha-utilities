@@ -14,8 +14,18 @@ use std::collections::{BTreeMap, BTreeSet};
 
 pub(crate) struct ImportState {
     pub id: String,
+    pub connection_id: Option<String>,
     pub mode: IngestionMode,
     pub imported_at: Option<chrono::DateTime<Utc>>,
+}
+
+fn import_states_sql(accounts: &[String]) -> QueryBuilder<Sqlite> {
+    let mut query = QueryBuilder::new(
+        "SELECT id,connection_id,import_only,imported_at FROM accounts WHERE id IN (",
+    );
+    crate::store::bind_accounts(&mut query, accounts);
+    query.push(")");
+    query
 }
 
 impl From<sqlx::Error> for ImportError {
@@ -181,11 +191,7 @@ impl Store {
         &self,
         accounts: &[String],
     ) -> Result<Vec<ImportState>, StoreError> {
-        let mut query = QueryBuilder::<Sqlite>::new(
-            "SELECT id,import_only,imported_at FROM accounts WHERE id IN (",
-        );
-        crate::store::bind_accounts(&mut query, accounts);
-        query.push(")");
+        let mut query = import_states_sql(accounts);
         query
             .build()
             .fetch_all(&self.pool)
@@ -201,6 +207,7 @@ impl Store {
                     .map(|time| time.with_timezone(&Utc));
                 Ok(ImportState {
                     id: row.try_get("id")?,
+                    connection_id: row.try_get("connection_id")?,
                     mode: ingestion_mode(row.try_get("import_only")?),
                     imported_at,
                 })
@@ -657,7 +664,7 @@ mod tests {
         models::{Observation, Service, ServiceKind, Usage, UsageUnit},
         store::{
             Store,
-            imports::{nonoverlapping_usage_sql, unknown_usage_records_sql},
+            imports::{import_states_sql, nonoverlapping_usage_sql, unknown_usage_records_sql},
         },
         utility::SyncPage,
     };
@@ -729,13 +736,11 @@ mod tests {
         let request = ImportRequest {
             account: ImportAccount {
                 id: "plan-water".to_owned(),
-                name: "Water".to_owned(),
                 provider: ImportProvider::Lvmwd,
                 start_on: start.date_naive(),
                 provider_account_sha256: None,
                 services: vec![Service {
                     id: "plan-meter".to_owned(),
-                    name: "Meter".to_owned(),
                     kind: ServiceKind::Water,
                 }],
             },
@@ -785,6 +790,13 @@ mod tests {
                 usage
             })
             .collect::<Vec<_>>();
+        let account_ids = vec![binding.id.clone()];
+        let mut identity_query = import_states_sql(&account_ids);
+        let plans = explain("account_identity_metadata", &store, identity_query.build()).await;
+        assert!(plans.iter().any(|plan| {
+            plan.starts_with("SEARCH accounts USING INDEX sqlite_autoindex_accounts_1")
+        }));
+        assert!(!plans.iter().any(|plan| plan == "SCAN accounts"));
         let mut missing = unknown_usage_records_sql(&binding.id, &ids);
         let plans = explain("unknown_missing_projection", &store, missing.build()).await;
         assert!(

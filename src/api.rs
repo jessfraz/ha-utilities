@@ -314,14 +314,17 @@ async fn accounts(
     let items = bindings
         .iter()
         .map(|binding| {
-            let source = import_states
+            let state = import_states
                 .iter()
                 .find(|state| state.id == binding.id)
-                .and_then(|state| state.mode.source(binding.provider))
+                .ok_or_else(|| store_error(StoreError::InvalidObservation))?;
+            let source = state
+                .mode
+                .source(binding.provider)
                 .ok_or_else(|| store_error(StoreError::InvalidObservation))?;
             Ok(Account {
                 id: binding.id.clone(),
-                name: binding.name.clone(),
+                connection_id: state.connection_id.clone(),
                 provider: binding.provider,
                 source,
                 services: binding
@@ -329,7 +332,6 @@ async fn accounts(
                     .iter()
                     .map(|service| Service {
                         id: service.id.clone(),
-                        name: service.name().to_owned(),
                         kind: service.kind,
                     })
                     .collect(),
@@ -417,27 +419,6 @@ async fn connection_get(
             .get(&path.into_inner().id)
             .await
             .map_err(connection_error)?,
-    ))
-}
-
-#[endpoint {method=POST,path="/v1/connections/{id}/rename",tags=["connections"],request_body_max_bytes=1024}]
-async fn connection_rename(
-    request: RequestContext<Arc<Context>>,
-    path: Path<RecordPath>,
-    body: TypedBody<ConnectionRename>,
-) -> Result<PrivateOk<Connection>, HttpError> {
-    authorized(&request)?;
-    let context = request.context();
-    Ok(private(
-        context
-            .store
-            .rename_connection(
-                &context.config.deployment,
-                &path.into_inner().id,
-                body.into_inner(),
-            )
-            .await
-            .map_err(|error| connection_error(ConnectionError::Store(error)))?,
     ))
 }
 
@@ -988,7 +969,7 @@ async fn schema(request: RequestContext<Arc<Context>>) -> Result<Response<Body>,
 
 pub fn description() -> anyhow::Result<ApiDescription<Arc<Context>>> {
     let mut api = ApiDescription::new();
-    let endpoints: [dropshot::ApiEndpoint<Arc<Context>>; 33] = [
+    let endpoints: [dropshot::ApiEndpoint<Arc<Context>>; 32] = [
         system.into(),
         health.into(),
         providers.into(),
@@ -997,7 +978,6 @@ pub fn description() -> anyhow::Result<ApiDescription<Arc<Context>>> {
         connections.into(),
         connection_start.into(),
         connection_get.into(),
-        connection_rename.into(),
         connection_refresh.into(),
         connection_resume.into(),
         connection_authorization.into(),

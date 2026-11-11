@@ -9,8 +9,8 @@ use uuid::Uuid;
 use crate::{
     config::{AccountBinding, Config},
     models::{
-        Connection, ConnectionProgress, ConnectionProvider, ConnectionRename, ConnectionState,
-        Coverage, CreateConnection, SyncJob,
+        Connection, ConnectionProgress, ConnectionProvider, ConnectionState, Coverage,
+        CreateConnection, SyncJob,
     },
     store::{Store, StoreError},
 };
@@ -28,7 +28,6 @@ struct ConnectionRow {
     external_id: String,
     utility_id: String,
     utility_name: String,
-    name: String,
     currency: String,
     progress: String,
     revision: i64,
@@ -54,7 +53,6 @@ impl ConnectionRow {
                 request_id: self.request_id,
                 utility_id: self.utility_id,
                 utility_name: self.utility_name,
-                name: self.name,
                 currency: self.currency,
                 progress: serde_json::from_str(&self.progress)?,
                 provider_settings_accepted_at: date(&self.provider_settings_accepted_at)?,
@@ -96,7 +94,7 @@ impl Store {
         binding: &AccountBinding,
         connection: Option<&str>,
     ) -> Result<(), StoreError> {
-        // This is the original immutable identity. Labels may still change.
+        // Display text never participates in the immutable binding identity.
         let identity = (
             &binding.deployment,
             &binding.provider,
@@ -159,13 +157,8 @@ impl Store {
             .await?
         {
             let existing = existing.decode()?;
-            let expected_name = input
-                .name
-                .as_deref()
-                .unwrap_or(&existing.connection.utility_name);
             if existing.connection.utility_id != input.utility_id
                 || existing.connection.currency != input.currency
-                || existing.connection.name != expected_name
             {
                 return Err(StoreError::BindingChanged);
             }
@@ -189,7 +182,6 @@ impl Store {
             .bind(&external_id)
             .bind(&input.utility_id)
             .bind(utility_name)
-            .bind(input.name.as_deref().unwrap_or(utility_name))
             .bind(&input.currency)
             .bind(serde_json::to_string(&ConnectionProgress::default())?)
             .execute(&mut *tx)
@@ -246,78 +238,6 @@ impl Store {
             .into_iter()
             .map(|row| row.decode().map(|record| record.connection))
             .collect()
-    }
-
-    pub async fn rename_connection(
-        &self,
-        deployment: &str,
-        id: &str,
-        input: ConnectionRename,
-    ) -> Result<Connection, StoreError> {
-        let name = input.name.trim();
-        // Default names come from the provider and may be longer than custom labels.
-        let expected_name = input.expected_name.as_str();
-        if [(name, 100), (expected_name, 300)]
-            .into_iter()
-            .any(|(name, limit)| {
-                name.trim().is_empty() || name.len() > limit || name.chars().any(char::is_control)
-            })
-        {
-            return Err(StoreError::InvalidQuery);
-        }
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let current = sqlx::query_as::<_, ConnectionRow>(queries::GET)
-            .bind(deployment)
-            .bind(id)
-            .fetch_optional(&mut *tx)
-            .await?
-            .ok_or(StoreError::NotFound)?
-            .decode()?;
-        if current.connection.name == name {
-            tx.commit().await?;
-            return Ok(current.connection);
-        }
-        if current.connection.name != expected_name {
-            return Err(StoreError::BindingChanged);
-        }
-        // Creating workers hold this revision until their provider request completes.
-        if current.connection.progress.state == ConnectionState::Creating {
-            return Err(StoreError::Busy);
-        }
-        sqlx::query(queries::RENAME)
-            .bind(name)
-            .bind(deployment)
-            .bind(id)
-            .bind(current.revision)
-            .execute(&mut *tx)
-            .await?;
-        let accounts: Vec<(String, String)> = sqlx::query_as(queries::LINKED_NAMES)
-            .bind(deployment)
-            .bind(id)
-            .fetch_all(&mut *tx)
-            .await?;
-        for (account_id, account_name) in accounts {
-            if let Some(suffix) = account_name
-                .strip_prefix(expected_name)
-                .filter(|suffix| suffix.is_empty() || suffix.starts_with(" · account ending "))
-            {
-                sqlx::query(queries::RENAME_ACCOUNT)
-                    .bind(format!("{name}{suffix}"))
-                    .bind(deployment)
-                    .bind(id)
-                    .bind(account_id)
-                    .execute(&mut *tx)
-                    .await?;
-            }
-        }
-        let renamed = sqlx::query_as::<_, ConnectionRow>(queries::GET)
-            .bind(deployment)
-            .bind(id)
-            .fetch_one(&mut *tx)
-            .await?
-            .decode()?;
-        tx.commit().await?;
-        Ok(renamed.connection)
     }
 
     pub(crate) async fn save_connection_progress(
@@ -428,16 +348,13 @@ pub(crate) mod queries {
     pub const BINDING: &str =
         "SELECT binding FROM accounts WHERE deployment=? AND id=? AND binding IS NOT NULL";
     pub const SAVE_BINDING: &str = "UPDATE accounts SET deployment=?, binding=?, connection_id=COALESCE(connection_id,?) WHERE id=?";
-    pub const GET: &str = "SELECT id,request_id,external_id,utility_id,utility_name,name,currency,progress,revision,provider_settings_accepted_at,created_at,updated_at,checked_at FROM utility_connections WHERE deployment=? AND id=?";
-    pub const BY_REQUEST: &str = "SELECT id,request_id,external_id,utility_id,utility_name,name,currency,progress,revision,provider_settings_accepted_at,created_at,updated_at,checked_at FROM utility_connections WHERE deployment=? AND request_id=?";
-    pub const LIST: &str = "SELECT id,request_id,external_id,utility_id,utility_name,name,currency,progress,revision,provider_settings_accepted_at,created_at,updated_at,checked_at FROM utility_connections WHERE deployment=? ORDER BY created_at DESC,id DESC LIMIT 100";
-    pub const QUEUED: &str = "SELECT id,request_id,external_id,utility_id,utility_name,name,currency,progress,revision,provider_settings_accepted_at,created_at,updated_at,checked_at FROM utility_connections WHERE deployment=? AND json_extract(progress,'$.state')='queued' ORDER BY created_at,id LIMIT 1";
+    pub const GET: &str = "SELECT id,request_id,external_id,utility_id,utility_name,currency,progress,revision,provider_settings_accepted_at,created_at,updated_at,checked_at FROM utility_connections WHERE deployment=? AND id=?";
+    pub const BY_REQUEST: &str = "SELECT id,request_id,external_id,utility_id,utility_name,currency,progress,revision,provider_settings_accepted_at,created_at,updated_at,checked_at FROM utility_connections WHERE deployment=? AND request_id=?";
+    pub const LIST: &str = "SELECT id,request_id,external_id,utility_id,utility_name,currency,progress,revision,provider_settings_accepted_at,created_at,updated_at,checked_at FROM utility_connections WHERE deployment=? ORDER BY created_at DESC,id DESC LIMIT 100";
+    pub const QUEUED: &str = "SELECT id,request_id,external_id,utility_id,utility_name,currency,progress,revision,provider_settings_accepted_at,created_at,updated_at,checked_at FROM utility_connections WHERE deployment=? AND json_extract(progress,'$.state')='queued' ORDER BY created_at,id LIMIT 1";
     pub const COUNT: &str = "SELECT COUNT(*) FROM utility_connections WHERE deployment=?";
-    pub const CREATE: &str = "INSERT INTO utility_connections(id,deployment,request_id,external_id,utility_id,utility_name,name,currency,progress) VALUES(?,?,?,?,?,?,?,?,?)";
+    pub const CREATE: &str = "INSERT INTO utility_connections(id,deployment,request_id,external_id,utility_id,utility_name,currency,progress) VALUES(?,?,?,?,?,?,?,?)";
     pub const SAVE_PROGRESS: &str = "UPDATE utility_connections SET progress=?, revision=revision+1, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now'), checked_at=CASE WHEN ? THEN strftime('%Y-%m-%dT%H:%M:%fZ','now') ELSE checked_at END WHERE deployment=? AND id=? AND revision=?";
-    pub const RENAME: &str = "UPDATE utility_connections SET name=?,revision=revision+1,updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE deployment=? AND id=? AND revision=?";
-    pub const LINKED_NAMES: &str = "SELECT id,json_extract(binding,'$.name') FROM accounts WHERE deployment=? AND connection_id=? AND binding IS NOT NULL";
-    pub const RENAME_ACCOUNT: &str = "UPDATE accounts SET binding=json_set(binding,'$.name',?) WHERE deployment=? AND connection_id=? AND id=?";
     pub const RECOVER: &str = "UPDATE utility_connections SET progress=json_set(progress,'$.state','unconfirmed','$.issue','process_interrupted'),revision=revision+1,updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE deployment=? AND json_extract(progress,'$.state')='creating'";
 }
 
@@ -456,7 +373,6 @@ mod tests {
             provider: ConnectionProvider::Bayou,
             request_id: Uuid::now_v7().to_string(),
             utility_id: "speculoos_power".into(),
-            name: None,
             currency: "USD".into(),
             accept_provider_settings: true,
         }
@@ -637,253 +553,6 @@ mod tests {
         store.pool().close().await;
     }
 
-    #[tokio::test]
-    async fn rename_preserves_identity_suffixes_and_rejects_stale_workers() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("labels.sqlite3");
-        let store = Store::open(&path).await.unwrap();
-        let config: Config = toml::from_str(include_str!("../../config/example.toml")).unwrap();
-        store.register(&config).await.unwrap();
-        let old_name = "Example Power";
-        let new_name = "Example Electric Company";
-        let (record, _) = store
-            .create_connection(&config.deployment, &input(), old_name)
-            .await
-            .unwrap();
-        let (other, _) = store
-            .create_connection(&config.deployment, &input(), old_name)
-            .await
-            .unwrap();
-        let mut bindings = Vec::new();
-        for (index, name) in [
-            old_name,
-            "Example Power · account ending 1234",
-            "Custom label",
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let mut binding = config.accounts[1].clone();
-            binding.id = format!("hosted-{index}");
-            binding.name = name.to_owned();
-            binding.provider_account = format!("hosted-{index}");
-            binding.services[0].id = format!("hosted-meter-{index}");
-            bindings.push(binding);
-        }
-        store
-            .bind_connection(&config, &record, &bindings, &[])
-            .await
-            .unwrap();
-        let mut other_binding = bindings[0].clone();
-        other_binding.id = "other-hosted".into();
-        other_binding.provider_account = "other-hosted".into();
-        other_binding.services[0].id = "other-meter".into();
-        store
-            .bind_connection(&config, &other, std::slice::from_ref(&other_binding), &[])
-            .await
-            .unwrap();
-        let other = store
-            .connection(&config.deployment, &other.connection.id)
-            .await
-            .unwrap();
-        let balance = Balance {
-            id: "hosted-balance".into(),
-            account_id: bindings[0].id.clone(),
-            amount: Money {
-                minor_units: 12500,
-                currency: "USD".into(),
-            },
-            as_of: chrono::Utc::now(),
-            observed_at: chrono::Utc::now(),
-        };
-        store
-            .ingest(
-                &bindings[0],
-                &crate::utility::SyncPage {
-                    observations: vec![Observation::Balance(balance.clone())],
-                    coverage: vec![],
-                    continuation: None,
-                },
-            )
-            .await
-            .unwrap();
-        let stale = store
-            .connection(&config.deployment, &record.connection.id)
-            .await
-            .unwrap();
-        let identity = || {
-            sqlx::query_as::<_, (String, String, Option<String>)>(
-                "SELECT id,binding_hash,connection_id FROM accounts ORDER BY id",
-            )
-            .fetch_all(store.pool())
-        };
-        let before = identity().await.unwrap();
-        let rename = || ConnectionRename {
-            name: format!("  {new_name}  "),
-            expected_name: old_name.to_owned(),
-        };
-        let (first, retry) = tokio::join!(
-            store.rename_connection(&config.deployment, &record.connection.id, rename()),
-            store.rename_connection(&config.deployment, &record.connection.id, rename()),
-        );
-        let mut expected = stale.connection.clone();
-        expected.name = new_name.to_owned();
-        expected.updated_at = first.as_ref().unwrap().updated_at;
-        assert_eq!(first.unwrap(), expected);
-        assert_eq!(retry.unwrap(), expected);
-        let current = store
-            .connection(&config.deployment, &record.connection.id)
-            .await
-            .unwrap();
-        assert_eq!(current.revision, stale.revision + 1);
-        assert_eq!(current.external_id, stale.external_id);
-        assert_eq!(identity().await.unwrap(), before);
-        let page: Page<Balance> = store
-            .list(
-                "balance",
-                &ListQuery::default(),
-                std::slice::from_ref(&bindings[0].id),
-            )
-            .await
-            .unwrap();
-        assert_eq!(page.items, vec![balance]);
-        for (binding, expected_name) in bindings.iter().zip([
-            new_name,
-            "Example Electric Company · account ending 1234",
-            "Custom label",
-        ]) {
-            let mut expected = binding.clone();
-            expected.name = expected_name.to_owned();
-            let actual = store
-                .binding(&config.deployment, &binding.id)
-                .await
-                .unwrap();
-            assert_eq!(
-                serde_json::to_string(&actual).unwrap(),
-                serde_json::to_string(&expected).unwrap()
-            );
-        }
-        assert_eq!(
-            store
-                .connection(&config.deployment, &other.connection.id)
-                .await
-                .unwrap()
-                .connection,
-            other.connection
-        );
-        assert_eq!(
-            store
-                .binding(&config.deployment, &other_binding.id)
-                .await
-                .unwrap()
-                .name,
-            old_name
-        );
-        assert!(
-            !store
-                .save_connection_progress(
-                    &config.deployment,
-                    &stale,
-                    &stale.connection.progress,
-                    true
-                )
-                .await
-                .unwrap()
-        );
-        assert!(matches!(
-            store.bind_connection(&config, &stale, &bindings, &[]).await,
-            Err(StoreError::Busy)
-        ));
-        assert!(matches!(
-            store
-                .rename_connection(
-                    &config.deployment,
-                    &record.connection.id,
-                    ConnectionRename {
-                        name: "Another label".into(),
-                        expected_name: old_name.into()
-                    },
-                )
-                .await,
-            Err(StoreError::BindingChanged)
-        ));
-        assert!(matches!(
-            store
-                .rename_connection("other", &record.connection.id, rename())
-                .await,
-            Err(StoreError::NotFound)
-        ));
-        for name in [
-            "".to_owned(),
-            " \t ".to_owned(),
-            "bad\nlabel".to_owned(),
-            "x".repeat(101),
-        ] {
-            assert!(matches!(
-                store
-                    .rename_connection(
-                        &config.deployment,
-                        &record.connection.id,
-                        ConnectionRename {
-                            name,
-                            expected_name: new_name.into()
-                        },
-                    )
-                    .await,
-                Err(StoreError::InvalidQuery)
-            ));
-        }
-        let default_name = format!(" {} ", "P".repeat(298));
-        let (default_record, _) = store
-            .create_connection(&config.deployment, &input(), &default_name)
-            .await
-            .unwrap();
-        let mut progress = default_record.connection.progress.clone();
-        progress.state = ConnectionState::Creating;
-        store
-            .save_connection_progress(&config.deployment, &default_record, &progress, false)
-            .await
-            .unwrap();
-        let change_default = || ConnectionRename {
-            name: new_name.to_owned(),
-            expected_name: default_name.clone(),
-        };
-        assert!(matches!(
-            store
-                .rename_connection(
-                    &config.deployment,
-                    &default_record.connection.id,
-                    change_default()
-                )
-                .await,
-            Err(StoreError::Busy)
-        ));
-        store.recover_connections(&config.deployment).await.unwrap();
-        assert_eq!(
-            store
-                .rename_connection(
-                    &config.deployment,
-                    &default_record.connection.id,
-                    change_default()
-                )
-                .await
-                .unwrap()
-                .name,
-            new_name
-        );
-        store.pool().close().await;
-        let store = Store::open(&path).await.unwrap();
-        assert_eq!(
-            store
-                .connection(&config.deployment, &record.connection.id)
-                .await
-                .unwrap()
-                .connection,
-            expected
-        );
-        store.pool().close().await;
-    }
-
     async fn explain(
         store: &Store,
         name: &str,
@@ -972,12 +641,6 @@ mod tests {
                 "scoped count",
                 sqlx::query(queries::COUNT).bind("fixture-0"),
             ),
-            (
-                "linked account labels",
-                sqlx::query(queries::LINKED_NAMES)
-                    .bind("fixture-0")
-                    .bind(&record.connection.id),
-            ),
         ] {
             let plan = explain(&store, name, query, false).await;
             assert!(
@@ -1000,7 +663,6 @@ mod tests {
                 .bind("new-external")
                 .bind("speculoos_power")
                 .bind("Speculoos Power")
-                .bind("Example")
                 .bind("USD")
                 .bind(&progress),
             true,
@@ -1015,28 +677,6 @@ mod tests {
                 .bind("fixture-0")
                 .bind(&record.connection.id)
                 .bind(record.revision),
-            true,
-        )
-        .await;
-        explain(
-            &store,
-            "rename connection",
-            sqlx::query(queries::RENAME)
-                .bind("Example Electric Company")
-                .bind("fixture-0")
-                .bind(&record.connection.id)
-                .bind(record.revision),
-            true,
-        )
-        .await;
-        explain(
-            &store,
-            "rename account label",
-            sqlx::query(queries::RENAME_ACCOUNT)
-                .bind("Example Electric Company")
-                .bind("fixture-0")
-                .bind(&record.connection.id)
-                .bind("fixture-0-demo-wm"),
             true,
         )
         .await;

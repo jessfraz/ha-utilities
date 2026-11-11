@@ -1,7 +1,7 @@
 # Configuration
 
 Use the app's native Configuration options. Set `deployment`, then add each
-account with its explicit local ID, name, deployment, provider, customer ID,
+account with its explicit local ID, deployment, provider, customer ID,
 provider account, currency, and service bindings. Providers are only
 `waste_management` and `bayou`. Each account's deployment must match the global
 deployment. No first-account or first-meter selection is performed.

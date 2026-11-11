@@ -15,10 +15,11 @@
     "schemas": {
       "Account": {
         "properties": {
-          "id": {
+          "connection_id": {
+            "nullable": true,
             "type": "string"
           },
-          "name": {
+          "id": {
             "type": "string"
           },
           "provider": {
@@ -36,7 +37,6 @@
         },
         "required": [
           "id",
-          "name",
           "provider",
           "services",
           "source"
@@ -532,9 +532,6 @@
             },
             "type": "array"
           },
-          "name": {
-            "type": "string"
-          },
           "provider": {
             "$ref": "#/components/schemas/ConnectionProvider"
           },
@@ -568,7 +565,6 @@
           "id",
           "intervals_ready",
           "linked_account_ids",
-          "name",
           "provider",
           "provider_settings_accepted_at",
           "request_id",
@@ -661,22 +657,6 @@
         ],
         "type": "string"
       },
-      "ConnectionRename": {
-        "additionalProperties": false,
-        "properties": {
-          "expected_name": {
-            "type": "string"
-          },
-          "name": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "expected_name",
-          "name"
-        ],
-        "type": "object"
-      },
       "ConnectionSelection": {
         "additionalProperties": false,
         "properties": {
@@ -767,10 +747,6 @@
             "type": "boolean"
           },
           "currency": {
-            "type": "string"
-          },
-          "name": {
-            "nullable": true,
             "type": "string"
           },
           "provider": {
@@ -870,9 +846,6 @@
           "id": {
             "type": "string"
           },
-          "name": {
-            "type": "string"
-          },
           "provider": {
             "$ref": "#/components/schemas/ImportProvider"
           },
@@ -894,7 +867,6 @@
         },
         "required": [
           "id",
-          "name",
           "provider",
           "services",
           "start_on"
@@ -1689,16 +1661,13 @@
         "type": "string"
       },
       "Service": {
+        "additionalProperties": false,
         "properties": {
           "id": {
             "type": "string"
           },
           "kind": {
             "$ref": "#/components/schemas/ServiceKind"
-          },
-          "name": {
-            "default": "",
-            "type": "string"
           }
         },
         "required": [
@@ -1930,8 +1899,7 @@
           "gas",
           "water",
           "propane",
-          "internet",
-          "other"
+          "internet"
         ],
         "type": "string"
       },
@@ -1980,14 +1948,10 @@
             "format": "date-time",
             "nullable": true,
             "type": "string"
-          },
-          "name": {
-            "type": "string"
           }
         },
         "required": [
-          "account_id",
-          "name"
+          "account_id"
         ],
         "type": "object"
       },
@@ -2000,14 +1964,10 @@
             "format": "date-time",
             "nullable": true,
             "type": "string"
-          },
-          "name": {
-            "type": "string"
           }
         },
         "required": [
-          "account_id",
-          "name"
+          "account_id"
         ],
         "type": "object"
       },
@@ -2272,7 +2232,7 @@
   "info": {
     "description": "Local utility observations and explicit coverage. Bearer owner credential or authenticated HA bridge. Sync reads providers only; no payments or service changes.",
     "title": "Utilities API",
-    "version": "0.1.11"
+    "version": "0.1.12"
   },
   "openapi": "3.0.3",
   "paths": {
@@ -3091,61 +3051,6 @@
             "application/json": {
               "schema": {
                 "$ref": "#/components/schemas/ConnectionAction"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Connection"
-                }
-              }
-            },
-            "description": "successful operation",
-            "headers": {
-              "cache-control": {
-                "required": true,
-                "schema": {
-                  "type": "string"
-                },
-                "style": "simple"
-              }
-            }
-          },
-          "4XX": {
-            "$ref": "#/components/responses/Error"
-          },
-          "5XX": {
-            "$ref": "#/components/responses/Error"
-          }
-        },
-        "tags": [
-          "connections"
-        ]
-      }
-    },
-    "/v1/connections/{id}/rename": {
-      "post": {
-        "operationId": "connection_rename",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "id",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/ConnectionRename"
               }
             }
           },

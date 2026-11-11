@@ -1,7 +1,7 @@
 """Entry-owned polling with explicit provider coverage."""
 
+import asyncio
 import logging
-import re
 from datetime import date, timedelta
 from hashlib import sha256
 from urllib.parse import urlencode
@@ -20,6 +20,7 @@ from .client import ResponseTooLarge, UtilitiesClient
 from .const import DOMAIN, MAX_CALENDAR_ROWS
 from .energy import async_update as async_update_energy
 from .models import (
+    AccountIdentity,
     Collection,
     Coverage,
     Snapshot,
@@ -62,46 +63,100 @@ class UtilitiesCoordinator(DataUpdateCoordinator[Snapshot]):
         self.active = True
         self.backend_version: str | None = None
         self.version_repairs: VersionRepairs | None = None
+        self._automatic_accounts: tuple[StaleAutomaticAccount, ...] = ()
+        self._labels_task: asyncio.Task[None] | None = None
 
     @callback
     def stop(self) -> None:
         """Block late network completions from recreating entry-owned Repairs."""
         self.active = False
+        if self._labels_task is not None:
+            self._labels_task.cancel()
         for issue in REPAIRS:
             ir.async_delete_issue(self.hass, DOMAIN, f"{self.entry.entry_id}_{issue}")
-        self._async_update_automatic_repairs(())
+        self._async_update_automatic_repairs((), {})
 
     @callback
     def _async_update_automatic_repairs(
-        self, accounts: tuple[StaleAutomaticAccount, ...]
+        self, accounts: tuple[StaleAutomaticAccount, ...], labels: dict[str, str]
     ) -> None:
         """Keep dismissals for ongoing issues and remove resolved accounts."""
         prefix = f"{self.entry.entry_id}_stale_automatic_account_"
-        with ir.async_refresh_issues(
-            self.hass,
-            DOMAIN,
-            issue_id_pattern=re.escape(prefix),
-            config_entry_id=self.entry.entry_id,
-        ):
-            for account in accounts:
-                identity = sha256(account.account_id.encode()).hexdigest()
-                placeholders = {"account": account.name}
-                key = "stale_automatic_account_without_data"
-                if account.last_data_at is not None:
-                    key = "stale_automatic_account"
-                    placeholders["last_data_date"] = (
-                        dt_util.as_local(account.last_data_at).date().isoformat()
-                    )
-                ir.async_create_issue(
-                    self.hass,
-                    DOMAIN,
-                    prefix + identity,
-                    config_entry_id=self.entry.entry_id,
-                    is_fixable=False,
-                    severity=ir.IssueSeverity.WARNING,
-                    translation_key=key,
-                    translation_placeholders=placeholders,
+        current = {
+            prefix + sha256(account.account_id.encode()).hexdigest()
+            for account in accounts
+        }
+        for (domain, identity), issue in tuple(ir.async_get(self.hass).issues.items()):
+            if (
+                domain == DOMAIN
+                and identity.startswith(prefix)
+                and issue.config_entry_id == self.entry.entry_id
+                and identity not in current
+            ):
+                ir.async_delete_issue(self.hass, DOMAIN, identity)
+        for account in accounts:
+            if account.account_id not in labels:
+                # A failed/slow optional identity read does not resolve an
+                # ongoing issue or discard its last known company label.
+                continue
+            identity = sha256(account.account_id.encode()).hexdigest()
+            placeholders = {"account": labels[account.account_id]}
+            key = "stale_automatic_account_without_data"
+            if account.last_data_at is not None:
+                key = "stale_automatic_account"
+                placeholders["last_data_date"] = (
+                    dt_util.as_local(account.last_data_at).date().isoformat()
                 )
+            ir.async_create_issue(
+                self.hass,
+                DOMAIN,
+                prefix + identity,
+                config_entry_id=self.entry.entry_id,
+                is_fixable=False,
+                severity=ir.IssueSeverity.WARNING,
+                translation_key=key,
+                translation_placeholders=placeholders,
+            )
+
+    @callback
+    def _async_schedule_automatic_repairs(
+        self, accounts: tuple[StaleAutomaticAccount, ...]
+    ) -> None:
+        """Repair labels never gate Summary, calendar or Energy polling."""
+        self._automatic_accounts = accounts
+        self._async_update_automatic_repairs(accounts, {})
+        if not accounts:
+            if self._labels_task is not None:
+                self._labels_task.cancel()
+            return
+        if self._labels_task is None or self._labels_task.done():
+            self._labels_task = self.entry.async_create_background_task(
+                self.hass,
+                self._async_refresh_labels(accounts),
+                "Utilities Repair labels",
+                eager_start=False,
+            )
+
+    async def _async_refresh_labels(
+        self, accounts: tuple[StaleAutomaticAccount, ...]
+    ) -> None:
+        try:
+            labels = await self.account_labels(accounts)
+        except (
+            ClientError,
+            TimeoutError,
+            ResponseTooLarge,
+            ValueError,
+            UpdateFailed,
+            ConfigEntryAuthFailed,
+        ):
+            _LOGGER.debug("Cannot refresh Utilities Repair labels")
+            return
+        if self.active and self.entry.state not in {
+            ConfigEntryState.UNLOAD_IN_PROGRESS,
+            ConfigEntryState.NOT_LOADED,
+        }:
+            self._async_update_automatic_repairs(self._automatic_accounts, labels)
 
     async def read(self, path: str) -> object:
         response = await self.client.request("GET", path)
@@ -110,6 +165,56 @@ class UtilitiesCoordinator(DataUpdateCoordinator[Snapshot]):
         if response.status != 200:
             raise UpdateFailed("Utilities is unavailable")
         return response.json()
+
+    async def identity_rows(self, route: str) -> list[object]:
+        """Read one bounded listing, never a separate request for each account."""
+        rows: list[object] = []
+        cursor: str | None = None
+        seen: set[str] = set()
+        while len(rows) < 1000:
+            limit = min(100, 1000 - len(rows))
+            query = {"limit": str(limit)}
+            if cursor is not None:
+                query["page"] = cursor
+            items, cursor, _ = page(
+                await self.read(route + "?" + urlencode(query)), maximum=limit
+            )
+            rows.extend(items)
+            if cursor is None:
+                return rows
+            if cursor in seen or not items:
+                raise ValueError("Non-advancing identity page")
+            seen.add(cursor)
+        raise ValueError("Incomplete account identity listing")
+
+    async def account_labels(
+        self, stale: tuple[StaleAutomaticAccount, ...]
+    ) -> dict[str, str]:
+        """Company comes from the canonical connection or the closed provider."""
+        if not stale:
+            return {}
+        accounts: dict[str, AccountIdentity] = {}
+        for value in await self.identity_rows("/v1/accounts"):
+            account = AccountIdentity.parse(value)
+            if account.id in accounts:
+                raise ValueError("Repeated account identity")
+            accounts[account.id] = account
+        if any(account.account_id not in accounts for account in stale):
+            raise ValueError("Missing automatic account identity")
+        connections: dict[str, str] = {}
+        if any(
+            accounts[account.account_id].connection_id is not None for account in stale
+        ):
+            for value in await self.identity_rows("/v1/connections"):
+                row = record(value)
+                identity = text(row.get("id"))
+                if identity in connections:
+                    raise ValueError("Repeated connection identity")
+                connections[identity] = text(row.get("utility_name"), max_length=500)
+        return {
+            account.account_id: accounts[account.account_id].label(connections)
+            for account in stale
+        }
 
     async def collections(
         self, start: str, end: str
@@ -225,5 +330,5 @@ class UtilitiesCoordinator(DataUpdateCoordinator[Snapshot]):
                     )
                 else:
                     ir.async_delete_issue(self.hass, DOMAIN, issue_id)
-            self._async_update_automatic_repairs(summary.stale_automatic_accounts)
+            self._async_schedule_automatic_repairs(summary.stale_automatic_accounts)
         return Snapshot(summary, collections, complete)

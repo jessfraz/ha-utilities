@@ -49,21 +49,14 @@ async def test_sync_is_disabled_with_a_reason_for_each_unconfigured_provider(
     submit = page.get_by_role("button", name="Sync account", exact=True)
     await page.get_by_label("Account to sync", exact=True).select_option("demo-wm")
     await expect(submit).to_be_disabled()
-    await expect(
-        page.get_by_text(
-            "Waste Management · Waste service · "
-            "Provider credentials are not configured.",
-            exact=True,
-        )
-    ).to_be_visible()
+    await expect(page.locator("#sync-availability")).to_have_text(
+        "Provider credentials are not configured."
+    )
     await page.get_by_label("Account to sync", exact=True).select_option("demo-energy")
     await expect(submit).to_be_disabled()
-    await expect(
-        page.get_by_text(
-            "Bayou · Energy service · Provider credentials are not configured.",
-            exact=True,
-        )
-    ).to_be_visible()
+    await expect(page.locator("#sync-availability")).to_have_text(
+        "Provider credentials are not configured."
+    )
 
 
 async def test_expired_native_session_preserves_saved_bills_and_returns_to_the_view(
@@ -187,9 +180,7 @@ async def test_overview_and_bill_table_explain_missing_balances_and_provider_sta
     await page.get_by_label("Account", exact=True).select_option("demo-energy")
     await page.get_by_role("button", name="Apply filters", exact=True).click()
     await expect(page.locator(".data-table tbody tr")).to_have_count(25)
-    await expect(
-        page.get_by_text("Synced from Bayou", exact=True).first
-    ).to_be_visible()
+    await expect(page.get_by_text("Provider API", exact=True).first).to_be_visible()
     await page.locator(".data-table tbody tr").first.get_by_role("button").click()
     dialog = page.get_by_role("dialog", name="Bill details")
     await expect(dialog.get_by_text("unlocked", exact=True)).to_be_visible()

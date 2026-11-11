@@ -166,7 +166,6 @@ impl Drop for Fixture {
 fn binding() -> AccountBinding {
     AccountBinding {
         id: "demo-energy".to_owned(),
-        name: "Example energy".to_owned(),
         deployment: "example-installation".to_owned(),
         provider: ProviderId::Bayou,
         currency: "USD".to_owned(),
@@ -174,7 +173,6 @@ fn binding() -> AccountBinding {
         provider_account: ACCOUNT_ID.to_owned(),
         services: vec![ServiceBinding {
             id: "demo-electric".to_owned(),
-            name: Some("Example electric".to_owned()),
             provider_service: METER_ID.to_owned(),
             kind: ServiceKind::Electricity,
         }],

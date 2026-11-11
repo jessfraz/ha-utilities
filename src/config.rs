@@ -34,7 +34,6 @@ pub struct Config {
 #[serde(deny_unknown_fields)]
 pub struct AccountBinding {
     pub id: String,
-    pub name: String,
     pub deployment: String,
     pub provider: ProviderId,
     pub customer_id: String,
@@ -47,16 +46,8 @@ pub struct AccountBinding {
 #[serde(deny_unknown_fields)]
 pub struct ServiceBinding {
     pub id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
     pub provider_service: String,
     pub kind: ServiceKind,
-}
-
-impl ServiceBinding {
-    pub fn name(&self) -> &str {
-        self.name.as_deref().unwrap_or(self.kind.name())
-    }
 }
 
 #[derive(Clone, Deserialize)]
@@ -222,8 +213,7 @@ impl Config {
                 "account deployment does not match"
             );
             anyhow::ensure!(
-                !account.name.trim().is_empty()
-                    && !account.customer_id.trim().is_empty()
+                !account.customer_id.trim().is_empty()
                     && !account.provider_account.trim().is_empty(),
                 "account binding must be explicit"
             );
@@ -240,10 +230,8 @@ impl Config {
             for service in &account.services {
                 anyhow::ensure!(
                     match account.provider {
-                        ProviderId::WasteManagement => matches!(
-                            service.kind,
-                            ServiceKind::Waste | ServiceKind::Recycling | ServiceKind::Other
-                        ),
+                        ProviderId::WasteManagement =>
+                            matches!(service.kind, ServiceKind::Waste | ServiceKind::Recycling),
                         ProviderId::Bayou =>
                             matches!(service.kind, ServiceKind::Electricity | ServiceKind::Gas),
                         ProviderId::Lvmwd => service.kind == ServiceKind::Water,
@@ -259,10 +247,6 @@ impl Config {
                 );
                 anyhow::ensure!(
                     !service.provider_service.trim().is_empty()
-                        && service
-                            .name
-                            .as_ref()
-                            .is_none_or(|name| !name.trim().is_empty())
                         && provider_services.insert(&service.provider_service),
                     "service binding must be explicit and unique"
                 );

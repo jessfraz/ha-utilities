@@ -231,7 +231,7 @@ async def start_connection(
     await page.get_by_role("button", name="Connect utility", exact=True).click()
     dialog = page.get_by_role("dialog", name="Connect utility", exact=True)
     await dialog.get_by_label("Utility", exact=True).select_option("speculoos_power")
-    await dialog.get_by_label("Display name (optional)").fill("Example electricity")
+    await expect(dialog.get_by_label("Display name (optional)")).to_have_count(0)
     if screenshot is not None:
         await owner.screenshot(path=str(screenshot), full_page=True)
     consent = dialog.get_by_role("checkbox")
@@ -521,7 +521,7 @@ async def test_hosted_link_meter_selection_and_saved_connection(
             await submit.click()
             await expect(dialog.get_by_role("status")).to_have_text("Connected")
             await expect(page.locator(".account-grid h3")).to_have_text(
-                "Example electricity"
+                "Speculoos Power"
             )
             await expect(page.locator(".sync-form select option")).to_have_count(2)
             await page.screenshot(
@@ -539,8 +539,13 @@ async def test_hosted_link_meter_selection_and_saved_connection(
             ).to_have_count(0)
             await page.reload()
             await expect(
-                page.get_by_role("button", name="Details", exact=True)
-            ).to_be_visible()
+                page.get_by_role("heading", name="Speculoos Power", exact=True)
+            ).to_have_count(1)
+            await page.get_by_role(
+                "button", name="Connection details", exact=True
+            ).click()
+            await expect(dialog.get_by_role("status")).to_have_text("Connected")
+            await dialog.get_by_role("button", name="Close utility connection").click()
             await expect(
                 page.get_by_label("Account to sync").locator("option")
             ).to_have_count(2)
@@ -581,7 +586,7 @@ async def test_manual_sync_progress_survives_reload_and_reconciles_overlapping_r
         "total_amount": 12050,
         "meters": [{"id": "fictional-electric-5678", "type": "electric"}],
     }
-    running = re.compile(r"(?:syncing|running).*example electricity", re.I)
+    running = re.compile(r"(?:syncing|running).*speculoos power", re.I)
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch()
         try:
@@ -596,10 +601,10 @@ async def test_manual_sync_progress_survives_reload_and_reconciles_overlapping_r
             await dialog.get_by_role("button", name="Go to sync settings").click()
 
             status = page.locator("#sync-status")
-            await expect(status).to_contain_text("Sync finished with coverage gaps")
+            await expect(status).to_contain_text("Coverage gaps")
             gate.clear()
             account = page.get_by_label("Account to sync")
-            await account.select_option(label="Example electricity")
+            await account.select_option(label="Speculoos Power")
             submit = page.get_by_role("button", name="Sync account")
             await submit.click()
             await expect(status).to_have_text(running)
@@ -609,21 +614,21 @@ async def test_manual_sync_progress_survives_reload_and_reconciles_overlapping_r
             to_field = page.get_by_label("To", exact=True)
             await expect(from_field).to_have_value(from_default.isoformat())
             await expect(to_field).to_have_value(today.isoformat())
-            await account.select_option(label="Example electricity")
+            await account.select_option(label="Speculoos Power")
             await expect(submit).to_be_disabled()
             gate.set()
-            await expect(status).to_contain_text("Sync finished with coverage gaps")
+            await expect(status).to_contain_text("Coverage gaps")
             await expect(submit).to_be_enabled()
             assert fixture.provider.bill_requests[0] == from_default.isoformat()
 
             gate.clear()
             await from_field.fill((today - timedelta(days=30)).isoformat())
             await submit.click()
-            await expect(status).to_contain_text("Syncing Bayou · Example electricity")
+            await expect(status).to_contain_text("Syncing Speculoos Power")
             await page.reload()
-            await expect(status).to_contain_text("Syncing Bayou · Example electricity")
+            await expect(status).to_contain_text("Syncing Speculoos Power")
             gate.set()
-            await expect(status).to_contain_text("Sync finished with coverage gaps")
+            await expect(status).to_contain_text("Coverage gaps")
             assert fixture.provider.bill_requests.count(billed_on.isoformat()) == 2
             async with ClientSession(
                 headers={"Authorization": f"Bearer {TOKEN}"}
@@ -663,29 +668,29 @@ async def test_first_and_manual_sync_share_saved_progress(
             await dialog.get_by_role("button", name="Go to sync settings").click()
 
             status = page.locator("#sync-status")
-            await expect(status).to_contain_text("Syncing Bayou · Example electricity")
+            await expect(status).to_contain_text("Syncing Speculoos Power")
             await page.reload()
-            await expect(status).to_contain_text("Syncing Bayou · Example electricity")
+            await expect(status).to_contain_text("Syncing Speculoos Power")
             await page.get_by_label("Account to sync").select_option(
-                label="Example electricity"
+                label="Speculoos Power"
             )
             submit = page.get_by_role("button", name="Sync account")
             await expect(submit).to_be_disabled()
             gate.set()
-            await expect(status).to_contain_text("Sync finished with coverage gaps")
+            await expect(status).to_contain_text("Coverage gaps")
             await expect(submit).to_be_enabled()
             assert fixture.provider.bills_queries == [{"account_number"}]
 
             gate.clear()
             await submit.click()
-            await expect(status).to_contain_text("Syncing Bayou · Example electricity")
+            await expect(status).to_contain_text("Syncing Speculoos Power")
             await page.reload()
-            await expect(status).to_contain_text("Syncing Bayou · Example electricity")
+            await expect(status).to_contain_text("Syncing Speculoos Power")
             gate.set()
-            await expect(status).to_contain_text("Sync finished with coverage gaps")
+            await expect(status).to_contain_text("Coverage gaps")
 
             await page.get_by_label("Account to sync").select_option(
-                label="Example electricity"
+                label="Speculoos Power"
             )
             await page.get_by_label("From", exact=True).fill("")
             await page.get_by_label("To", exact=True).fill("")
@@ -701,9 +706,9 @@ async def test_first_and_manual_sync_share_saved_progress(
             body = (await submitted.value).post_data_json
             assert isinstance(body, dict) and set(body) == {"account", "range"}
             assert body["range"] == "all"
-            await expect(status).to_contain_text("Syncing Bayou · Example electricity")
+            await expect(status).to_contain_text("Syncing Speculoos Power")
             gate.set()
-            await expect(status).to_contain_text("Sync finished with coverage gaps")
+            await expect(status).to_contain_text("Coverage gaps")
             assert fixture.provider.bills_queries[-1] == {"account_number"}
         finally:
             gate.set()
@@ -717,7 +722,7 @@ async def test_sync_progress_stays_visible_outside_settings(
     fixture.provider.bills_ready = True
     gate = asyncio.Event()
     fixture.provider.bills_gate = gate
-    progress = "Syncing Bayou · Example electricity…"
+    progress = "Syncing Speculoos Power…"
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch()
         try:
@@ -758,12 +763,10 @@ async def test_sync_progress_stays_visible_outside_settings(
             await expect(page.locator("#sync-status")).to_have_count(0)
 
             await page.get_by_role("button", name="Settings", exact=True).click()
-            await expect(page.locator("#sync-status")).to_contain_text(
-                "Sync finished with coverage gaps"
-            )
+            await expect(page.locator("#sync-status")).to_contain_text("Coverage gaps")
             gate.clear()
             await page.get_by_label("Account to sync").select_option(
-                label="Example electricity"
+                label="Speculoos Power"
             )
             await page.get_by_role("button", name="Sync account", exact=True).click()
             await expect(page.locator("#sync-status")).to_contain_text(progress)
@@ -813,7 +816,6 @@ async def test_native_api_requires_consent_and_reuses_request_id(
             "provider": "bayou",
             "request_id": "01900000-0000-7000-8000-000000000001",
             "utility_id": "speculoos_power",
-            "name": None,
             "currency": "USD",
             "accept_provider_settings": False,
         }
