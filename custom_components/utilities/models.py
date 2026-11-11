@@ -373,8 +373,20 @@ class Usage:
         raise ValueError("Invalid usage unit")
 
 
+class CollectionCoverage(StrEnum):
+    """Unsupported providers have no schedule; incomplete providers may have one."""
+
+    COMPLETE = "complete"
+    INCOMPLETE = "incomplete"
+    UNSUPPORTED = "unsupported"
+
+
 @dataclass(frozen=True, slots=True)
 class Snapshot:
     summary: Summary
     collections: tuple[Collection, ...]
-    collections_complete: bool
+    collections_coverage: CollectionCoverage
+
+    @property
+    def collections_complete(self) -> bool:
+        return self.collections_coverage is CollectionCoverage.COMPLETE

@@ -22,6 +22,7 @@ from .energy import async_update as async_update_energy
 from .models import (
     AccountIdentity,
     Collection,
+    CollectionCoverage,
     Coverage,
     Snapshot,
     StaleAutomaticAccount,
@@ -218,7 +219,7 @@ class UtilitiesCoordinator(DataUpdateCoordinator[Snapshot]):
 
     async def collections(
         self, start: str, end: str
-    ) -> tuple[tuple[Collection, ...], bool]:
+    ) -> tuple[tuple[Collection, ...], CollectionCoverage]:
         """Read a bounded calendar window; never silently drop another page."""
         rows: list[Collection] = []
         identities: set[str] = set()
@@ -241,11 +242,14 @@ class UtilitiesCoordinator(DataUpdateCoordinator[Snapshot]):
                 identities.add(collection.id)
                 rows.append(collection)
             if cursor is None:
-                eligible = [
-                    row
-                    for row in coverage_pages
-                    if row.capability == "collections" and row.state != "unsupported"
+                collection_coverage = [
+                    row for row in coverage_pages if row.capability == "collections"
                 ]
+                eligible = [
+                    row for row in collection_coverage if row.state != "unsupported"
+                ]
+                if collection_coverage and not eligible and not rows:
+                    return (), CollectionCoverage.UNSUPPORTED
                 now = dt_util.utcnow()
                 complete = bool(eligible) and all(
                     row.state == "complete"
@@ -256,11 +260,15 @@ class UtilitiesCoordinator(DataUpdateCoordinator[Snapshot]):
                     and -300 <= (now - row.checked_at).total_seconds() < 24 * 3600
                     for row in eligible
                 )
-                return tuple(rows), complete
+                return tuple(rows), (
+                    CollectionCoverage.COMPLETE
+                    if complete
+                    else CollectionCoverage.INCOMPLETE
+                )
             if cursor in cursors or not items:
                 raise ValueError("Non-advancing collection page")
             cursors.add(cursor)
-        return tuple(rows), False
+        return tuple(rows), CollectionCoverage.INCOMPLETE
 
     async def _async_update_data(self) -> Snapshot:
         try:
@@ -278,7 +286,7 @@ class UtilitiesCoordinator(DataUpdateCoordinator[Snapshot]):
                     self.version_repairs.async_report(version)
             summary = Summary.parse(await self.read("/v1/summary"))
             today = dt_util.now().date()
-            collections, complete = await self.collections(
+            collections, collection_coverage = await self.collections(
                 today.isoformat(), (today + timedelta(days=31)).isoformat()
             )
         except (ClientError, TimeoutError, ResponseTooLarge, ValueError) as err:
@@ -331,4 +339,4 @@ class UtilitiesCoordinator(DataUpdateCoordinator[Snapshot]):
                 else:
                     ir.async_delete_issue(self.hass, DOMAIN, issue_id)
             self._async_schedule_automatic_repairs(summary.stale_automatic_accounts)
-        return Snapshot(summary, collections, complete)
+        return Snapshot(summary, collections, collection_coverage)
