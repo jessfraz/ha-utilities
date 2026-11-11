@@ -18,7 +18,7 @@ path = "src/bin/ha-utilities.rs"
 [dependencies]
 anyhow = "1"
 dropshot = "0.18"
-base64 = "0.22"
+base64 = "0.23"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] }
 getrandom = "0.4"
