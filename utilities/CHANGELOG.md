@@ -5,6 +5,8 @@ imports separate from API accounts, group manual vendors, and show source and
 service tags. Put coverage in collapsed Diagnostics, name stale accounts,
 and keep bill totals, due dates, and quantities visible on mobile. Update the
 shared Home Assistant repair flow and its retry messages.
+Project reported water intervals and recover eligible legacy rows on replay.
+Keep estimates and overlapping windows out of usage.
 
 # 0.1.9
 
