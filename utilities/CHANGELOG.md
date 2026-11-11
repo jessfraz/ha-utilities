@@ -1,3 +1,10 @@
+# 0.1.8
+
+Allow the owner to remove an import-only account and its exclusive source
+documents without changing provider-linked accounts.
+Group imported billing accounts by utility provider in the dashboard.
+Allow the owner to rename a linked utility's display label.
+
 # 0.1.7
 
 Read available history when an account connects, then recheck seven days once

@@ -32,7 +32,7 @@ _ROUTES = (
     (
         re.compile("bills|balances|collections|usage"),
         {"GET"},
-        {"account", "service", "from", "to", "limit", "page"},
+        {"account", "import_provider", "service", "from", "to", "limit", "page"},
     ),
     (re.compile(rf"bills/{_RECORD_ID}|sync/{_ID}"), {"GET"}, set()),
     (re.compile("sync"), {"GET", "POST"}, set()),

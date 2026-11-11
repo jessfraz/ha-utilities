@@ -2,6 +2,7 @@
 
 import re
 from datetime import UTC, datetime, timedelta
+from hashlib import sha256
 from pathlib import Path
 from typing import Literal
 from urllib.parse import parse_qs, urlsplit
@@ -214,6 +215,134 @@ async def test_bills_page_filter_and_honest_read_only_detail(
         page.get_by_text(re.compile("not confirmation.*complete coverage"))
     ).to_be_visible()
     assert not [request for request in requests if request.method != "GET"]
+
+
+@pytest.mark.parametrize("web_backend", ["vendor_prefix"], indirect=True)
+async def test_imported_vendor_bills_include_construction_across_pages(
+    utility_page: Page, web_backend: WebBackend
+) -> None:
+    """Use real imported accounts with distinct names and a shared provider."""
+    today = datetime.now(UTC).date()
+    source = b"Fictional Spectrum billing evidence."
+    digest = sha256(source).hexdigest()
+    async with ClientSession(
+        headers={"Authorization": f"Bearer {web_backend.token}"}
+    ) as client:
+        async with client.put(
+            f"{web_backend.origin}/v1/documents/{digest}", data=source
+        ) as response:
+            response.raise_for_status()
+        for account, name, service, service_name, offsets in [
+            (
+                "fixture-internet",
+                "Home internet",
+                "internet",
+                "Internet service",
+                range(7, 32),
+            ),
+            (
+                "fixture-construction",
+                "Construction account",
+                "installation",
+                "Internet construction",
+                [32],
+            ),
+        ]:
+            records = [
+                {
+                    "kind": "bill",
+                    "reference": {
+                        "kind": "invoice_number",
+                        "value": f"{account}-{offset}",
+                    },
+                    "issued_on": (today - timedelta(days=offset)).isoformat(),
+                    "totals": {"new_charges_minor": 200000 if offset == 32 else 7500},
+                    "sources": [{"sha256": digest, "role": "invoice"}],
+                    "charges": [
+                        {
+                            "kind": "installation",
+                            "label": "Aerial construction",
+                            "amount_minor": 200000,
+                            "service_id": service,
+                        }
+                    ]
+                    if offset == 32
+                    else [],
+                }
+                for offset in offsets
+            ]
+            async with client.post(
+                f"{web_backend.origin}/v1/imports",
+                json={
+                    "account": {
+                        "id": account,
+                        "name": name,
+                        "provider": "spectrum",
+                        "start_on": (today - timedelta(days=60)).isoformat(),
+                        "services": [
+                            {"id": service, "name": service_name, "kind": "internet"}
+                        ],
+                    },
+                    "currency": "USD",
+                    "records": records,
+                },
+            ) as response:
+                response.raise_for_status()
+
+    page = utility_page
+    await open_app(page, web_backend)
+    vendor = page.get_by_role("region", name="Imported vendors")
+    await expect(vendor.get_by_text("Spectrum", exact=True)).to_have_count(1)
+    await vendor.get_by_role("button", name="View Spectrum bills").click()
+    filters = page.get_by_role("form", name="Filter bills")
+    await expect(filters.get_by_label("Account or vendor")).to_have_value(
+        "import_provider/spectrum"
+    )
+    await expect(
+        filters.get_by_role("option", name="Spectrum", exact=True)
+    ).to_have_count(1)
+    rows = page.get_by_role(
+        "table", name="Bills matching the selected filters"
+    ).get_by_role("row")
+    await expect(rows).to_have_count(26)
+    await page.get_by_role("button", name="Load more", exact=True).click()
+    await expect(rows).to_have_count(27)
+    await expect(rows.last).to_contain_text("Construction account")
+    await rows.last.get_by_role("button").click()
+    dialog = page.get_by_role("dialog", name="Bill details")
+    await expect(
+        dialog.get_by_role("heading", name="Spectrum", exact=True)
+    ).to_be_visible()
+    await expect(dialog.get_by_text("Construction account", exact=True)).to_be_visible()
+    await expect(dialog.get_by_text("Aerial construction", exact=True)).to_be_visible()
+    await expect(
+        dialog.get_by_role("link", name="Invoice", exact=True)
+    ).to_have_attribute("href", f"v1/documents/{digest}")
+    await page.keyboard.press("Escape")
+    await filters.get_by_label("Account or vendor").select_option(
+        "import_provider:spectrum"
+    )
+    await filters.get_by_role("button", name="Apply filters").click()
+    await expect(rows.last).to_contain_text("Energy service")
+    await expect(rows.get_by_text("Spectrum", exact=True)).to_have_count(0)
+
+    await page.get_by_role("button", name="Settings", exact=True).click()
+    settings = page.get_by_role("region", name="Utility providers")
+    await expect(
+        settings.get_by_role("heading", name="Spectrum", exact=True)
+    ).to_have_count(1)
+    card = settings.get_by_role("article").filter(
+        has=page.get_by_role("heading", name="Spectrum", exact=True)
+    )
+    await expect(card.get_by_text("Home internet", exact=True)).to_be_visible()
+    await expect(card.get_by_text("Construction account", exact=True)).to_be_visible()
+    await page.set_viewport_size({"width": 390, "height": 844})
+    await expect(card.get_by_text("Construction account", exact=True)).to_be_visible()
+    assert not await page.evaluate("document.documentElement.scrollWidth > innerWidth")
+    await page.get_by_label("Account to sync", exact=True).select_option("demo-wm")
+    await expect(
+        page.get_by_role("button", name="Sync account", exact=True)
+    ).to_be_disabled()
 
 
 async def test_collections_and_usage_filters_keep_units_and_report_exceptions(

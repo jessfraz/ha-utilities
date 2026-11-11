@@ -67,6 +67,12 @@ provider_service = "DEMO-METER"
 kind = "electricity"
 """,
         )
+    if getattr(request, "param", None) == "vendor_prefix":
+        original = await asyncio.to_thread(config.read_text)
+        await asyncio.to_thread(
+            config.write_text,
+            original.replace('id = "demo-energy"', 'id = "import_provider:spectrum"'),
+        )
     seed_process = await asyncio.create_subprocess_exec(
         str(seed),
         str(database),

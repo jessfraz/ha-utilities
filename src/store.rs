@@ -553,6 +553,7 @@ pub fn list_sql<'a>(
     if !["bill", "balance", "collection", "usage"].contains(&kind)
         || !(1..=200).contains(&query.limit.unwrap_or(50))
         || query.from.zip(query.to).is_some_and(|(from, to)| from > to)
+        || (query.account.is_some() && query.import_provider.is_some())
         || query
             .account
             .as_ref()

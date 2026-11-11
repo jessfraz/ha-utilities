@@ -625,6 +625,22 @@
         ],
         "type": "string"
       },
+      "ConnectionRename": {
+        "additionalProperties": false,
+        "properties": {
+          "expected_name": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "expected_name",
+          "name"
+        ],
+        "type": "object"
+      },
       "ConnectionSelection": {
         "additionalProperties": false,
         "properties": {
@@ -846,6 +862,47 @@
           "provider",
           "services",
           "start_on"
+        ],
+        "type": "object"
+      },
+      "ImportAccountPurge": {
+        "additionalProperties": false,
+        "properties": {
+          "expected_records": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "provider": {
+            "$ref": "#/components/schemas/ProviderId"
+          }
+        },
+        "required": [
+          "expected_records",
+          "provider"
+        ],
+        "type": "object"
+      },
+      "ImportAccountPurgeReceipt": {
+        "properties": {
+          "documents": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "records": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "removed": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "documents",
+          "records",
+          "removed"
         ],
         "type": "object"
       },
@@ -2133,7 +2190,7 @@
   "info": {
     "description": "Local utility observations and explicit coverage. Bearer owner credential or authenticated HA bridge. Sync reads providers only; no payments or service changes.",
     "title": "Utilities API",
-    "version": "0.1.7"
+    "version": "0.1.8"
   },
   "openapi": "3.0.3",
   "paths": {
@@ -2356,6 +2413,13 @@
           },
           {
             "in": "query",
+            "name": "import_provider",
+            "schema": {
+              "$ref": "#/components/schemas/ProviderId"
+            }
+          },
+          {
+            "in": "query",
             "name": "limit",
             "schema": {
               "format": "uint32",
@@ -2441,6 +2505,13 @@
               "format": "date",
               "nullable": true,
               "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "import_provider",
+            "schema": {
+              "$ref": "#/components/schemas/ProviderId"
             }
           },
           {
@@ -2620,6 +2691,13 @@
               "format": "date",
               "nullable": true,
               "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "import_provider",
+            "schema": {
+              "$ref": "#/components/schemas/ProviderId"
             }
           },
           {
@@ -2968,6 +3046,61 @@
         ]
       }
     },
+    "/v1/connections/{id}/rename": {
+      "post": {
+        "operationId": "connection_rename",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConnectionRename"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Connection"
+                }
+              }
+            },
+            "description": "successful operation",
+            "headers": {
+              "cache-control": {
+                "required": true,
+                "schema": {
+                  "type": "string"
+                },
+                "style": "simple"
+              }
+            }
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "tags": [
+          "connections"
+        ]
+      }
+    },
     "/v1/connections/{id}/resume": {
       "post": {
         "operationId": "connection_resume",
@@ -3129,6 +3262,62 @@
             "$ref": "#/components/responses/Error"
           }
         },
+        "tags": [
+          "imports"
+        ]
+      }
+    },
+    "/v1/imports/accounts/{id}/purge": {
+      "post": {
+        "operationId": "purge_import_account",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ImportAccountPurge"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ImportAccountPurgeReceipt"
+                }
+              }
+            },
+            "description": "successful operation",
+            "headers": {
+              "cache-control": {
+                "required": true,
+                "schema": {
+                  "type": "string"
+                },
+                "style": "simple"
+              }
+            }
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Remove an import-only account and its exclusively linked source documents.",
         "tags": [
           "imports"
         ]
@@ -3420,6 +3609,13 @@
               "format": "date",
               "nullable": true,
               "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "import_provider",
+            "schema": {
+              "$ref": "#/components/schemas/ProviderId"
             }
           },
           {

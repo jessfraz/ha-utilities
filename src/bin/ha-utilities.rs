@@ -197,6 +197,7 @@ impl From<Filters> for ListQuery {
     fn from(v: Filters) -> Self {
         Self {
             account: v.account,
+            import_provider: None,
             service: v.service,
             from: v.from,
             to: v.to,

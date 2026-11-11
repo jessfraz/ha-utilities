@@ -77,6 +77,10 @@ td.numeric { font-family: var(--mono); }
 .provider-grid .section-heading { padding: 0; border: 0; align-items: start; }
 .capabilities { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 14px; }
 .capabilities span { font-size: 11px; padding: 4px 7px; border-radius: 4px; background: var(--soft); color: var(--muted); }
+.imported-accounts { list-style: none; margin: 14px 0 0; padding: 0; font-size: 13px; }
+.imported-accounts li { border-top: 1px solid var(--line); padding: 10px 0; }
+.imported-accounts li:last-child { padding-bottom: 0; }
+.imported-accounts p { margin: 4px 0 0; }
 .account-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
 .account-grid article { border: 1px solid var(--line); border-radius: 6px; padding: 16px; }
 .account-grid p { margin: 0; font-size: 12px; color: var(--muted); }
@@ -100,6 +104,7 @@ dd { margin: 0; overflow-wrap: anywhere; }
 #bill-detail:has(.imported-bill) { width: min(780px, calc(100% - 32px)); }
 .imported-bill { display: grid; gap: 16px; }
 .billing-account { font-size: 20px; margin: 0; letter-spacing: -.025em; }
+.billing-account-context { margin: 0; color: var(--muted); font-size: 13px; }
 .billing-totals { grid-template-columns: repeat(auto-fit, minmax(min(100%, 180px), 1fr)); gap: 1px; margin: 0; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; background: var(--line); }
 .billing-totals > div { padding: 16px; background: var(--soft); }
 .billing-totals dd { margin-top: 5px; font-size: clamp(22px, 5vw, 32px); font-weight: 620; letter-spacing: -.035em; font-variant-numeric: tabular-nums; }

@@ -114,6 +114,14 @@ service IDs and printed record references stable across runs. A replay
 reports zero new records. A conflicting fact requires review or an explicit
 replacement against the current record revision.
 
+The native owner API can remove an entire import-only account with
+`POST /v1/imports/accounts/{id}/purge`. Confirm the exact `provider` and
+`expected_records` count in the request. The transaction removes the account,
+its records, and source files referenced only by that account.
+
+`POST /v1/connections/{id}/rename` changes a linked utility's display label.
+Supply `expected_name` and `name` to preserve concurrent label edits.
+
 The overview shows reported charges and quantities by bill issue month.
 Open a bill for its printed totals, itemized rates, linked payments, and
 source downloads. Import is available to the native owner and HA admins.

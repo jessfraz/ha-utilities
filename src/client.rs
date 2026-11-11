@@ -106,6 +106,14 @@ impl Client {
             if let Some(account) = &query.account {
                 pairs.append_pair("account", account);
             }
+            if let Some(provider) = query.import_provider {
+                let value = serde_json::to_value(provider)
+                    .map_err(|_| ClientError::new("invalid_request", None))?;
+                let value = value
+                    .as_str()
+                    .ok_or_else(|| ClientError::new("invalid_request", None))?;
+                pairs.append_pair("import_provider", value);
+            }
             if let Some(service) = &query.service {
                 pairs.append_pair("service", service);
             }
