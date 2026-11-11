@@ -5,12 +5,12 @@ use crate::{
         ImportReceipt, ImportRecord, ImportRequest, ImportedRecord, MAX_DOCUMENT_BYTES, Quality,
         combined_sources, digest, valid_digest,
     },
-    models::{Bill, Capability, Coverage, CoverageState, Observation, Payment, ProviderId},
+    models::{Bill, Capability, Coverage, CoverageState, Observation, Payment, ProviderId, Usage},
     store::{ObservationRow, Store, StoreError, connections, queries},
 };
 use chrono::Utc;
 use sqlx::{QueryBuilder, Row, Sqlite, Transaction};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub(crate) struct ImportState {
     pub id: String,
@@ -213,8 +213,8 @@ impl Store {
         for record in &mut records {
             *record.provenance_mut().0 = combined_sources(record.sources().iter());
         }
-        // Withdraw superseded measured projections before testing new intervals.
-        records.sort_by_key(|record| !matches!(record, ImportRecord::MeterInterval(interval) if interval.quality != Quality::Actual));
+        // Withdraw estimate demotions before testing replacement reported intervals.
+        records.sort_by_key(|record| !matches!(record, ImportRecord::MeterInterval(interval) if interval.quality == Quality::Estimated));
         let mut canonical = records
             .iter()
             .map(serde_json::to_string)
@@ -231,6 +231,9 @@ impl Store {
         .fetch_one(&mut *tx)
         .await?;
         if replayed {
+            if import_only {
+                Self::restore_unknown_usage(&mut tx, &binding, &input.records).await?;
+            }
             tx.commit().await?;
             return Ok(ImportReceipt {
                 unchanged: records.len(),
@@ -383,6 +386,9 @@ impl Store {
             )
             .await?;
         }
+        if import_only {
+            Self::restore_unknown_usage(&mut tx, &binding, &input.records).await?;
+        }
         sqlx::query("INSERT INTO import_receipts(account_id,digest) VALUES(?,?)")
             .bind(&binding.id)
             .bind(&receipt_digest)
@@ -397,6 +403,105 @@ impl Store {
         }
         tx.commit().await?;
         Ok(receipt)
+    }
+
+    async fn restore_unknown_usage(
+        tx: &mut Transaction<'_, Sqlite>,
+        binding: &AccountBinding,
+        incoming: &[ImportRecord],
+    ) -> Result<(), ImportError> {
+        let requested = incoming
+            .iter()
+            .filter(|record| matches!(record, ImportRecord::MeterInterval(value) if value.quality == Quality::Unknown))
+            .map(|record| Ok((record.id(&binding.id)?, record.facts())))
+            .collect::<Result<BTreeMap<_, _>, ImportError>>()?;
+        if requested.is_empty() {
+            return Ok(());
+        }
+        let ids = requested.keys().cloned().collect::<Vec<_>>();
+        let mut query = unknown_usage_records_sql(&binding.id, &ids);
+        let stored = query
+            .build_query_as::<(String, String)>()
+            .fetch_all(&mut **tx)
+            .await?;
+        if stored.is_empty() {
+            return Ok(());
+        }
+        let now: String = sqlx::query_scalar("SELECT strftime('%Y-%m-%dT%H:%M:%fZ','now')")
+            .fetch_one(&mut **tx)
+            .await?;
+        let observed_at = chrono::DateTime::parse_from_rfc3339(&now)
+            .map_err(|_| StoreError::InvalidObservation)?
+            .with_timezone(&Utc);
+        let mut candidates = Vec::new();
+        for (id, payload) in stored {
+            let record: ImportRecord = serde_json::from_str(&payload)?;
+            // An old receipt must not resurrect facts changed by a later correction.
+            if requested.get(&id) != Some(&record.facts()) {
+                continue;
+            }
+            if let Some(Observation::Usage(usage)) =
+                record.observation(binding, &id, observed_at)?
+            {
+                candidates.push(usage);
+            }
+        }
+        if candidates.is_empty() {
+            return Ok(());
+        }
+        let mut query = nonoverlapping_usage_sql(&binding.id, &candidates);
+        let eligible = query
+            .build_query_scalar::<String>()
+            .fetch_all(&mut **tx)
+            .await?
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let mut projected = false;
+        for usage in &candidates {
+            // Legacy unknown windows could overlap each other or actual usage.
+            // Keep ambiguous windows raw instead of replacing existing observations.
+            if !eligible.contains(&usage.id)
+                || candidates.iter().any(|other| {
+                    other.id != usage.id
+                        && eligible.contains(&other.id)
+                        && other.service_id == usage.service_id
+                        && other.start < usage.end
+                        && other.end > usage.start
+                })
+            {
+                continue;
+            }
+            let observation = Observation::Usage(usage.clone());
+            let row = ObservationRow::new(binding, &observation)?;
+            sqlx::query(queries::UPSERT_OBSERVATION)
+                .bind(&binding.id)
+                .bind(row.kind)
+                .bind(row.id)
+                .bind(row.service_id)
+                .bind(&row.sort_key)
+                .bind(&row.end_key)
+                .bind(&now)
+                .bind(row.payload)
+                .execute(&mut **tx)
+                .await?;
+            projected = true;
+        }
+        if projected {
+            Self::write_coverage(
+                tx,
+                &Coverage {
+                    account_id: binding.id.clone(),
+                    capability: Capability::Usage,
+                    state: CoverageState::Partial,
+                    reason: Some("document_import".to_owned()),
+                    checked_at: observed_at,
+                    from: None,
+                    to: None,
+                },
+            )
+            .await?;
+        }
+        Ok(())
     }
 
     pub async fn bill_details(
@@ -516,6 +621,33 @@ async fn import_binding(
     Ok((proposed, true))
 }
 
+fn unknown_usage_records_sql(account: &str, ids: &[String]) -> QueryBuilder<Sqlite> {
+    let mut query = QueryBuilder::new(
+        "SELECT raw.id,raw.payload FROM imported_records AS raw WHERE raw.account_id=",
+    );
+    query
+        .push_bind(account)
+        .push(" AND raw.kind='meter_interval' AND raw.id IN (");
+    crate::store::bind_accounts(&mut query, ids);
+    query.push(") AND NOT EXISTS (SELECT 1 FROM observations WHERE account_id=raw.account_id AND kind='usage' AND id=raw.id)");
+    query
+}
+
+fn nonoverlapping_usage_sql(account: &str, candidates: &[Usage]) -> QueryBuilder<Sqlite> {
+    let mut query = QueryBuilder::new("WITH candidate(id,service_id,start_key,end_key) AS (");
+    query.push_values(candidates, |mut values, usage| {
+        values
+            .push_bind(usage.id.clone())
+            .push_bind(usage.service_id.clone())
+            .push_bind(usage.start.to_rfc3339())
+            .push_bind(usage.end.to_rfc3339());
+    });
+    query.push(") SELECT candidate.id FROM candidate WHERE NOT EXISTS (SELECT 1 FROM (SELECT sort_key FROM observations WHERE account_id=")
+        .push_bind(account)
+        .push(" AND kind='usage' AND service_id=candidate.service_id AND end_key>candidate.start_key ORDER BY end_key LIMIT 1) WHERE sort_key<candidate.end_key)");
+    query
+}
+
 async fn native_wm_record(
     tx: &mut Transaction<'_, Sqlite>,
     binding: &AccountBinding,
@@ -573,5 +705,163 @@ async fn native_wm_record(
             Ok((id, Some(bill_id)))
         }
         _ => Err(ImportError::Conflict),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        config::Config,
+        imports::{
+            ExactDecimal, ImportAccount, ImportRecord, ImportRequest, MeterIntervalInput, Quality,
+            Quantity, QuantityUnit, SourceRef, SourceRole, digest,
+        },
+        models::{Observation, ProviderId, Service, ServiceKind, Usage, UsageUnit},
+        store::{
+            Store,
+            imports::{nonoverlapping_usage_sql, unknown_usage_records_sql},
+        },
+        utility::SyncPage,
+    };
+    use chrono::{Duration, Utc};
+    use rust_decimal::Decimal;
+    use sqlx::{Execute, Row, Sqlite, sqlite::SqliteArguments};
+
+    async fn explain(
+        name: &str,
+        store: &Store,
+        mut query: sqlx::query::Query<'_, Sqlite, SqliteArguments>,
+    ) -> Vec<String> {
+        let args = query.take_arguments().unwrap().unwrap_or_default();
+        let plans = sqlx::query_with(
+            sqlx::AssertSqlSafe(format!("EXPLAIN QUERY PLAN {}", query.sql().as_str())),
+            args,
+        )
+        .fetch_all(store.pool())
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| row.get::<String, _>("detail"))
+        .collect::<Vec<_>>();
+        println!("{name}: {}", plans.join("; "));
+        plans
+    }
+
+    #[tokio::test]
+    async fn unknown_replay_queries_use_scoped_indexes() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(&directory.path().join("replay-plans.sqlite3"))
+            .await
+            .unwrap();
+        let config: Config = toml::from_str(include_str!("../../config/example.toml")).unwrap();
+        store.register(&config).await.unwrap();
+        let now = Utc::now();
+        let start = now - Duration::days(300);
+        let binding = &config.accounts[1];
+        let observations = (0..5_000)
+            .map(|index| {
+                Observation::Usage(Usage {
+                    id: format!("plan-native:{index}"),
+                    account_id: binding.id.clone(),
+                    service_id: binding.services[0].id.clone(),
+                    start: start + Duration::hours(index),
+                    end: start + Duration::hours(index + 1),
+                    quantity: Decimal::ONE,
+                    unit: UsageUnit::Wh,
+                    observed_at: now,
+                })
+            })
+            .collect();
+        store
+            .ingest(
+                binding,
+                &SyncPage {
+                    observations,
+                    coverage: vec![],
+                    continuation: None,
+                },
+            )
+            .await
+            .unwrap();
+        let source = digest(b"Representative hourly export");
+        store
+            .put_document(&config.deployment, &source, b"Representative hourly export")
+            .await
+            .unwrap();
+        let request = ImportRequest {
+            account: ImportAccount {
+                id: "plan-water".to_owned(),
+                name: "Water".to_owned(),
+                provider: ProviderId::Lvmwd,
+                start_on: start.date_naive(),
+                provider_account_sha256: None,
+                services: vec![Service {
+                    id: "plan-meter".to_owned(),
+                    name: "Meter".to_owned(),
+                    kind: ServiceKind::Water,
+                }],
+            },
+            currency: "USD".to_owned(),
+            records: (0..200)
+                .map(|index| {
+                    ImportRecord::MeterInterval(MeterIntervalInput {
+                        service_id: "plan-meter".to_owned(),
+                        start: start + Duration::hours(index),
+                        end: start + Duration::hours(index + 1),
+                        quality: Quality::Unknown,
+                        quantity: Quantity {
+                            value: ExactDecimal(Decimal::ONE),
+                            unit: QuantityUnit::UsGallon,
+                        },
+                        sources: vec![SourceRef {
+                            sha256: source.clone(),
+                            role: SourceRole::UsageExport,
+                            pages: vec![],
+                        }],
+                        replaces_revision: None,
+                    })
+                })
+                .collect(),
+        };
+        store
+            .import(&config.deployment, request.clone())
+            .await
+            .unwrap();
+        sqlx::query("ANALYZE").execute(store.pool()).await.unwrap();
+        let binding = request.binding(&config.deployment);
+        let ids = request
+            .records
+            .iter()
+            .map(|record| record.id(&binding.id).unwrap())
+            .collect::<Vec<_>>();
+        let candidates = request
+            .records
+            .iter()
+            .zip(&ids)
+            .map(|(record, id)| {
+                let Some(Observation::Usage(usage)) =
+                    record.observation(&binding, id, now).unwrap()
+                else {
+                    panic!("expected reported usage")
+                };
+                usage
+            })
+            .collect::<Vec<_>>();
+        let mut missing = unknown_usage_records_sql(&binding.id, &ids);
+        let plans = explain("unknown_missing_projection", &store, missing.build()).await;
+        assert!(
+            plans
+                .iter()
+                .any(|plan| plan.starts_with("SEARCH raw USING PRIMARY KEY"))
+        );
+        assert!(
+            !plans
+                .iter()
+                .any(|plan| plan == "SCAN raw" || plan == "SCAN observations")
+        );
+        let mut overlap = nonoverlapping_usage_sql(&binding.id, &candidates);
+        let plans = explain("unknown_overlap", &store, overlap.build()).await;
+        assert!(plans.iter().any(|plan| plan.contains("usage_overlap")));
+        assert!(!plans.iter().any(|plan| plan == "SCAN observations"));
     }
 }

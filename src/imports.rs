@@ -902,7 +902,7 @@ impl ImportRecord {
                 .to_owned(),
                 observed_at,
             }),
-            Self::MeterInterval(value) if value.quality == Quality::Actual => {
+            Self::MeterInterval(value) if value.quality != Quality::Estimated => {
                 let unit = match value.quantity.unit {
                     QuantityUnit::HundredCubicFeet => UsageUnit::Ccf,
                     QuantityUnit::UsGallon => UsageUnit::Gallon,

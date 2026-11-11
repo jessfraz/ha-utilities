@@ -1,17 +1,43 @@
 mod support;
 
+use chrono::{Duration, Utc};
 use ha_utilities::{
     client::{Client, Transport},
-    imports::{ImportAccountPurge, ImportAccountPurgeReceipt, ImportError, ImportRequest, digest},
-    models::{Bill, ListQuery, Page, ProviderId, Summary, SyncJob, SyncState},
+    imports::{
+        ExactDecimal, ImportAccount, ImportAccountPurge, ImportAccountPurgeReceipt, ImportError,
+        ImportRecord, ImportRequest, ImportedRecord, MeterIntervalInput, Quality, Quantity,
+        QuantityUnit, SourceRef, SourceRole, digest,
+    },
+    models::{
+        Bill, ListQuery, Page, ProviderId, Service, ServiceKind, Summary, SyncJob, SyncState,
+        Usage, UsageUnit,
+    },
     store::Store,
 };
+use rust_decimal::Decimal;
 use serde_json::json;
 
 async fn document(store: &Store, bytes: &[u8]) -> String {
     let key = digest(bytes);
     store.put_document("demo", &key, bytes).await.unwrap();
     key
+}
+
+async fn meter_records(store: &Store, account: &str) -> Vec<ImportedRecord> {
+    sqlx::query_as::<_, (String, String, String)>(
+        "SELECT id,revision,payload FROM imported_records WHERE account_id=? AND kind='meter_interval' ORDER BY id LIMIT 200",
+    )
+    .bind(account)
+    .fetch_all(store.pool())
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|(id, revision, payload)| ImportedRecord {
+        id,
+        revision,
+        record: serde_json::from_str(&payload).unwrap(),
+    })
+    .collect()
 }
 
 fn request(records: serde_json::Value) -> ImportRequest {
@@ -380,4 +406,330 @@ async fn owner_can_purge_only_the_confirmed_import_account() {
         1
     );
     app.close().await;
+}
+
+#[tokio::test]
+async fn unknown_intervals_project_reported_usage_and_estimate_transitions_are_atomic() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(&directory.path().join("unknown-intervals.sqlite3"))
+        .await
+        .unwrap();
+    let source = document(&store, b"Provider hourly consumption export").await;
+    let start = "2025-02-08T08:00:00Z"
+        .parse::<chrono::DateTime<Utc>>()
+        .unwrap();
+    let account = ImportAccount {
+        id: "fictional-water".to_owned(),
+        name: "Fictional water".to_owned(),
+        provider: ProviderId::Lvmwd,
+        start_on: start.date_naive(),
+        provider_account_sha256: None,
+        services: vec![Service {
+            id: "fixture-meter".to_owned(),
+            name: "Meter".to_owned(),
+            kind: ServiceKind::Water,
+        }],
+    };
+    let input = |records| ImportRequest {
+        account: account.clone(),
+        currency: "USD".to_owned(),
+        records,
+    };
+    let interval = |from, to, quantity, quality, replaces_revision| {
+        ImportRecord::MeterInterval(MeterIntervalInput {
+            service_id: "fixture-meter".to_owned(),
+            start: start + Duration::minutes(from),
+            end: start + Duration::minutes(to),
+            quantity: Quantity {
+                value: ExactDecimal(quantity),
+                unit: QuantityUnit::UsGallon,
+            },
+            quality,
+            sources: vec![SourceRef {
+                sha256: source.clone(),
+                role: SourceRole::UsageExport,
+                pages: vec![],
+            }],
+            replaces_revision,
+        })
+    };
+    let initial = input(vec![
+        interval(0, 120, Decimal::new(15, 1), Quality::Unknown, None),
+        interval(120, 180, Decimal::ZERO, Quality::Unknown, None),
+        interval(0, 60, Decimal::ONE, Quality::Estimated, None),
+    ]);
+    assert_eq!(
+        store
+            .import("demo", initial.clone())
+            .await
+            .unwrap()
+            .inserted,
+        3
+    );
+    let accounts = std::slice::from_ref(&account.id);
+    let usage = store
+        .list::<Usage>("usage", &ListQuery::default(), accounts)
+        .await
+        .unwrap();
+    assert_eq!(
+        usage.items.len(),
+        2,
+        "unknown provider rows must project usage"
+    );
+    assert!(usage.items.iter().any(|item| {
+        item.start == start
+            && item.quantity == Decimal::new(15, 1)
+            && item.unit == UsageUnit::Gallon
+    }));
+    assert!(usage.items.iter().any(|item| {
+        item.start == start + Duration::hours(2)
+            && item.quantity == Decimal::ZERO
+            && item.unit == UsageUnit::Gallon
+    }));
+    let raw = meter_records(&store, &account.id).await;
+    assert_eq!(raw.len(), 3);
+    for requested in &initial.records {
+        assert!(raw.iter().any(|stored| stored.record == *requested));
+    }
+    let revision = |from, to| {
+        raw.iter()
+            .find(|stored| {
+                matches!(&stored.record, ImportRecord::MeterInterval(value)
+                    if value.start == start + Duration::minutes(from)
+                        && value.end == start + Duration::minutes(to))
+            })
+            .unwrap()
+            .revision
+            .clone()
+    };
+    // These projections overlap the old interval until its estimate demotion runs.
+    let replacement = input(vec![
+        interval(0, 60, Decimal::ONE, Quality::Unknown, Some(revision(0, 60))),
+        interval(60, 120, Decimal::new(5, 1), Quality::Unknown, None),
+        interval(
+            0,
+            120,
+            Decimal::new(15, 1),
+            Quality::Estimated,
+            Some(revision(0, 120)),
+        ),
+    ]);
+    let receipt = store.import("demo", replacement).await.unwrap();
+    assert_eq!((receipt.inserted, receipt.corrected), (1, 2));
+    let before = store
+        .list::<Usage>("usage", &ListQuery::default(), accounts)
+        .await
+        .unwrap();
+    let mut starts = before
+        .items
+        .iter()
+        .map(|item| item.start)
+        .collect::<Vec<_>>();
+    starts.sort();
+    assert_eq!(
+        starts,
+        [
+            start,
+            start + Duration::hours(1),
+            start + Duration::hours(2)
+        ]
+    );
+    let before_raw = meter_records(&store, &account.id).await;
+    let invalid = input(vec![
+        interval(30, 90, Decimal::ONE, Quality::Unknown, None),
+        interval(
+            120,
+            180,
+            Decimal::ZERO,
+            Quality::Estimated,
+            Some(revision(120, 180)),
+        ),
+    ]);
+    assert!(matches!(
+        store.import("demo", invalid).await,
+        Err(ImportError::Conflict)
+    ));
+    assert_eq!(
+        store
+            .list::<Usage>("usage", &ListQuery::default(), accounts)
+            .await
+            .unwrap()
+            .items,
+        before.items
+    );
+    let after_raw = meter_records(&store, &account.id).await;
+    assert_eq!(
+        after_raw
+            .iter()
+            .map(|record| (&record.revision, &record.record))
+            .collect::<Vec<_>>(),
+        before_raw
+            .iter()
+            .map(|record| (&record.revision, &record.record))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn replay_restores_legacy_unknown_usage_without_overwriting_actual_or_raw_facts() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(&directory.path().join("legacy-unknown.sqlite3"))
+        .await
+        .unwrap();
+    let source = document(&store, b"Legacy provider hourly export").await;
+    let start = "2025-02-08T08:00:00Z"
+        .parse::<chrono::DateTime<Utc>>()
+        .unwrap();
+    let interval = |from, to, quantity, quality| {
+        ImportRecord::MeterInterval(MeterIntervalInput {
+            service_id: "fixture-meter".to_owned(),
+            start: start + Duration::hours(from),
+            end: start + Duration::hours(to),
+            quantity: Quantity {
+                value: ExactDecimal(quantity),
+                unit: QuantityUnit::UsGallon,
+            },
+            quality,
+            sources: vec![SourceRef {
+                sha256: source.clone(),
+                role: SourceRole::UsageExport,
+                pages: vec![],
+            }],
+            replaces_revision: None,
+        })
+    };
+    let initial = ImportRequest {
+        account: ImportAccount {
+            id: "legacy-water".to_owned(),
+            name: "Legacy water".to_owned(),
+            provider: ProviderId::Lvmwd,
+            start_on: start.date_naive(),
+            provider_account_sha256: None,
+            services: vec![Service {
+                id: "fixture-meter".to_owned(),
+                name: "Meter".to_owned(),
+                kind: ServiceKind::Water,
+            }],
+        },
+        currency: "USD".to_owned(),
+        records: vec![
+            interval(0, 1, Decimal::ZERO, Quality::Unknown),
+            interval(1, 2, Decimal::ONE, Quality::Unknown),
+            interval(2, 4, Decimal::from(2), Quality::Unknown),
+        ],
+    };
+    let mut unrelated = initial.clone();
+    unrelated.account.id = "other-water".to_owned();
+    unrelated.account.name = "Other water".to_owned();
+    unrelated.account.services[0].id = "other-meter".to_owned();
+    for record in &mut unrelated.records {
+        if let ImportRecord::MeterInterval(value) = record {
+            value.service_id = "other-meter".to_owned();
+        }
+    }
+    for input in [initial.clone(), unrelated.clone()] {
+        store.import("demo", input).await.unwrap();
+    }
+    // Recreate the released state: canonical unknown facts and receipts existed,
+    // but their derived usage rows did not.
+    sqlx::query("DELETE FROM observations WHERE kind='usage'")
+        .execute(store.pool())
+        .await
+        .unwrap();
+    let mut actual = initial.clone();
+    actual.records = vec![interval(2, 3, Decimal::from(3), Quality::Actual)];
+    store.import("demo", actual).await.unwrap();
+    let accounts = std::slice::from_ref(&initial.account.id);
+    let actual_before = store
+        .list::<Usage>("usage", &ListQuery::default(), accounts)
+        .await
+        .unwrap();
+    assert_eq!(actual_before.items.len(), 1);
+    let raw_before = meter_records(&store, &initial.account.id).await;
+    let receipt = store.import("demo", initial.clone()).await.unwrap();
+    assert!(receipt.replayed);
+    assert_eq!(receipt.unchanged, 3);
+    let projected = store
+        .list::<Usage>("usage", &ListQuery::default(), accounts)
+        .await
+        .unwrap();
+    assert_eq!(projected.items.len(), 3);
+    assert!(projected.items.contains(&actual_before.items[0]));
+    assert!(
+        projected
+            .items
+            .iter()
+            .any(|usage| usage.start == start && usage.quantity == Decimal::ZERO)
+    );
+    assert!(
+        projected
+            .items
+            .iter()
+            .all(|usage| usage.end != start + Duration::hours(4))
+    );
+    let raw_after = meter_records(&store, &initial.account.id).await;
+    assert_eq!(
+        raw_after
+            .iter()
+            .map(|record| (&record.revision, &record.record))
+            .collect::<Vec<_>>(),
+        raw_before
+            .iter()
+            .map(|record| (&record.revision, &record.record))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        store.import("demo", initial.clone()).await.unwrap(),
+        receipt
+    );
+    assert_eq!(
+        store
+            .list::<Usage>("usage", &ListQuery::default(), accounts)
+            .await
+            .unwrap()
+            .items,
+        projected.items
+    );
+    assert!(
+        store
+            .list::<Usage>(
+                "usage",
+                &ListQuery::default(),
+                std::slice::from_ref(&unrelated.account.id)
+            )
+            .await
+            .unwrap()
+            .items
+            .is_empty()
+    );
+    let zero = raw_after
+        .iter()
+        .find(|record| matches!(&record.record, ImportRecord::MeterInterval(value) if value.start == start))
+        .unwrap();
+    let mut estimated = zero.record.clone();
+    if let ImportRecord::MeterInterval(value) = &mut estimated {
+        value.quality = Quality::Estimated;
+        value.replaces_revision = Some(zero.revision.clone());
+    }
+    let mut demotion = initial.clone();
+    demotion.records = vec![estimated];
+    assert_eq!(store.import("demo", demotion).await.unwrap().corrected, 1);
+    assert!(
+        store
+            .import("demo", initial.clone())
+            .await
+            .unwrap()
+            .replayed
+    );
+    let usage = store
+        .list::<Usage>("usage", &ListQuery::default(), accounts)
+        .await
+        .unwrap();
+    assert_eq!(usage.items.len(), 2);
+    assert!(usage.items.iter().all(|item| item.start != start));
+    let raw = meter_records(&store, &initial.account.id).await;
+    assert!(raw.iter().any(
+        |record| matches!(&record.record, ImportRecord::MeterInterval(value)
+        if value.start == start && value.quality == Quality::Estimated)
+    ));
 }
