@@ -143,7 +143,7 @@ export function createConnections({ api, node, providers, updated, connected, on
     if (nextSignature === signature) { poll(); return; }
     signature = nextSignature;
     footer.replaceChildren();
-    title.textContent = next.name;
+    title.textContent = next.utility_name;
     const steps = node('ol', undefined, 'connection-steps');
     steps.setAttribute('aria-label', 'Connection progress');
     const step = next.state === 'connected' ? 3 : next.state === 'ready' ? 2 : 1;
@@ -154,7 +154,7 @@ export function createConnections({ api, node, providers, updated, connected, on
     });
     const status = node('p', stateNames[next.state] ?? 'Checking connection', 'connection-status');
     status.setAttribute('role', 'status');
-    const description = node('p', `${next.utility_name} · Bayou`, 'muted');
+    const description = node('p', 'Bayou', 'muted');
     body.replaceChildren(steps, status, description);
     if (next.issue) body.append(node('p', issues[next.issue] ?? 'Check the connection status before continuing.', 'connection-note'));
     if (next.state === 'connected') {
@@ -271,14 +271,6 @@ export function createConnections({ api, node, providers, updated, connected, on
     utility.append(new Option('Choose your utility', ''));
     for (const item of values.items) utility.append(new Option(item.name, item.id));
     utilityLabel.append(utilityCaption, utility);
-    const nameLabel = node('div', undefined, 'form-field');
-    const name = node('input');
-    name.id = 'connection-display-name';
-    const nameCaption = node('label', 'Display name (optional)');
-    nameCaption.htmlFor = name.id;
-    name.type = 'text'; name.maxLength = 100; name.autocomplete = 'off';
-    name.placeholder = 'For example, Electricity';
-    nameLabel.append(nameCaption, name);
     const currencyLabel = node('div', undefined, 'form-field');
     const currency = node('select');
     currency.id = 'connection-currency';
@@ -302,19 +294,19 @@ export function createConnections({ api, node, providers, updated, connected, on
     utility.addEventListener('change', updateReadiness);
     consent.addEventListener('change', updateReadiness);
     if (draft) {
-      utility.value = draft.utility_id; name.value = draft.name ?? ''; currency.value = draft.currency; consent.checked = true;
-      for (const control of [utility, name, currency, consent]) control.disabled = true;
+      utility.value = draft.utility_id; currency.value = draft.currency; consent.checked = true;
+      for (const control of [utility, currency, consent]) control.disabled = true;
       form.append(node('p', 'A previous setup request was not confirmed. This checks the same request, so retrying cannot create another customer.', 'connection-note'));
     }
-    form.append(utilityLabel, nameLabel, currencyLabel, policy, consentLabel);
+    form.append(utilityLabel, currencyLabel, policy, consentLabel);
     footer.replaceChildren(submit);
     updateReadiness();
     form.addEventListener('submit', async (event) => {
       event.preventDefault();
       if (!form.reportValidity()) return;
-      if (!draft) draft = { provider: 'bayou', request_id: crypto.randomUUID(), utility_id: utility.value, name: name.value.trim() || null, currency: currency.value, accept_provider_settings: true };
+      if (!draft) draft = { provider: 'bayou', request_id: crypto.randomUUID(), utility_id: utility.value, currency: currency.value, accept_provider_settings: true };
       submit.disabled = true;
-      for (const control of [utility, name, currency, consent]) control.disabled = true;
+      for (const control of [utility, currency, consent]) control.disabled = true;
       error.textContent = '';
       try {
         const result = await request('v1/connections', { body: draft });
@@ -357,27 +349,28 @@ export function createConnections({ api, node, providers, updated, connected, on
       const result = await api('v1/connections', { signal: panelController.signal });
       if (!current.isConnected) return;
       const list = node('ul', undefined, 'record-list');
-      for (const item of result.items) {
+      const pending = result.items.filter((item) => !item.linked_account_ids.length);
+      for (const item of pending) {
         const row = node('li');
         const description = node('div');
-        description.append(node('strong', item.name), node('p', `${item.utility_name} · ${stateNames[item.state] ?? 'Check connection'}`));
+        description.append(node('strong', item.utility_name), node('p', stateNames[item.state] ?? 'Check connection'));
         row.append(description, action(item.state === 'connected' ? 'Details' : 'Continue setup', () => open(item.id), true));
         list.append(row);
       }
-      current.replaceChildren(result.items.length ? list : node('p', 'No hosted utility connections yet.', 'panel-empty'));
+      current.replaceChildren(pending.length ? list : node('p', 'No unfinished utility connections.', 'panel-empty'));
     } catch (failure) {
       if (failure.name === 'AbortError' || !current.isConnected) return;
       current.replaceChildren(node('p', failure.status === 403 ? 'A Home Assistant administrator can manage utility connections.' : 'Saved connections could not be loaded. Refresh before starting another setup.', 'panel-empty'));
     }
   }
-  function section({ pendingOnly = false } = {}) {
+  function section({ showStart = true } = {}) {
     panelController?.abort();
     const section = node('section', undefined, 'panel settings-section');
     const heading = node('div', undefined, 'section-heading');
     heading.append(node('h2', 'Utility connections'));
     const start = action('Connect utility', () => open());
     start.disabled = !providers().some((provider) => provider.id === 'bayou' && provider.configured);
-    if (!pendingOnly) heading.append(start);
+    if (showStart) heading.append(start);
     panel = node('div');
     panel.append(node('p', start.disabled ? 'Add a Bayou API key in the app configuration to connect a utility.' : 'Loading saved connections…', 'panel-empty'));
     section.append(heading, panel);

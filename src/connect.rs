@@ -18,7 +18,7 @@ use crate::{
     models::{
         BindConnection, ConnectableUtility, Connection, ConnectionAuthStatus,
         ConnectionAuthorization, ConnectionIssue, ConnectionProgress, ConnectionState,
-        CreateConnection, ProviderId, ServiceKind, SyncJob,
+        CreateConnection, ProviderId, SyncJob,
     },
     store::{Store, StoreError, connections::ConnectionRecord},
     sync::Providers,
@@ -194,12 +194,6 @@ impl ConnectionHandle {
         if !valid_id(&input.utility_id) || !matches!(input.currency.as_str(), "USD" | "CAD") {
             return Err(ConnectionError::InvalidInput);
         }
-        if let Some(name) = input.name.as_mut() {
-            *name = name.trim().to_owned();
-            if name.is_empty() || name.len() > 100 || name.chars().any(char::is_control) {
-                return Err(ConnectionError::InvalidInput);
-            }
-        }
         if let Some(record) = self
             .engine
             .store
@@ -207,10 +201,7 @@ impl ConnectionHandle {
             .await?
         {
             let connection = record.connection;
-            if connection.utility_id != input.utility_id
-                || connection.currency != input.currency
-                || connection.name != input.name.as_deref().unwrap_or(&connection.utility_name)
-            {
+            if connection.utility_id != input.utility_id || connection.currency != input.currency {
                 return Err(ConnectionError::Changed);
             }
             return Ok(connection);
@@ -349,18 +340,6 @@ impl ConnectionHandle {
                     .ok_or(ConnectionError::InvalidInput)?;
                 services.push(ServiceBinding {
                     id: local_id("meter", &[id, &account.id, &meter.id]),
-                    name: Some({
-                        let kind = match meter.kind {
-                            ServiceKind::Electricity => "Electricity",
-                            ServiceKind::Gas => "Gas",
-                            _ => return Err(ConnectionError::InvalidInput),
-                        };
-                        if account.meters.len() > 1 {
-                            format!("{kind} meter ending {}", ending(&meter.id))
-                        } else {
-                            kind.to_owned()
-                        }
-                    }),
                     provider_service: meter.id.clone(),
                     kind: meter.kind,
                 });
@@ -369,15 +348,6 @@ impl ConnectionHandle {
             services.sort_by(|left, right| left.id.cmp(&right.id));
             bindings.push(AccountBinding {
                 id: local_id("bayou", &[id, &account.id]),
-                name: if customer.accounts.len() > 1 {
-                    format!(
-                        "{} · account ending {}",
-                        record.connection.name,
-                        ending(&account.id)
-                    )
-                } else {
-                    record.connection.name.clone()
-                },
                 deployment: self.engine.config.deployment.clone(),
                 provider: ProviderId::Bayou,
                 customer_id: customer.customer_id.clone(),
@@ -638,17 +608,6 @@ fn local_id(prefix: &str, values: &[&str]) -> String {
     format!("{prefix}-{}", URL_SAFE_NO_PAD.encode(hash.finalize()))
 }
 
-fn ending(value: &str) -> String {
-    value
-        .chars()
-        .rev()
-        .take(4)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use crate::{
@@ -716,7 +675,6 @@ mod tests {
             provider: ConnectionProvider::Bayou,
             request_id: uuid::Uuid::now_v7().to_string(),
             utility_id: "speculoos_power".into(),
-            name: None,
             currency: "USD".into(),
             accept_provider_settings: true,
         };
@@ -772,7 +730,6 @@ mod tests {
             provider: ConnectionProvider::Bayou,
             request_id: uuid::Uuid::now_v7().to_string(),
             utility_id: "speculoos_power".into(),
-            name: None,
             currency: "USD".into(),
             accept_provider_settings: true,
         };

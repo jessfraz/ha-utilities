@@ -452,7 +452,6 @@ impl Store {
                     binding.provider,
                     StaleAutomaticAccount {
                         account_id: binding.id,
-                        name: binding.name,
                         last_data_at,
                     },
                 ))
@@ -471,11 +470,11 @@ impl Store {
         }
         let mut query = manual_freshness_sql(deployment, accounts);
         let rows = query
-            .build_query_as::<(String, String, Option<String>)>()
+            .build_query_as::<(String, Option<String>)>()
             .fetch_all(&self.pool)
             .await?;
         let mut stale = Vec::new();
-        for (account_id, name, last_synced_at) in rows {
+        for (account_id, last_synced_at) in rows {
             let last_synced_at = last_synced_at
                 .as_deref()
                 .map(DateTime::parse_from_rfc3339)
@@ -485,7 +484,6 @@ impl Store {
             if last_synced_at.is_none_or(|time| time <= cutoff) {
                 stale.push(StaleManualAccount {
                     account_id,
-                    name,
                     last_synced_at,
                 });
             }
@@ -800,7 +798,8 @@ mod queries {
     pub const SUMMARY_PREFIX: &str =
         "SELECT kind,count(*) AS count FROM observations WHERE account_id IN (";
     pub const FRESHNESS_PREFIX: &str = "SELECT count(*) AS accounts,max(finished_at) AS newest,min(finished_at) AS oldest FROM (SELECT account_id,max(finished_at) AS finished_at FROM sync_jobs WHERE state IN ('complete','partial') AND account_id IN (";
-    pub const MANUAL_FRESHNESS_PREFIX: &str = "SELECT account.id,json_extract(account.binding,'$.name') AS name,max(job.finished_at) AS last_synced_at
+    pub const MANUAL_FRESHNESS_PREFIX: &str =
+        "SELECT account.id,max(job.finished_at) AS last_synced_at
         FROM accounts AS account LEFT JOIN sync_jobs AS job
         ON job.account_id=account.id AND job.state IN ('complete','partial')
         WHERE account.deployment=";
@@ -1466,7 +1465,6 @@ mod tests {
         .map(|id| {
             let mut account = template.clone();
             account.id = id.to_owned();
-            account.name = format!("Service {id}");
             account.provider_account = id.to_owned();
             account.services[0].id = format!("{id}-service");
             account
@@ -1523,17 +1521,14 @@ mod tests {
             vec![
                 StaleManualAccount {
                     account_id: "boundary".to_owned(),
-                    name: "Service boundary".to_owned(),
                     last_synced_at: Some(cutoff),
                 },
                 StaleManualAccount {
                     account_id: "failed".to_owned(),
-                    name: "Service failed".to_owned(),
                     last_synced_at: Some(cutoff - Duration::hours(1)),
                 },
                 StaleManualAccount {
                     account_id: "never".to_owned(),
-                    name: "Service never".to_owned(),
                     last_synced_at: None,
                 },
             ]

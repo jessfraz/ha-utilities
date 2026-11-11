@@ -60,7 +60,7 @@ def connection_input(path: str, value: object) -> None:
             "currency",
             "accept_provider_settings",
         }
-        if set(row) - required - {"name"} or required - set(row):
+        if set(row) != required:
             raise ValueError("Invalid connection request")
         if row["provider"] != "bayou" or row["accept_provider_settings"] is not True:
             raise ValueError("Provider consent required")
@@ -68,8 +68,6 @@ def connection_input(path: str, value: object) -> None:
             raise ValueError("Invalid connection request")
         text(row["utility_id"])
         text(row["currency"], max_length=3)
-        if row.get("name") is not None:
-            text(row["name"], max_length=100)
     elif path.endswith("/bind"):
         values = row.get("accounts")
         if (

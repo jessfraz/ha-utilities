@@ -1,3 +1,9 @@
+# 0.1.12
+
+Use canonical utility companies and typed service categories throughout the app.
+Remove custom connection, account, and service names and the rename endpoint.
+Keep account IDs, invoices, original documents, amounts, and import history intact.
+
 # 0.1.11
 
 Keep active sync progress visible on every page, including after closing setup

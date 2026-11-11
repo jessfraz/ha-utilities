@@ -9,6 +9,7 @@ import pytest
 from homeassistant.config_entries import SOURCE_USER, ConfigEntryState
 from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers import issue_registry as ir
 from homeassistant.loader import async_get_integration
 from homeassistant.util import dt as dt_util
@@ -30,6 +31,178 @@ from custom_components.utilities.models import Collection
 from .conftest import TOKEN, Backend, collection, coverage, entity_id, json_response
 
 PREFIX = "/api/utilities/v1"
+
+
+async def test_unavailable_repair_identity_does_not_discard_a_healthy_summary(
+    hass: HomeAssistant, entry: UtilitiesConfigEntry, backend: Backend
+) -> None:
+    coordinator = entry.runtime_data
+    assert coordinator.data.summary.bills == 2
+    backend.responses["/v1/summary"] = json_response(
+        {
+            **backend.summary(),
+            "bills": 3,
+            "stale_automatic_accounts": [
+                {
+                    "account_id": "example-account",
+                    "name": "Example Electric Company",
+                    "last_data_at": None,
+                }
+            ],
+        }
+    )
+    backend.responses["/v1/accounts"] = (503, b"{}", {})
+    await coordinator.async_refresh()
+    assert coordinator.data.summary.bills == 3
+    await hass.async_block_till_done(wait_background_tasks=True)
+    assert coordinator.last_update_success
+
+
+async def test_slow_repair_identity_is_coalesced_and_cancelled_without_blocking_data(
+    hass: HomeAssistant, entry: UtilitiesConfigEntry, backend: Backend
+) -> None:
+    backend.responses["/v1/summary"] = json_response(
+        {
+            **backend.summary(),
+            "bills": 3,
+            "stale_automatic_accounts": [
+                {"account_id": "example-account", "last_data_at": None}
+            ],
+        }
+    )
+    started, release = asyncio.Event(), asyncio.Event()
+    backend.gates["/v1/accounts"] = (started, release)
+    coordinator = entry.runtime_data
+    backend.requests.clear()
+    try:
+        await asyncio.wait_for(coordinator.async_refresh(), 1)
+        await asyncio.wait_for(started.wait(), 1)
+        assert coordinator.data.summary.bills == 3
+        backend.responses["/v1/summary"] = json_response(
+            {
+                **backend.summary(),
+                "bills": 4,
+                "stale_automatic_accounts": [
+                    {"account_id": "example-account", "last_data_at": None}
+                ],
+            }
+        )
+        await asyncio.wait_for(coordinator.async_refresh(), 1)
+        assert coordinator.data.summary.bills == 4
+        assert coordinator.last_update_success
+        assert sum(row.path == "/v1/accounts" for row in backend.requests) == 1
+        assert await asyncio.wait_for(
+            hass.config_entries.async_unload(entry.entry_id), 1
+        )
+    finally:
+        release.set()
+    await hass.async_block_till_done(wait_background_tasks=True)
+    assert not any(
+        issue.config_entry_id == entry.entry_id
+        and issue.translation_key == "stale_automatic_account_without_data"
+        for issue in ir.async_get(hass).issues.values()
+    )
+
+
+async def test_identity_labels_page_once_and_reject_unknown_service_kinds(
+    hass: HomeAssistant, entry: UtilitiesConfigEntry, backend: Backend
+) -> None:
+    second: dict[str, object] = {
+        "id": "example-second-account",
+        "provider": "starlink",
+        "connection_id": None,
+        "services": [{"id": "example-device", "kind": "internet"}],
+    }
+    backend.responses["/v1/summary"] = json_response(
+        {
+            **backend.summary(),
+            "stale_automatic_accounts": [
+                {"account_id": "example-account", "last_data_at": None},
+                {"account_id": second["id"], "last_data_at": None},
+            ],
+        }
+    )
+    backend.responses["/v1/accounts?limit=100"] = json_response(
+        {**backend.page(backend.accounts), "next_page": "second"}
+    )
+    backend.responses["/v1/accounts?limit=100&page=second"] = json_response(
+        backend.page([second])
+    )
+    backend.requests.clear()
+    await entry.runtime_data.async_refresh()
+    await hass.async_block_till_done(wait_background_tasks=True)
+    registry = ir.async_get(hass)
+    issues = {
+        issue.issue_id: issue
+        for issue in registry.issues.values()
+        if issue.config_entry_id == entry.entry_id
+        and issue.translation_placeholders
+        and "account" in issue.translation_placeholders
+    }
+    labels = set()
+    for issue in issues.values():
+        assert issue.translation_placeholders is not None
+        labels.add(issue.translation_placeholders["account"])
+    assert labels == {
+        "Example Electric Company (Electricity)",
+        "Starlink (Internet)",
+    }
+    assert sum(row.path == "/v1/accounts" for row in backend.requests) == 2
+    assert sum(row.path == "/v1/connections" for row in backend.requests) == 1
+    second["services"] = [{"id": "example-device", "kind": "other"}]
+    backend.responses["/v1/accounts?limit=100&page=second"] = json_response(
+        backend.page([second])
+    )
+    await entry.runtime_data.async_refresh()
+    await hass.async_block_till_done(wait_background_tasks=True)
+    assert entry.runtime_data.last_update_success is True
+    assert all(
+        registry.async_get_issue(DOMAIN, key) == value for key, value in issues.items()
+    )
+
+
+async def test_identity_read_cannot_recreate_repairs_after_unload(
+    hass: HomeAssistant, entry: UtilitiesConfigEntry, backend: Backend
+) -> None:
+    backend.responses["/v1/summary"] = json_response(
+        {
+            **backend.summary(),
+            "stale_automatic_accounts": [
+                {"account_id": "example-account", "last_data_at": None}
+            ],
+        }
+    )
+    started, release = asyncio.Event(), asyncio.Event()
+    backend.gates["/v1/accounts"] = (started, release)
+    coordinator = entry.runtime_data
+    pending = asyncio.create_task(coordinator.async_refresh())
+    await started.wait()
+    coordinator.stop()
+    release.set()
+    await pending
+    assert not any(
+        issue.config_entry_id == entry.entry_id
+        and issue.translation_key == "stale_automatic_account_without_data"
+        for issue in ir.async_get(hass).issues.values()
+    )
+
+
+async def test_registry_customizations_survive_typed_identity_reload(
+    hass: HomeAssistant, entry: UtilitiesConfigEntry
+) -> None:
+    registry = er.async_get(hass)
+    identity = entity_id(hass, entry, "bills")
+    before = registry.async_get(identity)
+    assert before is not None
+    registry.async_update_entity(
+        identity, name="Custom utilities label", icon="mdi:water"
+    )
+    assert await hass.config_entries.async_reload(entry.entry_id)
+    await hass.async_block_till_done(wait_background_tasks=True)
+    after = registry.async_get(identity)
+    assert after is not None
+    assert after.unique_id == before.unique_id
+    assert after.name == "Custom utilities label" and after.icon == "mdi:water"
 
 
 async def test_flow_entities_redacted_diagnostics_and_unload(
@@ -166,14 +339,21 @@ async def test_stale_automatic_accounts_have_independent_repairs(
     last_data = dt_util.utcnow() - timedelta(days=41)
     first = {
         "account_id": "example-automatic-1",
-        "name": "Example electricity",
         "last_data_at": last_data.isoformat(),
     }
     second = {
         "account_id": "example-automatic-2",
-        "name": "Example waste",
         "last_data_at": None,
     }
+    backend.accounts = [
+        {**backend.accounts[0], "id": first["account_id"]},
+        {
+            "id": second["account_id"],
+            "provider": "waste_management",
+            "connection_id": None,
+            "services": [{"id": "example-waste", "kind": "waste"}],
+        },
+    ]
     backend.responses["/v1/summary"] = json_response(
         {
             **backend.summary(),
@@ -181,7 +361,9 @@ async def test_stale_automatic_accounts_have_independent_repairs(
             "stale_automatic_accounts": [first, second],
         }
     )
+    backend.requests.clear()
     await entry.runtime_data.async_refresh()
+    await hass.async_block_till_done(wait_background_tasks=True)
     accounts = {
         issue.translation_placeholders["account"]: issue
         for issue in registry.issues.values()
@@ -189,13 +371,19 @@ async def test_stale_automatic_accounts_have_independent_repairs(
         and issue.translation_placeholders
         and "account" in issue.translation_placeholders
     }
-    assert set(accounts) == {"Example electricity", "Example waste"}
-    electricity, waste = accounts["Example electricity"], accounts["Example waste"]
+    assert set(accounts) == {
+        "Example Electric Company (Electricity)",
+        "Waste Management (Waste)",
+    }
+    electricity = accounts["Example Electric Company (Electricity)"]
+    waste = accounts["Waste Management (Waste)"]
+    assert sum(row.path == "/v1/accounts" for row in backend.requests) == 1
+    assert sum(row.path == "/v1/connections" for row in backend.requests) == 1
     assert electricity.issue_id != waste.issue_id
     assert "example-automatic" not in electricity.issue_id + waste.issue_id
     assert electricity.translation_key == "stale_automatic_account"
     assert electricity.translation_placeholders == {
-        "account": "Example electricity",
+        "account": "Example Electric Company (Electricity)",
         "last_data_date": dt_util.as_local(last_data).date().isoformat(),
     }
     assert waste.translation_key == "stale_automatic_account_without_data"
@@ -206,28 +394,30 @@ async def test_stale_automatic_accounts_have_independent_repairs(
         )
 
     ir.async_ignore_issue(hass, DOMAIN, electricity.issue_id, True)
-    renamed = "Renamed example electricity " + "e" * 200
+    backend.connections[0]["utility_name"] = "Example Electric Cooperative"
     backend.responses["/v1/summary"] = json_response(
         {
             **backend.summary(),
             "manual_accounts_stale": True,
             "stale_automatic_accounts": [
                 second,
-                {**first, "name": renamed},
+                first,
             ],
         }
     )
     await entry.runtime_data.async_refresh()
+    await hass.async_block_till_done(wait_background_tasks=True)
     dismissed = registry.async_get_issue(DOMAIN, electricity.issue_id)
     assert dismissed is not None and dismissed.dismissed_version is not None
     assert dismissed.translation_placeholders == {
-        "account": renamed,
+        "account": "Example Electric Cooperative (Electricity)",
         "last_data_date": dt_util.as_local(last_data).date().isoformat(),
     }
     assert registry.async_get_issue(DOMAIN, f"{entry.entry_id}_stale_data") is not None
 
     backend.responses["/v1/summary"] = (503, b"{}", {})
     await entry.runtime_data.async_refresh()
+    await hass.async_block_till_done(wait_background_tasks=True)
     assert registry.async_get_issue(DOMAIN, electricity.issue_id) == dismissed
     assert registry.async_get_issue(DOMAIN, waste.issue_id) is not None
 
@@ -239,6 +429,7 @@ async def test_stale_automatic_accounts_have_independent_repairs(
         }
     )
     await entry.runtime_data.async_refresh()
+    await hass.async_block_till_done(wait_background_tasks=True)
     assert registry.async_get_issue(DOMAIN, electricity.issue_id) is None
     assert registry.async_get_issue(DOMAIN, waste.issue_id) is not None
     assert await hass.config_entries.async_unload(entry.entry_id)
@@ -404,6 +595,7 @@ async def test_hosted_connections_require_admin_even_for_the_authorization_link(
     assert (await admin.post(f"{PREFIX}/connections", json=body)).status == 202
     assert json.loads(backend.requests[-1].body) == body
     for extra in [
+        {"name": "Removed freeform account label"},
         {"password": "fictional-never-forward"},
         {"accept_provider_settings": False},
         {"request_id": "invalid"},
@@ -538,7 +730,6 @@ async def test_late_refresh_cannot_recreate_unloaded_repairs(
             "stale_automatic_accounts": [
                 {
                     "account_id": "example-late-account",
-                    "name": "Example late account",
                     "last_data_at": None,
                 }
             ],

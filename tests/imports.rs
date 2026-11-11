@@ -46,9 +46,9 @@ async fn meter_records(store: &Store, account: &str) -> Vec<ImportedRecord> {
 fn request(records: serde_json::Value) -> ImportRequest {
     serde_json::from_value(json!({
         "account": {
-            "id": "fictional-water", "name": "Fictional water", "provider": "lvmwd",
+            "id": "fictional-water", "provider": "lvmwd",
             "start_on": "2025-02-01",
-            "services": [{"id": "fixture-meter", "name": "Meter", "kind": "water"}]
+            "services": [{"id": "fixture-meter", "kind": "water"}]
         },
         "currency": "USD",
         "records": records
@@ -60,7 +60,6 @@ fn api_bill_import(binding: &AccountBinding, bill: &Bill, source: &str) -> Impor
     ImportRequest {
         account: ImportAccount {
             id: binding.id.clone(),
-            name: binding.name.clone(),
             provider: serde_json::from_str("\"waste_management\"").unwrap(),
             start_on: bill.issued_on,
             provider_account_sha256: Some(digest(binding.provider_account.as_bytes())),
@@ -69,7 +68,6 @@ fn api_bill_import(binding: &AccountBinding, bill: &Bill, source: &str) -> Impor
                 .iter()
                 .map(|service| Service {
                     id: service.id.clone(),
-                    name: "Service".to_owned(),
                     kind: service.kind,
                 })
                 .collect(),
@@ -227,7 +225,6 @@ async fn a_new_manual_bayou_issuer_is_rejected_at_the_http_request_boundary() {
         Vec::new(),
         vec![Service {
             id: "fictional-energy-meter".to_owned(),
-            name: "Electricity".to_owned(),
             kind: ha_utilities::models::ServiceKind::Electricity,
         }],
     ] {
@@ -678,13 +675,11 @@ async fn unknown_intervals_project_reported_usage_and_estimate_transitions_are_a
         .unwrap();
     let account = ImportAccount {
         id: "fictional-water".to_owned(),
-        name: "Fictional water".to_owned(),
         provider: ImportProvider::Lvmwd,
         start_on: start.date_naive(),
         provider_account_sha256: None,
         services: vec![Service {
             id: "fixture-meter".to_owned(),
-            name: "Meter".to_owned(),
             kind: ServiceKind::Water,
         }],
     };
@@ -859,13 +854,11 @@ async fn replay_restores_legacy_unknown_usage_without_overwriting_actual_or_raw_
     let initial = ImportRequest {
         account: ImportAccount {
             id: "legacy-water".to_owned(),
-            name: "Legacy water".to_owned(),
             provider: ImportProvider::Lvmwd,
             start_on: start.date_naive(),
             provider_account_sha256: None,
             services: vec![Service {
                 id: "fixture-meter".to_owned(),
-                name: "Meter".to_owned(),
                 kind: ServiceKind::Water,
             }],
         },
@@ -878,7 +871,6 @@ async fn replay_restores_legacy_unknown_usage_without_overwriting_actual_or_raw_
     };
     let mut unrelated = initial.clone();
     unrelated.account.id = "other-water".to_owned();
-    unrelated.account.name = "Other water".to_owned();
     unrelated.account.services[0].id = "other-meter".to_owned();
     for record in &mut unrelated.records {
         if let ImportRecord::MeterInterval(value) = record {
@@ -990,4 +982,110 @@ async fn replay_restores_legacy_unknown_usage_without_overwriting_actual_or_raw_
         |record| matches!(&record.record, ImportRecord::MeterInterval(value)
         if value.start == start && value.quality == Quality::Estimated)
     ));
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct FinancialSnapshot {
+    records: Vec<(String, String, String, String, Option<String>, String)>,
+    revisions: Vec<(String, String, String, String, String, String)>,
+    evidence: Vec<(String, String, String, String, String)>,
+    receipts: Vec<(String, String)>,
+    documents: Vec<(String, String, Vec<u8>)>,
+    observations: Vec<(String, String, String, String)>,
+    identities: Vec<(String, String)>,
+}
+
+async fn financial_snapshot(store: &Store) -> FinancialSnapshot {
+    FinancialSnapshot {
+        records: sqlx::query_as("SELECT account_id,kind,id,revision,bill_id,payload FROM imported_records ORDER BY account_id,kind,id").fetch_all(store.pool()).await.unwrap(),
+        revisions: sqlx::query_as("SELECT account_id,kind,id,revision,facts,sources FROM imported_revisions ORDER BY account_id,kind,id,revision").fetch_all(store.pool()).await.unwrap(),
+        evidence: sqlx::query_as("SELECT deployment,digest,account_id,kind,id FROM imported_evidence ORDER BY deployment,digest,account_id,kind,id").fetch_all(store.pool()).await.unwrap(),
+        receipts: sqlx::query_as("SELECT account_id,digest FROM import_receipts ORDER BY account_id,digest").fetch_all(store.pool()).await.unwrap(),
+        documents: sqlx::query_as("SELECT deployment,digest,bytes FROM import_documents ORDER BY deployment,digest").fetch_all(store.pool()).await.unwrap(),
+        observations: sqlx::query_as("SELECT account_id,id,payload,observed_at FROM observations WHERE kind!='service' ORDER BY account_id,kind,id").fetch_all(store.pool()).await.unwrap(),
+        identities: sqlx::query_as("SELECT id,binding_hash FROM accounts ORDER BY id").fetch_all(store.pool()).await.unwrap(),
+    }
+}
+
+#[tokio::test]
+async fn identity_upgrade_preserves_financial_revisions_documents_and_receipt_replay() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("labels-and-receipts.sqlite3");
+    let store = Store::open(&path).await.unwrap();
+    let original = document(&store, b"Fictional original invoice").await;
+    let correction = document(&store, b"Fictional corrected invoice").await;
+    let bill = |amount, source, replaces| {
+        request(json!([{
+            "kind":"bill", "reference":{"kind":"invoice_number","value":"EXAMPLE-IDENTITY"},
+            "issued_on":"2025-02-20", "totals":{"new_charges_minor":amount},
+            "sources":[{"sha256":source,"role":"invoice"}], "replaces_revision":replaces
+        }]))
+    };
+    let first = bill(1000, &original, None::<&str>);
+    assert_eq!(store.import("demo", first).await.unwrap().inserted, 1);
+    let id: String = sqlx::query_scalar("SELECT id FROM imported_records WHERE kind='bill'")
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+    let revision: String =
+        sqlx::query_scalar("SELECT revision FROM imported_records WHERE kind='bill'")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+    let corrected = bill(1250, &correction, Some(revision.as_str()));
+    assert_eq!(
+        store
+            .import("demo", corrected.clone())
+            .await
+            .unwrap()
+            .corrected,
+        1
+    );
+    let binding =
+        serde_json::to_string(&store.binding("demo", "fictional-water").await.unwrap()).unwrap();
+    let before = financial_snapshot(&store).await;
+    assert_eq!(before.revisions.len(), 2);
+    assert_eq!(before.receipts.len(), 2);
+    // Reconstruct the old persisted label shape around real importer-created facts.
+    sqlx::query("ALTER TABLE utility_connections ADD COLUMN name TEXT NOT NULL DEFAULT 'Old connection label'")
+        .execute(store.pool()).await.unwrap();
+    sqlx::query("UPDATE accounts SET binding=json_set(binding,'$.name','Old account label','$.services[0].name','Old meter label')")
+        .execute(store.pool()).await.unwrap();
+    sqlx::query("DELETE FROM _sqlx_migrations WHERE version=7")
+        .execute(store.pool())
+        .await
+        .unwrap();
+    store.pool().close().await;
+
+    let upgraded = Store::open(&path).await.unwrap();
+    assert_eq!(financial_snapshot(&upgraded).await, before);
+    assert_eq!(
+        serde_json::to_string(&upgraded.binding("demo", "fictional-water").await.unwrap()).unwrap(),
+        binding
+    );
+    assert_eq!(
+        upgraded.document("demo", &original).await.unwrap(),
+        b"Fictional original invoice"
+    );
+    assert_eq!(
+        upgraded.document("demo", &correction).await.unwrap(),
+        b"Fictional corrected invoice"
+    );
+    let receipt = upgraded.import("demo", corrected).await.unwrap();
+    assert!(receipt.replayed);
+    assert_eq!(
+        receipt.inserted + receipt.corrected + receipt.evidence_added,
+        0
+    );
+    assert_eq!(financial_snapshot(&upgraded).await, before);
+    assert_eq!(
+        upgraded
+            .bill(&id, &["fictional-water".to_owned()])
+            .await
+            .unwrap()
+            .total
+            .minor_units,
+        1250
+    );
+    upgraded.pool().close().await;
 }

@@ -3,7 +3,7 @@ use ha_utilities::models::*;
 use reqwest::StatusCode;
 
 #[tokio::test]
-async fn optional_service_names_preserve_binding_identity_and_existing_bills() {
+async fn nameless_bindings_preserve_identity_and_existing_bills() {
     let app = support::App::start().await;
     let original: String =
         sqlx::query_scalar("SELECT binding_hash FROM accounts WHERE id='demo-wm'")
@@ -15,9 +15,8 @@ async fn optional_service_names_preserve_binding_identity_and_existing_bills() {
         .bill("demo-wm:bill:0", &["demo-wm".to_owned()])
         .await
         .unwrap();
-    let configuration =
-        include_str!("../config/example.toml").replace("name = \"Waste collection\", ", "");
-    let config: ha_utilities::config::Config = toml::from_str(&configuration).unwrap();
+    let configuration = include_str!("../config/example.toml");
+    let config: ha_utilities::config::Config = toml::from_str(configuration).unwrap();
     app.store.register(&config).await.unwrap();
     let updated: String =
         sqlx::query_scalar("SELECT binding_hash FROM accounts WHERE id='demo-wm'")
@@ -44,7 +43,8 @@ async fn optional_service_names_preserve_binding_identity_and_existing_bills() {
         .iter()
         .find(|account| account.id == "demo-wm")
         .unwrap();
-    assert_eq!(wm.services[0].name, "Waste");
+    assert_eq!(wm.services[0].kind, ServiceKind::Waste);
+    assert_eq!(wm.connection_id, None);
 }
 
 #[tokio::test]
@@ -84,7 +84,6 @@ async fn summary_names_only_stale_manual_accounts_and_clears_removed_accounts() 
         summary.stale_manual_accounts,
         vec![StaleManualAccount {
             account_id: stale.id.clone(),
-            name: stale.name.clone(),
             last_synced_at: Some(last_synced_at),
         }]
     );
@@ -114,19 +113,6 @@ async fn summary_names_only_stale_manual_accounts_and_clears_removed_accounts() 
 async fn real_http_auth_pagination_and_sync_outcomes() {
     let app = support::App::start().await;
     let client = reqwest::Client::new();
-    let rename = client
-        .post(format!(
-            "{}/v1/connections/fictional-connection/rename",
-            app.url
-        ))
-        .json(&ConnectionRename {
-            name: "Example utility".to_owned(),
-            expected_name: "Original label".to_owned(),
-        });
-    assert_eq!(
-        rename.send().await.unwrap().status(),
-        StatusCode::UNAUTHORIZED
-    );
     assert_eq!(
         client
             .get(format!("{}/v1/bills", app.url))
