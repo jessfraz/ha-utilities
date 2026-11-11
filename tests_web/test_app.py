@@ -466,6 +466,10 @@ async def test_imported_vendor_bills_include_construction_across_pages(
     vendor_color = await rows.locator(".account-badge").first.evaluate(
         "(badge) => getComputedStyle(badge).backgroundColor"
     )
+    await expect(
+        page.get_by_role("columnheader", name="Source status", exact=True)
+    ).to_be_visible()
+    await expect(rows.nth(1)).to_contain_text("Document imported")
     await page.get_by_role("button", name="Load more", exact=True).click()
     await expect(rows).to_have_count(27)
     await expect(rows.last).to_contain_text("Construction account")
@@ -514,6 +518,133 @@ async def test_imported_vendor_bills_include_construction_across_pages(
     await expect(
         page.get_by_role("button", name="Sync account", exact=True)
     ).to_be_disabled()
+
+
+async def test_usage_includes_billed_water_periods_and_source_documents(
+    utility_page: Page, web_backend: WebBackend
+) -> None:
+    today = datetime.now(UTC).date()
+    source = b"Fictional water billing evidence."
+    digest = sha256(source).hexdigest()
+    records = []
+    for index in range(32):
+        issued = today - timedelta(days=14 + index * 7)
+        start = issued - timedelta(days=10)
+        end = issued - timedelta(days=2)
+        records.append(
+            {
+                "kind": "bill",
+                "reference": {"kind": "invoice_number", "value": f"WATER-{index}"},
+                "issued_on": issued.isoformat(),
+                "period": {
+                    "start": start.isoformat(),
+                    "end_exclusive": end.isoformat(),
+                },
+                "totals": {"new_charges_minor": 2345},
+                "services": [
+                    {
+                        "kind": "water",
+                        "service_id": "fixture-water-meter",
+                        "billed_volume": {
+                            "value": "0"
+                            if index == 0
+                            else "12.75"
+                            if index == 31
+                            else "23.5",
+                            "unit": "cubic_meter"
+                            if index == 31
+                            else "hundred_cubic_feet",
+                        },
+                        "meter_reads": [
+                            {
+                                "on": start.isoformat(),
+                                "register": "100",
+                                "quality": "unknown",
+                            },
+                            {
+                                "on": end.isoformat(),
+                                "register": "100",
+                                "quality": "unknown",
+                            },
+                        ]
+                        if index == 0
+                        else [],
+                    }
+                ],
+                "sources": [{"sha256": digest, "role": "invoice", "pages": [1]}],
+            }
+        )
+    async with ClientSession(
+        headers={"Authorization": f"Bearer {web_backend.token}"}
+    ) as client:
+        async with client.put(
+            f"{web_backend.origin}/v1/documents/{digest}", data=source
+        ) as response:
+            response.raise_for_status()
+        async with client.post(
+            f"{web_backend.origin}/v1/imports",
+            json={
+                "account": {
+                    "id": "fixture-water",
+                    "name": "Water service",
+                    "provider": "lvmwd",
+                    "start_on": (today - timedelta(days=365)).isoformat(),
+                    "services": [
+                        {
+                            "id": "fixture-water-meter",
+                            "name": "Water meter",
+                            "kind": "water",
+                        }
+                    ],
+                },
+                "currency": "USD",
+                "records": records,
+            },
+        ) as response:
+            response.raise_for_status()
+
+    page = utility_page
+    await open_app(page, web_backend)
+    await page.get_by_role("button", name="Usage", exact=True).click()
+    billed = page.get_by_role("region", name="Billed usage", exact=True)
+    rows = billed.get_by_role("table").locator("tbody tr")
+    await expect(rows).to_have_count(32)
+    await expect(rows.first).to_contain_text("0 CCF")
+    await expect(rows.last).to_contain_text("12.75 m³")
+    await expect(rows.first).to_contain_text("Water meter")
+    start = today - timedelta(days=24)
+    through = today - timedelta(days=17)
+    await expect(rows.first.locator("td").first).to_have_text(
+        f"{start:%b} {start.day}, {start:%Y} – {through:%b} {through.day}, {through:%Y}"
+    )
+    await rows.first.get_by_role("button").click()
+    dialog = page.get_by_role("dialog", name="Bill details")
+    await expect(dialog.get_by_text("0 CCF", exact=True)).to_be_visible()
+    await expect(
+        dialog.get_by_role("table", name="Water meter readings")
+    ).to_be_visible()
+    await expect(
+        dialog.get_by_role("link", name="Invoice", exact=True)
+    ).to_have_attribute("href", f"v1/documents/{digest}")
+    await page.keyboard.press("Escape")
+    intervals = page.get_by_role("region", name="Meter intervals", exact=True)
+    await intervals.get_by_label("Service", exact=True).select_option("demo-electric")
+    await intervals.get_by_role("button", name="Apply filters", exact=True).click()
+    interval_rows = intervals.get_by_role(
+        "table", name="Usage matching the selected filters"
+    ).locator("tbody tr")
+    await expect(interval_rows).to_have_count(25)
+    await expect(interval_rows.first.locator("td").last).to_have_text("Wh")
+    await expect(rows).to_have_count(32)
+    await intervals.get_by_label("From", exact=True).fill("2100-01-01")
+    await intervals.get_by_label("To", exact=True).fill("2100-01-02")
+    await intervals.get_by_role("button", name="Apply filters", exact=True).click()
+    await expect(
+        page.get_by_role("heading", name="No meter intervals reported")
+    ).to_be_visible()
+    await expect(billed.get_by_role("table").locator("tbody tr")).to_have_count(32)
+    await page.set_viewport_size({"width": 390, "height": 844})
+    assert not await page.evaluate("document.documentElement.scrollWidth > innerWidth")
 
 
 async def test_collections_and_usage_filters_keep_units_and_report_exceptions(

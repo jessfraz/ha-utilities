@@ -13,7 +13,7 @@ const views = {
   overview: ['Overview', 'Bills and service data from your utilities.'],
   bills: ['Bills', 'Billing history, charges, and source documents.'],
   collections: ['Trash collections', 'Scheduled pickups, completion reports, and exceptions.'],
-  usage: ['Usage', 'Meter intervals, with the units and time ranges reported by the provider.'],
+  usage: ['Usage', 'Billed quantities and meter intervals from your utilities.'],
   settings: ['Settings', 'Utility connections and sync.'],
 };
 const names = {
@@ -32,6 +32,7 @@ const billingUnits = {
   hundred_cubic_feet: 'CCF', us_gallon: 'US gal', cubic_meter: 'm³', byte: 'B',
   gigabyte: 'GB', terabyte: 'TB', count: 'unit', cubic_yard: 'yd³', day: 'day', month: 'month',
 };
+const reportedQuantityNames = { billed_water: 'Billed water', propane_delivered: 'Propane delivered' };
 const sourceNames = {
   invoice: 'Invoice', statement: 'Statement', supporting: 'Supporting document',
   payment_confirmation: 'Payment confirmation', delivery_ticket: 'Delivery ticket', usage_export: 'Usage export',
@@ -454,6 +455,7 @@ async function renderView() {
   try {
     if (view === 'overview') await renderOverview(controller.signal, current);
     else if (view === 'settings') renderSettings();
+    else if (view === 'usage') await renderUsage(controller.signal, current);
     else await renderList(view, controller.signal, current);
   } catch (error) {
     if (current === generation) showError(error);
@@ -630,11 +632,10 @@ function addReportedQuantities(total, value) {
 }
 
 function reportedUsageTrend(bills) {
-  const titles = { billed_water: 'Billed water', propane_delivered: 'Propane delivered' };
   const groups = new Map();
   for (const { issued_on, reported_quantities = [] } of bills) {
     for (const { kind, quantity: { value, unit } } of reported_quantities) {
-      if (!Object.hasOwn(titles, kind)) continue;
+      if (!Object.hasOwn(reportedQuantityNames, kind)) continue;
       const key = `${kind}:${unit}`;
       if (!groups.has(key)) groups.set(key, { kind, unit, months: new Map() });
       const { months } = groups.get(key);
@@ -649,11 +650,64 @@ function reportedUsageTrend(bills) {
   const body = node('div', undefined, 'panel-body');
   body.append(node('p', 'Quantities from saved bills issued in the past year, grouped by bill issue month.', 'muted'));
   for (const { kind, unit, months } of groups.values()) {
-    body.append(node('h3', `${titles[kind]} · ${billingUnits[unit] ?? label(unit)}`),
+    body.append(node('h3', `${reportedQuantityNames[kind]} · ${billingUnits[unit] ?? label(unit)}`),
       monthlyHistory(months, (value) => quantity({ value, unit })));
   }
   section.append(body);
   return section;
+}
+
+async function renderUsage(signal, current) {
+  if (!accounts.some((account) => account.services.some((service) => ['water', 'propane'].includes(service.kind)))) {
+    await renderList('usage', signal, current);
+    return;
+  }
+  const billed = panel('Billed usage');
+  billed.classList.add('usage-panel');
+  billed.setAttribute('aria-label', 'Billed usage');
+  const reported = node('div');
+  reported.append(node('p', 'Loading billed quantities…', 'panel-empty'));
+  billed.append(reported);
+  const intervals = panel('Meter intervals');
+  intervals.setAttribute('aria-label', 'Meter intervals');
+  const intervalResults = node('div', undefined, 'panel-body');
+  intervals.append(intervalResults);
+  content.replaceChildren(billed, intervals);
+  const history = async () => {
+    try {
+      const bills = await allBindings('v1/bills', signal, { from: dateOffset(-365), to: dateOffset(0) });
+      if (current !== generation) return;
+      const { wrapper, body } = table([
+        'Billing period', 'Utility', 'Service', { text: 'Quantity', numeric: true }, 'Bill',
+      ], 'Billed usage from saved bills', 'billed-usage-table');
+      for (const bill of bills) {
+        for (const item of bill.reported_quantities ?? []) {
+          if (!Object.hasOwn(reportedQuantityNames, item.kind)) continue;
+          const row = node('tr');
+          const service = cell(reportedQuantityNames[item.kind]);
+          service.append(node('small', serviceName(item.service_id)));
+          const source = cell();
+          const open = node('button', calendarDate(bill.issued_on), 'record-button');
+          open.type = 'button';
+          open.setAttribute('aria-label', `View ${accountName(bill.account_id)} bill issued ${calendarDate(bill.issued_on)}`);
+          open.addEventListener('click', () => openBill(bill.id));
+          source.append(open);
+          const period = bill.period_from && bill.period_to
+            ? `${calendarDate(bill.period_from)} – ${calendarDate(bill.period_to)}` : 'Not reported';
+          row.append(cell(period), accountCell(bill.account_id), service, cell(quantity(item.quantity), true), source);
+          body.append(row);
+        }
+      }
+      reported.replaceChildren(body.childElementCount ? wrapper : empty('No billed usage reported', 'Saved bills issued in the past year have no reported water use or propane deliveries.'));
+      reported.append(node('p', 'Quantities from bills issued in the past year. Open a bill for its original documents.', 'section-note'));
+    } catch (error) {
+      if (current === generation && error.name !== 'AbortError') {
+        reported.replaceChildren(empty('Could not load billed usage', 'Refresh to try reading saved bills again.'));
+      }
+      throw error;
+    }
+  };
+  await Promise.all([history(), renderList('usage', signal, current, intervalResults)]);
 }
 
 function initialFilters(type) {
@@ -752,13 +806,13 @@ function serviceOptions(account, capability) {
     .flatMap((item) => item.services.map((service) => [service.id, `${service.name} · ${item.name}`]))];
 }
 
-async function renderList(type, signal, current) {
+async function renderList(type, signal, current, target = content) {
   const state = listStateFor(type);
   const filter = filterForm(type, state, () => renderView());
   const results = node('section');
   results.setAttribute('aria-label', `${label(type)} results`);
   results.append(node('p', 'Loading saved records…', 'muted'));
-  content.replaceChildren(filter, results);
+  target.replaceChildren(filter, results);
   async function page(append) {
     const query = new URLSearchParams({ limit: '25' });
     for (const [key, value] of Object.entries(state.filters)) if (value) query.set(key, value);
@@ -772,7 +826,7 @@ async function renderList(type, signal, current) {
   }
   function draw() {
     results.replaceChildren();
-    if (!state.items.length) results.append(empty(`No ${type} reported`, 'No saved records match these filters.'));
+    if (!state.items.length) results.append(empty(`No ${type === 'usage' ? 'meter intervals' : type} reported`, 'No saved records match these filters.'));
     else results.append(recordTable(type, state.items));
     const meta = node('div', undefined, 'list-meta');
     const amount = node('p', `${count(state.items.length)} ${state.items.length === 1 ? 'record' : 'records'} shown${state.next ? ' · more available' : ' · end of saved results'}`);
@@ -808,7 +862,7 @@ async function renderList(type, signal, current) {
 }
 
 function recordTable(type, items) {
-  const headers = type === 'bills' ? ['Issued', 'Account', 'Due', { text: 'Total', numeric: true }, 'Provider status']
+  const headers = type === 'bills' ? ['Issued', 'Account', 'Due', { text: 'Total', numeric: true }, 'Source status']
     : type === 'collections' ? ['Scheduled', 'Service', 'Status', 'ETA / completion', 'Exception']
     : ['Interval start', 'Interval end', 'Service', { text: 'Quantity', numeric: true }, 'Unit'];
   const { wrapper, body } = table(headers, `${label(type)} matching the selected filters`, 'data-table');
@@ -822,7 +876,7 @@ function recordTable(type, items) {
       open.setAttribute('aria-label', `View ${context ? `${name}, ${context}` : name} bill issued ${calendarDate(item.issued_on)}`);
       open.addEventListener('click', () => openBill(item.id));
       issued.append(open);
-      const providerStatus = cell(item.source_status ?? 'Not reported');
+      const providerStatus = cell(item.source_status ?? (accounts.find((account) => account.id === item.account_id)?.source.kind === 'manual_import' ? 'Document imported' : 'Not reported'));
       if (item.provider === 'bayou' && item.source_status) providerStatus.append(node('small', 'Data access status, not payment'));
       row.append(issued, accountCell(item.account_id), cell(calendarDate(item.due_on)), cell(money(item.total), true), providerStatus);
     } else if (type === 'collections') {
