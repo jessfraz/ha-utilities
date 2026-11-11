@@ -21,8 +21,143 @@ async def open_app(page: Page, backend: WebBackend) -> None:
     await expect(
         page.get_by_role("heading", name="Overview", exact=True)
     ).to_be_visible()
-    await expect(page.get_by_role("heading", name="Data coverage")).to_be_visible()
     await expect(page.locator("#content")).to_have_attribute("aria-busy", "false")
+
+
+@pytest.mark.parametrize("web_backend", ["account_cards"], indirect=True)
+async def test_settings_show_sources_categories_and_collapsed_diagnostics(
+    utility_page: Page, web_backend: WebBackend, tmp_path: Path
+) -> None:
+    source = b"Fictional statement for account display tests"
+    digest = sha256(source).hexdigest()
+    imported_accounts = [
+        {
+            "id": "fictional-water",
+            "name": "Water",
+            "provider": "lvmwd",
+            "services": [
+                {"id": "water-meter", "name": "Water", "kind": "water"},
+                {"id": "second-water-meter", "name": "Water", "kind": "water"},
+            ],
+        },
+        {
+            "id": "fictional-internet",
+            "name": "Internet (Starlink)",
+            "provider": "starlink",
+            "services": [
+                {"id": "fixed-dish", "name": "Fixed dish", "kind": "internet"},
+                {"id": "portable-dish", "name": "Portable dish", "kind": "internet"},
+            ],
+        },
+    ]
+    async with ClientSession(
+        headers={"Authorization": f"Bearer {web_backend.token}"}
+    ) as client:
+        async with client.put(
+            f"{web_backend.origin}/v1/documents/{digest}",
+            data=source,
+            headers={"Content-Type": "application/octet-stream"},
+        ) as response:
+            assert response.status == 204
+        for account in imported_accounts:
+            async with client.post(
+                f"{web_backend.origin}/v1/imports",
+                json={
+                    "account": {**account, "start_on": "2025-02-01"},
+                    "currency": "USD",
+                    "records": [
+                        {
+                            "kind": "bill",
+                            "reference": {
+                                "kind": "invoice_number",
+                                "value": account["id"],
+                            },
+                            "issued_on": "2025-02-20",
+                            "totals": {"new_charges_minor": 1000},
+                            "sources": [{"sha256": digest, "role": "invoice"}],
+                        }
+                    ],
+                },
+            ) as response:
+                assert response.status == 200, await response.text()
+
+    page = utility_page
+    await open_app(page, web_backend)
+    await expect(page.locator(".coverage-panel")).to_have_count(0)
+    for view in ("Bills", "Usage"):
+        await page.get_by_role("button", name=view, exact=True).click()
+        await expect(page.locator("#content")).to_have_attribute("aria-busy", "false")
+        await expect(page.locator(".coverage-panel")).to_have_count(0)
+    await page.get_by_role("button", name="Settings", exact=True).click()
+    await expect(
+        page.get_by_role("heading", name="Utility accounts", exact=True)
+    ).to_be_visible()
+    await expect(
+        page.get_by_role("heading", name="Bound accounts", exact=True)
+    ).to_have_count(0)
+
+    cards = page.locator(".account-grid article")
+    electricity = cards.filter(
+        has=page.get_by_role("heading", name="Electricity (SCE)", exact=True)
+    )
+    await expect(electricity.get_by_text("Bayou", exact=True)).to_have_count(1)
+    await expect(
+        electricity.get_by_role(
+            "group", name="Data source and service categories"
+        ).locator(".badge")
+    ).to_have_text(["Bayou", "Electricity"])
+    await expect(electricity.locator("li")).to_have_count(0)
+    water = cards.filter(has=page.get_by_role("heading", name="LVMWD", exact=True))
+    await expect(water.get_by_text("Manual import", exact=True)).to_have_count(1)
+    await expect(
+        water.get_by_role("group", name="Data source and service categories").locator(
+            ".badge"
+        )
+    ).to_have_text(["Manual import", "Water"])
+    await expect(water.locator("li")).to_have_count(0)
+    await expect(water.locator(".account-services")).to_have_count(0)
+    waste = cards.filter(
+        has=page.get_by_role("heading", name="Waste service", exact=True)
+    )
+    await expect(waste.get_by_text("Waste Management API", exact=True)).to_have_count(1)
+    await expect(waste.get_by_text("Waste Management", exact=True)).to_have_count(0)
+    internet = cards.filter(
+        has=page.get_by_role("heading", name="Starlink", exact=True)
+    )
+    await expect(internet.get_by_text("Manual import", exact=True)).to_have_count(1)
+    await expect(
+        internet.get_by_role(
+            "group", name="Data source and service categories"
+        ).locator(".badge")
+    ).to_have_text(["Manual import", "Internet"])
+    await expect(internet.get_by_text("Starlink", exact=True)).to_have_count(1)
+    await expect(internet.get_by_text("Fixed dish", exact=True)).to_be_hidden()
+    await expect(internet.get_by_text("Portable dish", exact=True)).to_be_hidden()
+    await page.screenshot(path=str(tmp_path / "settings-desktop.png"), full_page=True)
+    await page.emulate_media(color_scheme="dark")
+    await page.screenshot(path=str(tmp_path / "settings-dark.png"), full_page=True)
+    await page.emulate_media(color_scheme="light")
+    await internet.get_by_text("Services", exact=True).click()
+    await expect(internet.locator(".account-services .capabilities span")).to_have_text(
+        ["Fixed dish", "Portable dish"]
+    )
+    await expect(cards.locator("ul, ol, li")).to_have_count(0)
+
+    diagnostics = page.locator("details.diagnostics")
+    await expect(diagnostics).to_have_js_property("open", False)
+    await expect(page.get_by_label("Utility providers")).to_be_hidden()
+    await expect(page.get_by_role("heading", name="Data coverage")).to_be_hidden()
+    await page.set_viewport_size({"width": 390, "height": 844})
+    await page.screenshot(path=str(tmp_path / "settings-mobile.png"), full_page=True)
+    assert await page.evaluate(
+        "document.documentElement.scrollWidth <= window.innerWidth"
+    )
+    await diagnostics.get_by_text("Diagnostics", exact=True).click()
+    await expect(page.get_by_label("Utility providers")).to_be_visible()
+    await expect(page.get_by_role("heading", name="Data coverage")).to_be_visible()
+    await diagnostics.get_by_text("Diagnostics", exact=True).click()
+    await expect(page.get_by_label("Utility providers")).to_be_hidden()
+    await expect(page.get_by_role("heading", name="Data coverage")).to_be_hidden()
 
 
 @pytest.mark.parametrize("web_backend", ["bayou_only"], indirect=True)
@@ -78,9 +213,9 @@ async def test_native_sign_in_is_masked_and_uses_only_an_httponly_session(
             await expect(
                 page.get_by_role("heading", name="Overview", exact=True)
             ).to_be_visible()
-            await expect(
-                page.get_by_role("heading", name="Data coverage")
-            ).to_be_visible()
+            await expect(page.locator("#content")).to_have_attribute(
+                "aria-busy", "false"
+            )
             cookie = next(
                 cookie
                 for cookie in await page.context.cookies()
@@ -138,9 +273,9 @@ async def test_relative_assets_and_api_requests_work_behind_a_real_proxy_prefix(
                 await page.goto(origin)
                 await page.get_by_label("API token", exact=True).fill(web_backend.token)
                 await page.get_by_role("button", name="Sign in", exact=True).click()
-                await expect(
-                    page.get_by_role("heading", name="Data coverage")
-                ).to_be_visible()
+                await expect(page.locator("#content")).to_have_attribute(
+                    "aria-busy", "false"
+                )
                 await page.get_by_role("button", name="Bills", exact=True).click()
                 await expect(page.locator(".data-table tbody tr")).to_have_count(25)
                 assert all(
@@ -155,7 +290,7 @@ async def test_relative_assets_and_api_requests_work_behind_a_real_proxy_prefix(
 
 
 async def test_bills_page_filter_and_honest_read_only_detail(
-    utility_page: Page, web_backend: WebBackend
+    utility_page: Page, web_backend: WebBackend, tmp_path: Path
 ) -> None:
     """Pagination reads the real producer, and provider processing is not payment."""
     page = utility_page
@@ -164,6 +299,26 @@ async def test_bills_page_filter_and_honest_read_only_detail(
     await open_app(page, web_backend)
     await page.get_by_role("button", name="Bills", exact=True).click()
     await expect(page.locator(".data-table tbody tr")).to_have_count(25)
+    account_badges = page.locator(".data-table .account-badge")
+    energy_badges = account_badges.filter(has_text=re.compile("^Energy service$"))
+    waste_badges = account_badges.filter(has_text=re.compile("^Waste service$"))
+    await expect(energy_badges).not_to_have_count(0)
+    await expect(waste_badges).not_to_have_count(0)
+    energy_colors: list[str] = await energy_badges.evaluate_all(
+        "(badges) => badges.map((badge) => getComputedStyle(badge).backgroundColor)"
+    )
+    waste_colors: list[str] = await waste_badges.evaluate_all(
+        "(badges) => badges.map((badge) => getComputedStyle(badge).backgroundColor)"
+    )
+    assert len(set(energy_colors)) == len(set(waste_colors)) == 1
+    assert energy_colors[0] != waste_colors[0]
+    await page.screenshot(path=str(tmp_path / "bills-desktop.png"))
+    await page.emulate_media(color_scheme="dark")
+    await page.screenshot(path=str(tmp_path / "bills-dark.png"))
+    await page.emulate_media(color_scheme="light")
+    await page.set_viewport_size({"width": 390, "height": 844})
+    await page.screenshot(path=str(tmp_path / "bills-mobile.png"))
+    await page.set_viewport_size({"width": 1280, "height": 720})
     await expect(
         page.get_by_role("status").filter(has_text="25 records shown")
     ).to_be_visible()
@@ -192,6 +347,9 @@ async def test_bills_page_filter_and_honest_read_only_detail(
     first_bill = rows.first.get_by_role("button")
     await first_bill.click()
     dialog = page.get_by_role("dialog", name="Bill details")
+    await expect(dialog.locator(".account-badge")).to_have_css(
+        "background-color", energy_colors[0]
+    )
     await expect(
         dialog.get_by_text("Previous-cycle balance", exact=True)
     ).to_be_visible()
@@ -212,7 +370,7 @@ async def test_bills_page_filter_and_honest_read_only_detail(
     await page.get_by_role("button", name="Apply filters", exact=True).click()
     await expect(page.get_by_role("heading", name="No bills reported")).to_be_visible()
     await expect(
-        page.get_by_text(re.compile("not confirmation.*complete coverage"))
+        page.get_by_text("No saved records match these filters.", exact=True)
     ).to_be_visible()
     assert not [request for request in requests if request.method != "GET"]
 
@@ -305,15 +463,24 @@ async def test_imported_vendor_bills_include_construction_across_pages(
         "table", name="Bills matching the selected filters"
     ).get_by_role("row")
     await expect(rows).to_have_count(26)
+    vendor_color = await rows.locator(".account-badge").first.evaluate(
+        "(badge) => getComputedStyle(badge).backgroundColor"
+    )
     await page.get_by_role("button", name="Load more", exact=True).click()
     await expect(rows).to_have_count(27)
     await expect(rows.last).to_contain_text("Construction account")
+    await expect(rows.last.locator(".account-badge")).to_have_css(
+        "background-color", vendor_color
+    )
     await rows.last.get_by_role("button").click()
     dialog = page.get_by_role("dialog", name="Bill details")
     await expect(
         dialog.get_by_role("heading", name="Spectrum", exact=True)
     ).to_be_visible()
     await expect(dialog.get_by_text("Construction account", exact=True)).to_be_visible()
+    await expect(dialog.locator(".account-badge")).to_have_css(
+        "background-color", vendor_color
+    )
     await expect(dialog.get_by_text("Aerial construction", exact=True)).to_be_visible()
     await expect(
         dialog.get_by_role("link", name="Invoice", exact=True)
@@ -327,17 +494,21 @@ async def test_imported_vendor_bills_include_construction_across_pages(
     await expect(rows.get_by_text("Spectrum", exact=True)).to_have_count(0)
 
     await page.get_by_role("button", name="Settings", exact=True).click()
-    settings = page.get_by_role("region", name="Utility providers")
     await expect(
-        settings.get_by_role("heading", name="Spectrum", exact=True)
-    ).to_have_count(1)
-    card = settings.get_by_role("article").filter(
+        page.get_by_role("heading", name="Utility accounts", exact=True)
+    ).to_be_visible()
+    card = page.locator(".account-grid article").filter(
         has=page.get_by_role("heading", name="Spectrum", exact=True)
     )
-    await expect(card.get_by_text("Home internet", exact=True)).to_be_visible()
-    await expect(card.get_by_text("Construction account", exact=True)).to_be_visible()
+    await expect(card).to_have_count(1)
+    await expect(card.locator(".badge")).to_have_text(["Manual import", "Internet"])
+    for name in ("Home internet", "Construction account"):
+        await expect(page.get_by_role("heading", name=name, exact=True)).to_have_count(
+            0
+        )
+    await expect(page.get_by_role("region", name="Utility providers")).to_be_hidden()
     await page.set_viewport_size({"width": 390, "height": 844})
-    await expect(card.get_by_text("Construction account", exact=True)).to_be_visible()
+    await expect(card).to_be_visible()
     assert not await page.evaluate("document.documentElement.scrollWidth > innerWidth")
     await page.get_by_label("Account to sync", exact=True).select_option("demo-wm")
     await expect(
@@ -382,7 +553,7 @@ async def test_collections_and_usage_filters_keep_units_and_report_exceptions(
     await expect(
         page.get_by_role("button", name="Load more", exact=True)
     ).to_be_hidden()
-    await expect(page.get_by_role("heading", name="Data coverage")).to_be_visible()
+    await expect(page.get_by_role("heading", name="Data coverage")).to_have_count(0)
     await expect(page.locator(".list-meta [role=status]")).to_be_focused()
 
 
@@ -411,7 +582,7 @@ async def test_failed_refresh_preserves_saved_results_and_recovers(
     await expect(
         page.get_by_role("contentinfo").get_by_role("status")
     ).not_to_contain_text("connection lost")
-    await expect(page.get_by_role("heading", name="Data coverage")).to_be_visible()
+    await expect(page.locator(".metrics")).to_be_visible()
 
 
 async def test_unconfigured_sync_requires_an_explicit_account_without_sending_requests(
@@ -438,6 +609,12 @@ async def test_unconfigured_sync_requires_an_explicit_account_without_sending_re
         page.get_by_text("Waste Management credentials are not configured.", exact=True)
     ).to_be_visible()
     assert not [request for request in requests if request.method != "GET"]
+    await expect(page.get_by_text("Not configured", exact=True).first).to_be_hidden()
+    await (
+        page.locator("details.diagnostics")
+        .get_by_text("Diagnostics", exact=True)
+        .click()
+    )
     await expect(page.get_by_text("Not configured", exact=True).first).to_be_visible()
     await expect(
         page.get_by_role("button", name=re.compile("book|pay|cancel service", re.I))

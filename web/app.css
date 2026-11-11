@@ -18,6 +18,12 @@ p { line-height: 1.55; }
 .badge { display: inline-flex; align-items: center; flex-shrink: 0; border: 1px solid var(--line); padding: 5px 9px; border-radius: 4px; font-size: 11px; font-weight: 570; line-height: 1.35; background: var(--soft); }
 .badge.good { color: var(--ok); background: var(--ok-soft); border-color: transparent; }
 .badge.attention { color: var(--warning); background: var(--warning-soft); border-color: transparent; }
+.account-badge { --account-hue: 220; max-width: 100%; color: color-mix(in srgb, hsl(var(--account-hue) 65% 45%) 65%, var(--ink)); background: color-mix(in srgb, hsl(var(--account-hue) 65% 45%) 10%, var(--paper)); border-color: color-mix(in srgb, hsl(var(--account-hue) 65% 45%) 25%, var(--line)); }
+.account-color-1 { --account-hue: 270; }
+.account-color-2 { --account-hue: 180; }
+.account-color-3 { --account-hue: 40; }
+.account-color-4 { --account-hue: 145; }
+.account-color-5 { --account-hue: 330; }
 .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 160px), 1fr)); margin-bottom: 24px; border: 1px solid var(--line); border-radius: 8px; background: var(--paper); }
 .metric { min-width: 0; padding: 22px 24px; border-right: 1px solid var(--line); }
 .metric:last-child { border-right: 0; }
@@ -50,6 +56,8 @@ th { padding: 11px 16px; background: var(--soft); color: var(--muted); font-size
 td { padding: 16px; border-top: 1px solid var(--line); vertical-align: top; line-height: 1.5; }
 td strong { font-weight: 560; }
 td small { display: block; margin-top: 3px; color: var(--muted); font-size: 11px; }
+.data-table td { vertical-align: baseline; }
+.data-table td small { font-size: 12px; }
 td.numeric, th.numeric { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
 td.numeric { font-family: var(--mono); }
 .record-button { display: inline-flex; align-items: center; min-height: 44px; min-width: 44px; margin-block: -10px; padding: 0; background: transparent; color: var(--ink); font-size: inherit; font-weight: 560; border-radius: 0; text-align: left; text-decoration: underline; text-underline-offset: 4px; }
@@ -77,14 +85,12 @@ td.numeric { font-family: var(--mono); }
 .provider-grid .section-heading { padding: 0; border: 0; align-items: start; }
 .capabilities { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 14px; }
 .capabilities span { font-size: 11px; padding: 4px 7px; border-radius: 4px; background: var(--soft); color: var(--muted); }
-.imported-accounts { list-style: none; margin: 14px 0 0; padding: 0; font-size: 13px; }
-.imported-accounts li { border-top: 1px solid var(--line); padding: 10px 0; }
-.imported-accounts li:last-child { padding-bottom: 0; }
-.imported-accounts p { margin: 4px 0 0; }
 .account-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
 .account-grid article { border: 1px solid var(--line); border-radius: 6px; padding: 16px; }
 .account-grid p { margin: 0; font-size: 12px; color: var(--muted); }
-.account-grid ul { padding-left: 18px; margin: 12px 0 0; font-size: 13px; line-height: 1.8; }
+.account-services { margin-top: 12px; font-size: 13px; }
+.account-services summary { color: var(--muted); cursor: pointer; }
+.account-services .capabilities { margin-top: 8px; }
 .settings-section { margin-bottom: 24px; }
 .sync-form { display: flex; flex-wrap: wrap; gap: 12px; align-items: end; }
 .sync-form .form-field { flex: 1 1 140px; }
