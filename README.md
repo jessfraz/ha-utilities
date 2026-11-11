@@ -135,7 +135,8 @@ consolidation request returns its saved receipt. Account filters use the
 surviving ID, and existing bill URLs continue to work.
 
 To remove one imported bill, use its bill ID, original intake account ID, and
-current revision. `bills get BILL_ID --json` returns the bill and its revision.
+current revision. The native owner endpoint `GET /v1/bills/{id}/details`
+returns the current imported revision.
 
 ```sh
 fetch-home-assistant ha-utilities --transport home-assistant purge-imported-bill BILL_ID \
