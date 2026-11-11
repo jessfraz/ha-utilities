@@ -5,7 +5,7 @@ use ha_utilities::{
         BillInput, BillReference, BillTotals, ImportAccount, ImportReceipt, ImportRecord,
         ImportRequest, SourceRef, SourceRole, digest,
     },
-    models::{Bill, ListQuery, Page, ProviderId, Service, ServiceKind},
+    models::{Bill, ListQuery, Page, Service, ServiceKind},
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -142,7 +142,7 @@ async fn actual_ingest_cli_checks_every_source_then_replays_without_duplicates()
             account: ImportAccount {
                 id: "example-import-water".into(),
                 name: "Example water".into(),
-                provider: ProviderId::Lvmwd,
+                provider: ha_utilities::imports::ImportProvider::Lvmwd,
                 start_on: "2025-01-01".parse().unwrap(),
                 provider_account_sha256: None,
                 services: vec![Service {

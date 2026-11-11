@@ -174,7 +174,7 @@ fn binding() -> AccountBinding {
         provider_account: ACCOUNT_ID.to_owned(),
         services: vec![ServiceBinding {
             id: "demo-electric".to_owned(),
-            name: "Example electric".to_owned(),
+            name: Some("Example electric".to_owned()),
             provider_service: METER_ID.to_owned(),
             kind: ServiceKind::Electricity,
         }],

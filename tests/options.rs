@@ -1,7 +1,7 @@
 //! The production executable provisions Supervisor options, not a test loader.
 use ha_utilities::{
     config::{AccountBinding, Config},
-    models::{Account, Page, ProviderId, ProviderInfo},
+    models::{Account, LiveProvider, Page, ProviderInfo},
 };
 use serde::Serialize;
 use std::{
@@ -13,6 +13,122 @@ use std::{
 const WM_TOKEN: &str = "fictional-wm-token-for-options";
 const WM_CLIENT: &str = "fictional-wm-client-for-options";
 const BAYOU_KEY: &str = "fictional-bayou-key-for-options";
+
+#[tokio::test]
+async fn native_sync_failure_logs_a_fixed_stage_and_preserves_the_job_error() {
+    use ha_utilities::models::{HistoryRange, HistorySyncInput, SyncJob, SyncState};
+    let directory = tempfile::tempdir().unwrap();
+    let mut settings = Settings {
+        wm_token: String::new(),
+        wm_client_id: String::new(),
+        bayou_api_key: String::new(),
+        ..Settings::default()
+    };
+    settings.accounts[0].services[0].name = None;
+    write_settings(directory.path(), &settings);
+    let app = Running::start(directory.path()).await;
+    let accounts: Page<Account> = app.get("/v1/accounts").await;
+    let wm = accounts
+        .items
+        .iter()
+        .find(|account| account.id == "demo-wm")
+        .unwrap();
+    assert_eq!(wm.services[0].name, "Waste");
+    let response = reqwest::Client::new()
+        .post(format!("{}/v1/sync", app.origin))
+        .bearer_auth(&app.token)
+        .json(&HistorySyncInput {
+            account: "demo-wm".to_owned(),
+            range: HistoryRange::All,
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let mut job: SyncJob = response.json().await.unwrap();
+    for _ in 0..200 {
+        if job.state != SyncState::Running {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        job = app.get(&format!("/v1/sync/{}", job.id)).await;
+    }
+    assert_eq!(job.state, SyncState::Failed);
+    assert_eq!(job.error.as_deref(), Some("credentials_not_configured"));
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Event {
+        event: String,
+        provider: LiveProvider,
+        stage: String,
+        reason: String,
+    }
+    let log = std::fs::read_to_string(directory.path().join("service.log")).unwrap();
+    let events: Vec<Event> = log
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.event == "utility_sync_failed"
+                && event.provider == LiveProvider::WasteManagement
+                && event.stage == "history"
+                && event.reason == "credentials_not_configured")
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event.event == "utility_sync_failed"
+                && event.provider == LiveProvider::WasteManagement
+                && event.stage == "worker"
+                && event.reason == "credentials_not_configured")
+    );
+    assert!(!log.contains(&job.id));
+    assert!(!log.contains("demo-wm"));
+}
+
+#[test]
+fn static_company_accounts_fail_before_starting_the_service() {
+    let directory = tempfile::tempdir().unwrap();
+    let configuration = include_str!("../config/example.toml")
+        .replace("provider = \"waste_management\"", "provider = \"lvmwd\"")
+        .replace("kind = \"waste\"", "kind = \"water\"");
+    // Generic validation is also used on saved manual bindings during hosted setup.
+    let parsed: Config = toml::from_str(&configuration).unwrap();
+    parsed.validate().unwrap();
+    std::fs::write(directory.path().join("native.toml"), configuration).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_utilities"))
+        .arg("--config")
+        .arg(directory.path().join("native.toml"))
+        .arg("--database")
+        .arg(directory.path().join("utilities.sqlite3"))
+        .arg("--token-file")
+        .arg(directory.path().join("api-token"))
+        .env_remove("SUPERVISOR_TOKEN")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    for _ in 0..200 {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    if child.try_wait().unwrap().is_none() {
+        child.kill().unwrap();
+    }
+    let result = child.wait_with_output().unwrap();
+    assert!(!result.status.success());
+    assert!(
+        String::from_utf8(result.stderr)
+            .unwrap()
+            .contains("static account bindings require a live API provider")
+    );
+    assert!(!directory.path().join("utilities.sqlite3").exists());
+}
 
 #[derive(Serialize)]
 struct Settings {
@@ -132,7 +248,7 @@ async fn supervisor_options_provision_explicit_accounts_and_private_credentials(
     assert_eq!(accounts.items.len(), 2);
     let providers: Page<ProviderInfo> = running.get("/v1/providers").await;
     assert!(providers.items.iter().all(|p| p.configured));
-    assert!(providers.items.iter().any(|p| p.id == ProviderId::Bayou));
+    assert!(providers.items.iter().any(|p| p.id == LiveProvider::Bayou));
     for (name, value) in [
         ("wm-token", WM_TOKEN),
         ("wm-client-id", WM_CLIENT),

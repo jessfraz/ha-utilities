@@ -1,12 +1,12 @@
 use crate::{
     config::{AccountBinding, valid_id},
     imports::{
-        BillDetails, BillReference, ImportAccountPurge, ImportAccountPurgeReceipt, ImportError,
-        ImportReceipt, ImportRecord, ImportRequest, ImportedRecord, MAX_DOCUMENT_BYTES, Quality,
-        combined_sources, digest, valid_digest,
+        BillDetails, ImportAccountPurge, ImportAccountPurgeReceipt, ImportError, ImportReceipt,
+        ImportRecord, ImportRequest, ImportedRecord, MAX_DOCUMENT_BYTES, Quality, combined_sources,
+        digest, valid_digest,
     },
-    models::{Bill, Capability, Coverage, CoverageState, Observation, Payment, ProviderId},
-    store::{ObservationRow, Store, StoreError, connections, queries},
+    models::{Capability, Coverage, CoverageState, IngestionMode, Observation, ProviderId},
+    store::{ObservationRow, Store, StoreError, ingestion_mode, queries, require_mode},
 };
 use chrono::Utc;
 use sqlx::{QueryBuilder, Row, Sqlite, Transaction};
@@ -14,7 +14,7 @@ use std::collections::BTreeSet;
 
 pub(crate) struct ImportState {
     pub id: String,
-    pub import_only: bool,
+    pub mode: IngestionMode,
     pub imported_at: Option<chrono::DateTime<Utc>>,
 }
 
@@ -63,14 +63,32 @@ impl Store {
         .ok_or(StoreError::NotFound)
     }
 
-    pub async fn is_import_only(&self, account_id: &str) -> Result<bool, StoreError> {
-        Ok(
-            sqlx::query_scalar::<_, bool>("SELECT import_only FROM accounts WHERE id=?")
-                .bind(account_id)
-                .fetch_optional(&self.pool)
-                .await?
-                .unwrap_or(false),
-        )
+    pub(crate) async fn account_ingestion(
+        &self,
+        deployment: &str,
+        account_id: &str,
+    ) -> Result<IngestionMode, StoreError> {
+        let value = sqlx::query_scalar::<_, bool>(queries::ACCOUNT_INGESTION)
+            .bind(account_id)
+            .bind(deployment)
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or(StoreError::NotFound)?;
+        Ok(ingestion_mode(value))
+    }
+
+    pub(crate) async fn require_ingestion(
+        tx: &mut Transaction<'_, Sqlite>,
+        binding: &AccountBinding,
+        expected: IngestionMode,
+    ) -> Result<(), StoreError> {
+        let value = sqlx::query_scalar::<_, bool>(queries::ACCOUNT_INGESTION)
+            .bind(&binding.id)
+            .bind(&binding.deployment)
+            .fetch_optional(&mut **tx)
+            .await?
+            .ok_or(StoreError::NotFound)?;
+        require_mode(ingestion_mode(value), expected)
     }
 
     pub(crate) async fn import_account_ids(
@@ -183,7 +201,7 @@ impl Store {
                     .map(|time| time.with_timezone(&Utc));
                 Ok(ImportState {
                     id: row.try_get("id")?,
-                    import_only: row.try_get("import_only")?,
+                    mode: ingestion_mode(row.try_get("import_only")?),
                     imported_at,
                 })
             })
@@ -222,7 +240,7 @@ impl Store {
         canonical.sort_unstable();
         let receipt_digest = digest(&serde_json::to_vec(&(&input.currency, &canonical))?);
         let mut tx = self.pool.begin_with(queries::BEGIN_INGEST).await?;
-        let (binding, import_only) = import_binding(&mut tx, deployment, &input).await?;
+        let binding = import_binding(&mut tx, deployment, &input).await?;
         let replayed: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM import_receipts WHERE account_id=? AND digest=?)",
         )
@@ -263,11 +281,7 @@ impl Store {
         let mut capabilities = Vec::new();
         for incoming in records {
             let kind = incoming.kind();
-            let (id, bill_link) = if import_only {
-                (incoming.id(&binding.id)?, incoming.bill_link(&binding.id)?)
-            } else {
-                native_wm_record(&mut tx, &binding, &incoming).await?
-            };
+            let id = incoming.id(&binding.id)?;
             let row = sqlx::query("SELECT revision,payload FROM imported_records WHERE account_id=? AND kind=? AND id=?")
                 .bind(&binding.id).bind(kind).bind(&id).fetch_optional(&mut *tx).await?;
             let (value, facts_changed) = if let Some(row) = row {
@@ -300,11 +314,7 @@ impl Store {
                 (incoming, true)
             };
             value.validate(&input.account)?;
-            let bill_link = if import_only {
-                value.bill_link(&binding.id)?
-            } else {
-                bill_link
-            };
+            let bill_link = value.bill_link(&binding.id)?;
             let facts = serde_json::to_string(&value.facts())?;
             let revision = digest(facts.as_bytes());
             let payload = serde_json::to_string(&value)?;
@@ -320,7 +330,7 @@ impl Store {
                     .bind(deployment).bind(&source.sha256).bind(&binding.id).bind(kind).bind(&id)
                     .execute(&mut *tx).await?;
             }
-            if import_only && facts_changed {
+            if facts_changed {
                 if let Some(observation) = value.observation(&binding, &id, observed_at)? {
                     let row = ObservationRow::new(&binding, &observation)?;
                     if row.kind == "usage" {
@@ -431,14 +441,18 @@ async fn import_binding(
     tx: &mut Transaction<'_, Sqlite>,
     deployment: &str,
     input: &ImportRequest,
-) -> Result<(AccountBinding, bool), ImportError> {
+) -> Result<AccountBinding, ImportError> {
     let proposed = input.binding(deployment);
     let existing = sqlx::query("SELECT binding,import_only,import_start_on FROM accounts WHERE id=? AND deployment=? AND binding IS NOT NULL")
         .bind(&proposed.id).bind(deployment).fetch_optional(&mut **tx).await?;
     let start = input.account.start_on.to_string();
     if let Some(row) = existing {
         let current: AccountBinding = serde_json::from_str(row.try_get("binding")?)?;
-        let import_only: bool = row.try_get("import_only")?;
+        require_mode(
+            ingestion_mode(row.try_get("import_only")?),
+            IngestionMode::ManualImport,
+        )
+        .map_err(|_| ImportError::Binding)?;
         let start_on: Option<String> = row.try_get("import_start_on")?;
         if start_on
             .as_deref()
@@ -448,25 +462,12 @@ async fn import_binding(
         {
             return Err(ImportError::Binding);
         }
-        if import_only {
-            if current.provider_account != proposed.provider_account
-                || !current
-                    .services
-                    .iter()
-                    .map(|s| (&s.id, s.kind))
-                    .eq(proposed.services.iter().map(|s| (&s.id, s.kind)))
-            {
-                return Err(ImportError::Binding);
-            }
-        } else if current.provider != ProviderId::WasteManagement
-            || input.account.provider_account_sha256.as_deref()
-                != Some(&digest(current.provider_account.as_bytes()))
-            || proposed.services.iter().any(|p| {
-                !current
-                    .services
-                    .iter()
-                    .any(|c| c.id == p.id && c.kind == p.kind)
-            })
+        if current.provider_account != proposed.provider_account
+            || !current
+                .services
+                .iter()
+                .map(|s| (&s.id, s.kind))
+                .eq(proposed.services.iter().map(|s| (&s.id, s.kind)))
         {
             return Err(ImportError::Binding);
         }
@@ -477,27 +478,27 @@ async fn import_binding(
                 .execute(&mut **tx)
                 .await?;
         }
-        return Ok((current, import_only));
+        return Ok(current);
     }
-    let bindings = sqlx::query_scalar::<_, String>(connections::queries::BINDINGS)
+    let bindings = sqlx::query("SELECT binding,import_only FROM accounts WHERE deployment=? AND binding IS NOT NULL ORDER BY id LIMIT 101")
         .bind(deployment)
         .fetch_all(&mut **tx)
         .await?;
     if bindings.len() >= 100 {
         return Err(ImportError::Binding);
     }
-    for existing in bindings {
-        let existing: AccountBinding = serde_json::from_str(&existing)?;
+    for row in bindings {
+        let existing: AccountBinding = serde_json::from_str(row.try_get("binding")?)?;
+        let mode = ingestion_mode(row.try_get("import_only")?);
         if existing
             .services
             .iter()
             .any(|s| proposed.services.iter().any(|p| p.id == s.id))
             || (existing.provider == proposed.provider
                 && (existing.provider_account == proposed.provider_account
-                    || (existing.provider == ProviderId::WasteManagement
-                        && (input.account.provider_account_sha256.is_none()
-                            || digest(existing.provider_account.as_bytes())
-                                == proposed.provider_account))))
+                    || digest(existing.provider_account.as_bytes()) == proposed.provider_account
+                    || (mode == IngestionMode::Live
+                        && input.account.provider_account_sha256.is_none())))
         {
             return Err(ImportError::Binding);
         }
@@ -513,65 +514,5 @@ async fn import_binding(
         .bind(&proposed.id)
         .execute(&mut **tx)
         .await?;
-    Ok((proposed, true))
-}
-
-async fn native_wm_record(
-    tx: &mut Transaction<'_, Sqlite>,
-    binding: &AccountBinding,
-    record: &ImportRecord,
-) -> Result<(String, Option<String>), ImportError> {
-    let lookup = |invoice: &str| format!("{}:bill:{invoice}", binding.id);
-    let load = "SELECT payload FROM observations WHERE account_id=? AND kind=? AND id=?";
-    match record {
-        ImportRecord::Bill(value) => {
-            let BillReference::InvoiceNumber(invoice) = &value.reference else {
-                return Err(ImportError::Conflict);
-            };
-            let id = lookup(invoice);
-            let json: String = sqlx::query_scalar(load)
-                .bind(&binding.id)
-                .bind("bill")
-                .bind(&id)
-                .fetch_optional(&mut **tx)
-                .await?
-                .ok_or(ImportError::Conflict)?;
-            let bill: Bill = serde_json::from_str(&json)?;
-            if bill.issued_on != value.issued_on
-                || value.totals.new_charges_minor != Some(bill.total.minor_units)
-            {
-                return Err(ImportError::Conflict);
-            }
-            Ok((id, None))
-        }
-        ImportRecord::Payment(value) => {
-            let Some(BillReference::InvoiceNumber(invoice)) = &value.bill else {
-                return Err(ImportError::Conflict);
-            };
-            let bill_id = lookup(invoice);
-            let id = crate::utility::waste_management::payment_id(
-                &binding.id,
-                &bill_id,
-                value.paid_on,
-                value.amount_minor,
-                &value.reference,
-            );
-            let json: String = sqlx::query_scalar(load)
-                .bind(&binding.id)
-                .bind("payment")
-                .bind(&id)
-                .fetch_optional(&mut **tx)
-                .await?
-                .ok_or(ImportError::Conflict)?;
-            let payment: Payment = serde_json::from_str(&json)?;
-            if payment.bill_id.as_deref() != Some(&bill_id)
-                || payment.paid_on != value.paid_on
-                || payment.amount.minor_units != value.amount_minor
-            {
-                return Err(ImportError::Conflict);
-            }
-            Ok((id, Some(bill_id)))
-        }
-        _ => Err(ImportError::Conflict),
-    }
+    Ok(proposed)
 }

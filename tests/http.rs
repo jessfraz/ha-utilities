@@ -3,6 +3,52 @@ use ha_utilities::models::*;
 use reqwest::StatusCode;
 
 #[tokio::test]
+async fn optional_service_names_preserve_binding_identity_and_existing_bills() {
+    let app = support::App::start().await;
+    let original: String =
+        sqlx::query_scalar("SELECT binding_hash FROM accounts WHERE id='demo-wm'")
+            .fetch_one(app.store.pool())
+            .await
+            .unwrap();
+    let bill = app
+        .store
+        .bill("demo-wm:bill:0", &["demo-wm".to_owned()])
+        .await
+        .unwrap();
+    let configuration =
+        include_str!("../config/example.toml").replace("name = \"Waste collection\", ", "");
+    let config: ha_utilities::config::Config = toml::from_str(&configuration).unwrap();
+    app.store.register(&config).await.unwrap();
+    let updated: String =
+        sqlx::query_scalar("SELECT binding_hash FROM accounts WHERE id='demo-wm'")
+            .fetch_one(app.store.pool())
+            .await
+            .unwrap();
+    assert_eq!(updated, original);
+    assert_eq!(
+        app.store
+            .bill(&bill.id, &["demo-wm".to_owned()])
+            .await
+            .unwrap(),
+        bill
+    );
+    let client = ha_utilities::client::Client::new(
+        &app.url,
+        ha_utilities::client::Transport::Native,
+        support::TOKEN,
+    )
+    .unwrap();
+    let accounts = client.accounts().await.unwrap();
+    let wm = accounts
+        .items
+        .iter()
+        .find(|account| account.id == "demo-wm")
+        .unwrap();
+    assert_eq!(wm.services[0].name, "Waste");
+    app.close().await;
+}
+
+#[tokio::test]
 async fn real_http_auth_pagination_and_sync_outcomes() {
     let app = support::App::start().await;
     let client = reqwest::Client::new();

@@ -76,7 +76,7 @@ impl Store {
     }
 
     pub async fn register(&self, config: &Config) -> anyhow::Result<()> {
-        config.validate()?;
+        config.validate_static_accounts()?;
         let mut tx = self.pool.begin().await?;
         // Configuration still owns manual bindings. Retain their observations,
         // but stop exposing a removed manual account. UI connections stay owned
@@ -157,6 +157,7 @@ impl Store {
         // Reserve the SQLite writer before overlap reads. A deferred transaction
         // cannot upgrade a WAL snapshot after concurrent sync admission commits.
         let mut tx = self.pool.begin_with(queries::BEGIN_INGEST).await?;
+        Self::require_ingestion(&mut tx, binding, IngestionMode::Live).await?;
         let mut newest_source = None;
         for observation in &page.observations {
             let row = ObservationRow::new(binding, observation)?;
@@ -316,11 +317,14 @@ impl Store {
         let states = self.import_states(accounts).await?;
         let native = states
             .iter()
-            .filter(|state| !state.import_only)
+            .filter(|state| state.mode == IngestionMode::Live)
             .map(|state| state.id.clone())
             .collect::<Vec<_>>();
         summary.last_imported_at = states.iter().filter_map(|state| state.imported_at).max();
-        summary.import_only_accounts = states.iter().filter(|state| state.import_only).count();
+        summary.import_only_accounts = states
+            .iter()
+            .filter(|state| state.mode == IngestionMode::ManualImport)
+            .count();
         let (last, stale) = if native.is_empty() {
             (None, summary.last_imported_at.is_none())
         } else {
@@ -526,6 +530,24 @@ impl Store {
     }
 }
 
+fn ingestion_mode(import_only: bool) -> IngestionMode {
+    if import_only {
+        IngestionMode::ManualImport
+    } else {
+        IngestionMode::Live
+    }
+}
+
+pub(crate) fn require_mode(
+    actual: IngestionMode,
+    expected: IngestionMode,
+) -> Result<(), StoreError> {
+    if actual != expected {
+        return Err(StoreError::InvalidObservation);
+    }
+    Ok(())
+}
+
 fn source_time(observation: &Observation) -> Option<DateTime<Utc>> {
     let midnight = |day: NaiveDate| day.and_hms_opt(0, 0, 0).map(|date| date.and_utc());
     match observation {
@@ -729,6 +751,8 @@ impl<'a> ObservationRow<'a> {
 
 mod queries {
     pub const BEGIN_INGEST: &str = "BEGIN IMMEDIATE";
+    pub const ACCOUNT_INGESTION: &str =
+        "SELECT import_only FROM accounts WHERE id=? AND deployment=? AND binding IS NOT NULL";
     pub const ADVANCE_JOB: &str = "UPDATE sync_jobs SET observations=observations+? WHERE id=? AND account_id=? AND state='running'";
     pub const REGISTER: &str =
         "INSERT INTO accounts(id,binding_hash) VALUES(?,?) ON CONFLICT(id) DO NOTHING";

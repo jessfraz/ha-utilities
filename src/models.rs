@@ -28,6 +28,61 @@ impl ProviderId {
     }
 }
 
+/// API adapters are separate from the issuer identifiers retained on old records.
+#[derive(JsonSchema, Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LiveProvider {
+    WasteManagement,
+    Bayou,
+}
+
+impl LiveProvider {
+    pub const fn issuer(self) -> ProviderId {
+        match self {
+            Self::WasteManagement => ProviderId::WasteManagement,
+            Self::Bayou => ProviderId::Bayou,
+        }
+    }
+
+    pub const fn name(self) -> &'static str {
+        self.issuer().name()
+    }
+}
+
+impl TryFrom<ProviderId> for LiveProvider {
+    type Error = ();
+
+    fn try_from(provider: ProviderId) -> Result<Self, Self::Error> {
+        match provider {
+            ProviderId::WasteManagement => Ok(Self::WasteManagement),
+            ProviderId::Bayou => Ok(Self::Bayou),
+            _ => Err(()),
+        }
+    }
+}
+
+#[derive(JsonSchema, Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", content = "provider", rename_all = "snake_case")]
+pub enum AccountSource {
+    ManualImport,
+    Live(LiveProvider),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IngestionMode {
+    ManualImport,
+    Live,
+}
+
+impl IngestionMode {
+    pub(crate) fn source(self, issuer: ProviderId) -> Option<AccountSource> {
+        match self {
+            Self::ManualImport => Some(AccountSource::ManualImport),
+            Self::Live => LiveProvider::try_from(issuer).ok().map(AccountSource::Live),
+        }
+    }
+}
+
 #[derive(JsonSchema, Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Capability {
@@ -41,7 +96,7 @@ pub enum Capability {
 
 #[derive(JsonSchema, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ProviderInfo {
-    pub id: ProviderId,
+    pub id: LiveProvider,
     pub name: String,
     pub capabilities: Vec<Capability>,
     pub configured: bool,
@@ -60,14 +115,28 @@ pub enum ServiceKind {
     Other,
 }
 
+impl ServiceKind {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Waste => "Waste",
+            Self::Recycling => "Recycling",
+            Self::Electricity => "Electricity",
+            Self::Gas => "Gas",
+            Self::Water => "Water",
+            Self::Propane => "Propane",
+            Self::Internet => "Internet",
+            Self::Other => "Other",
+        }
+    }
+}
+
 #[derive(JsonSchema, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Account {
     pub id: String,
     pub name: String,
     pub provider: ProviderId,
     pub services: Vec<Service>,
-    #[serde(default)]
-    pub import_only: bool,
+    pub source: AccountSource,
 }
 
 #[derive(JsonSchema, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -215,6 +284,7 @@ pub struct ConnectionAuthorization {
 #[derive(JsonSchema, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Service {
     pub id: String,
+    #[serde(default)]
     pub name: String,
     pub kind: ServiceKind,
 }

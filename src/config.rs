@@ -1,5 +1,5 @@
 //! Manual deployment/account/service bindings and private provider credentials.
-use crate::models::{Account, ProviderId, Service, ServiceKind};
+use crate::models::{LiveProvider, ProviderId, ServiceKind};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
@@ -47,9 +47,16 @@ pub struct AccountBinding {
 #[serde(deny_unknown_fields)]
 pub struct ServiceBinding {
     pub id: String,
-    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     pub provider_service: String,
     pub kind: ServiceKind,
+}
+
+impl ServiceBinding {
+    pub fn name(&self) -> &str {
+        self.name.as_deref().unwrap_or(self.kind.name())
+    }
 }
 
 #[derive(Clone, Deserialize)]
@@ -151,7 +158,7 @@ impl Config {
             }),
         };
         // Reject invalid or ambiguous bindings before writing any credential.
-        config.validate()?;
+        config.validate_static_accounts()?;
         private_directory(&secrets)?;
         for (name, value) in [
             ("wm-token", wm_token),
@@ -187,7 +194,7 @@ impl Config {
                 bayou: None,
             }
         };
-        config.validate()?;
+        config.validate_static_accounts()?;
         Ok(config)
     }
 
@@ -252,7 +259,10 @@ impl Config {
                 );
                 anyhow::ensure!(
                     !service.provider_service.trim().is_empty()
-                        && !service.name.trim().is_empty()
+                        && service
+                            .name
+                            .as_ref()
+                            .is_none_or(|name| !name.trim().is_empty())
                         && provider_services.insert(&service.provider_service),
                     "service binding must be explicit and unique"
                 );
@@ -261,25 +271,15 @@ impl Config {
         Ok(())
     }
 
-    pub fn public_accounts(&self) -> Vec<Account> {
-        self.accounts
-            .iter()
-            .map(|a| Account {
-                id: a.id.clone(),
-                name: a.name.clone(),
-                provider: a.provider,
-                import_only: false,
-                services: a
-                    .services
-                    .iter()
-                    .map(|s| Service {
-                        id: s.id.clone(),
-                        name: s.name.clone(),
-                        kind: s.kind,
-                    })
-                    .collect(),
-            })
-            .collect()
+    pub(crate) fn validate_static_accounts(&self) -> anyhow::Result<()> {
+        self.validate()?;
+        anyhow::ensure!(
+            self.accounts
+                .iter()
+                .all(|account| LiveProvider::try_from(account.provider).is_ok()),
+            "static account bindings require a live API provider; manual accounts must be imported"
+        );
+        Ok(())
     }
 }
 

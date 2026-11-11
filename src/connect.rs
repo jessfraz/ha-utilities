@@ -349,7 +349,7 @@ impl ConnectionHandle {
                     .ok_or(ConnectionError::InvalidInput)?;
                 services.push(ServiceBinding {
                     id: local_id("meter", &[id, &account.id, &meter.id]),
-                    name: {
+                    name: Some({
                         let kind = match meter.kind {
                             ServiceKind::Electricity => "Electricity",
                             ServiceKind::Gas => "Gas",
@@ -360,7 +360,7 @@ impl ConnectionHandle {
                         } else {
                             kind.to_owned()
                         }
-                    },
+                    }),
                     provider_service: meter.id.clone(),
                     kind: meter.kind,
                 });

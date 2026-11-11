@@ -43,11 +43,34 @@ pub struct ImportRequest {
 pub struct ImportAccount {
     pub id: String,
     pub name: String,
-    pub provider: ProviderId,
+    pub provider: ImportProvider,
     pub start_on: NaiveDate,
     #[serde(default)]
     pub provider_account_sha256: Option<String>,
     pub services: Vec<Service>,
+}
+
+/// A manual statement names its issuer, never an API adapter.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ImportProvider {
+    WasteManagement,
+    Lvmwd,
+    SuperiorPropane,
+    Starlink,
+    Spectrum,
+}
+
+impl ImportProvider {
+    pub const fn issuer(self) -> ProviderId {
+        match self {
+            Self::WasteManagement => ProviderId::WasteManagement,
+            Self::Lvmwd => ProviderId::Lvmwd,
+            Self::SuperiorPropane => ProviderId::SuperiorPropane,
+            Self::Starlink => ProviderId::Starlink,
+            Self::Spectrum => ProviderId::Spectrum,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
@@ -106,10 +129,10 @@ impl BillReference {
         }
     }
 
-    fn valid(&self, provider: ProviderId) -> bool {
+    fn valid(&self, provider: ImportProvider) -> bool {
         match self {
             Self::StatementCycle(cycle) => {
-                provider == ProviderId::Spectrum
+                provider == ImportProvider::Spectrum
                     && NaiveDate::parse_from_str(&format!("{cycle}-01"), "%Y-%m-%d")
                         .is_ok_and(|date| date.format("%Y-%m").to_string() == *cycle)
             }
@@ -402,15 +425,14 @@ fn text(value: &str, max: usize) -> bool {
         && !value.chars().any(char::is_control)
 }
 
-fn service_matches(provider: ProviderId, service: ServiceKind) -> bool {
+fn service_matches(provider: ImportProvider, service: ServiceKind) -> bool {
     match provider {
-        ProviderId::Lvmwd => service == ServiceKind::Water,
-        ProviderId::SuperiorPropane => service == ServiceKind::Propane,
-        ProviderId::Starlink | ProviderId::Spectrum => service == ServiceKind::Internet,
-        ProviderId::WasteManagement => {
+        ImportProvider::Lvmwd => service == ServiceKind::Water,
+        ImportProvider::SuperiorPropane => service == ServiceKind::Propane,
+        ImportProvider::Starlink | ImportProvider::Spectrum => service == ServiceKind::Internet,
+        ImportProvider::WasteManagement => {
             matches!(service, ServiceKind::Waste | ServiceKind::Recycling)
         }
-        ProviderId::Bayou => false,
     }
 }
 
@@ -420,7 +442,6 @@ impl ImportRequest {
         let mut service_ids = BTreeSet::new();
         if !valid_id(&account.id)
             || !text(&account.name, 100)
-            || account.provider == ProviderId::Bayou
             || account
                 .provider_account_sha256
                 .as_deref()
@@ -431,7 +452,7 @@ impl ImportRequest {
             || self.records.len() > 200
             || account.services.iter().any(|s| {
                 !valid_id(&s.id)
-                    || !text(&s.name, 100)
+                    || (!s.name.is_empty() && !text(&s.name, 100))
                     || !service_matches(account.provider, s.kind)
                     || !service_ids.insert(&s.id)
             })
@@ -461,7 +482,7 @@ impl ImportRequest {
             .iter()
             .map(|service| ServiceBinding {
                 id: service.id.clone(),
-                name: service.name.clone(),
+                name: (!service.name.is_empty()).then(|| service.name.clone()),
                 provider_service: service.id.clone(),
                 kind: service.kind,
             })
@@ -471,7 +492,7 @@ impl ImportRequest {
             id: account.id.clone(),
             name: account.name.clone(),
             deployment: deployment.to_owned(),
-            provider: account.provider,
+            provider: account.provider.issuer(),
             customer_id: "document_import".to_owned(),
             provider_account: account
                 .provider_account_sha256

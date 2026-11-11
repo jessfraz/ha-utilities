@@ -275,24 +275,8 @@ async fn providers(
         .await
         .map_err(store_error)?;
     let allowed: Vec<_> = bindings.iter().map(|account| account.id.clone()).collect();
-    let mut providers = context.providers.info();
-    for binding in &bindings {
-        if !providers.iter().any(|item| item.id == binding.provider) {
-            providers.push(ProviderInfo {
-                id: binding.provider,
-                name: binding.provider.name().to_owned(),
-                capabilities: vec![
-                    Capability::Bills,
-                    Capability::Payments,
-                    Capability::Balances,
-                    Capability::Usage,
-                ],
-                configured: false,
-            });
-        }
-    }
     Ok(private(Page {
-        items: providers,
+        items: context.providers.info(),
         next_page: None,
         coverage: request
             .context()
@@ -310,15 +294,14 @@ async fn accounts(
     request: RequestContext<Arc<Context>>,
 ) -> Result<PrivateOk<Page<Account>>, HttpError> {
     authorized(&request)?;
-    let mut current = request.context().config.as_ref().clone();
-    current.accounts = request
+    let context = request.context();
+    let bindings = request
         .context()
         .store
-        .bindings(&current.deployment)
+        .bindings(&context.config.deployment)
         .await
         .map_err(store_error)?;
-    let allowed = current
-        .accounts
+    let allowed = bindings
         .iter()
         .map(|account| account.id.clone())
         .collect::<Vec<_>>();
@@ -328,12 +311,31 @@ async fn accounts(
         .import_states(&allowed)
         .await
         .map_err(store_error)?;
-    let mut items = current.public_accounts();
-    for item in &mut items {
-        item.import_only = import_states
-            .iter()
-            .any(|state| state.id == item.id && state.import_only);
-    }
+    let items = bindings
+        .iter()
+        .map(|binding| {
+            let source = import_states
+                .iter()
+                .find(|state| state.id == binding.id)
+                .and_then(|state| state.mode.source(binding.provider))
+                .ok_or_else(|| store_error(StoreError::InvalidObservation))?;
+            Ok(Account {
+                id: binding.id.clone(),
+                name: binding.name.clone(),
+                provider: binding.provider,
+                source,
+                services: binding
+                    .services
+                    .iter()
+                    .map(|service| Service {
+                        id: service.id.clone(),
+                        name: service.name().to_owned(),
+                        kind: service.kind,
+                    })
+                    .collect(),
+            })
+        })
+        .collect::<Result<Vec<_>, HttpError>>()?;
     Ok(private(Page {
         items,
         next_page: None,
@@ -550,7 +552,7 @@ async fn summary(request: RequestContext<Arc<Context>>) -> Result<PrivateOk<Summ
             .await
             .map_err(store_error)?
             .into_iter()
-            .filter_map(|account| (!account.import_only).then_some(account.id))
+            .filter_map(|account| (account.mode == IngestionMode::Live).then_some(account.id))
             .collect::<Vec<_>>()
     };
     summary.manual_accounts_stale = !manual.is_empty()
