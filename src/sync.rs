@@ -2,10 +2,10 @@
 use crate::{
     config::Config,
     models::*,
-    store::{Store, StoreError},
+    store::{Store, StoreError, require_mode},
     utility::{
-        HistoryRequest, SyncRequest, Utility, UtilityError, bayou::Bayou,
-        waste_management::WasteManagement,
+        HistoryRequest, SyncRequest, SyncStage, Utility, UtilityError, bayou::Bayou,
+        report_failure, report_terminal_failure, waste_management::WasteManagement,
     },
 };
 use chrono::{Days, NaiveDate, Utc};
@@ -26,6 +26,12 @@ enum Adapter {
     Bayou(Bayou),
 }
 impl Adapter {
+    fn provider(&self) -> LiveProvider {
+        match self {
+            Self::Wm(adapter) => adapter.provider(),
+            Self::Bayou(adapter) => adapter.provider(),
+        }
+    }
     async fn sync(&self, request: SyncRequest) -> Result<crate::utility::SyncPage, UtilityError> {
         match self {
             Self::Wm(adapter) => adapter.sync(request).await,
@@ -61,15 +67,18 @@ impl Providers {
             bayou: bayou.map(Adapter::Bayou),
         }
     }
-    fn get(&self, provider: ProviderId) -> Option<&Adapter> {
-        match provider {
-            ProviderId::WasteManagement => self.wm.as_ref(),
-            ProviderId::Bayou => self.bayou.as_ref(),
-            _ => None,
-        }
+    fn get(&self, provider: LiveProvider) -> Option<&Adapter> {
+        let adapter = match provider {
+            LiveProvider::WasteManagement => self.wm.as_ref(),
+            LiveProvider::Bayou => self.bayou.as_ref(),
+        };
+        adapter.filter(|adapter| adapter.provider() == provider)
     }
     pub(crate) fn configured(&self, provider: ProviderId) -> bool {
-        self.get(provider).is_some()
+        LiveProvider::try_from(provider)
+            .ok()
+            .and_then(|provider| self.get(provider))
+            .is_some()
     }
     pub(crate) fn bayou(&self) -> Option<&Bayou> {
         match self.bayou.as_ref() {
@@ -81,13 +90,15 @@ impl Providers {
         &self,
         binding: &crate::config::AccountBinding,
     ) -> Vec<Coverage> {
-        let adapter = self.get(binding.provider);
+        let adapter = LiveProvider::try_from(binding.provider)
+            .ok()
+            .and_then(|provider| self.get(provider));
         let info = self.info();
         ALL.iter()
             .map(|capability| {
                 let supported = info
                     .iter()
-                    .find(|provider| provider.id == binding.provider)
+                    .find(|provider| provider.id.issuer() == binding.provider)
                     .is_some_and(|provider| provider.capabilities.contains(capability));
                 Coverage {
                     account_id: binding.id.clone(),
@@ -117,15 +128,14 @@ impl Providers {
             .collect()
     }
     pub fn info(&self) -> Vec<ProviderInfo> {
-        [ProviderId::WasteManagement, ProviderId::Bayou]
+        [LiveProvider::WasteManagement, LiveProvider::Bayou]
             .into_iter()
             .map(|id| ProviderInfo {
                 id,
                 name: id.name().to_owned(),
                 capabilities: match id {
-                    ProviderId::WasteManagement => crate::utility::waste_management::CAPABILITIES,
-                    ProviderId::Bayou => crate::utility::bayou::CAPABILITIES,
-                    _ => &[],
+                    LiveProvider::WasteManagement => crate::utility::waste_management::CAPABILITIES,
+                    LiveProvider::Bayou => crate::utility::bayou::CAPABILITIES,
                 }
                 .to_vec(),
                 configured: self.get(id).is_some(),
@@ -183,9 +193,13 @@ impl SyncHandle {
                     error
                 }
             })?;
-        if self.store.is_import_only(account).await? {
-            return Err(StoreError::InvalidQuery);
-        }
+        require_mode(
+            self.store
+                .account_ingestion(&self.config.deployment, account)
+                .await?,
+            IngestionMode::Live,
+        )
+        .map_err(|_| StoreError::InvalidQuery)?;
         let job = self.store.start_job(account).await?;
         self.enqueue(job, range).await
     }
@@ -245,7 +259,11 @@ impl SyncWorker {
         let mut initial = Vec::new();
         let bindings = store.bindings(&config.deployment).await?;
         for account in &bindings {
-            if store.is_import_only(&account.id).await? {
+            if store
+                .account_ingestion(&config.deployment, &account.id)
+                .await?
+                != IngestionMode::Live
+            {
                 continue;
             }
             for coverage in providers.initial_coverage(account) {
@@ -357,10 +375,23 @@ impl SyncWorker {
             .binding(&self.config.deployment, &job.account_id)
             .await
             .map_err(|_| "binding_mismatch")?;
-        let adapter = self
-            .providers
-            .get(binding.provider)
-            .ok_or("credentials_not_configured")?;
+        require_mode(
+            self.store
+                .account_ingestion(&self.config.deployment, &binding.id)
+                .await
+                .map_err(|_| "binding_mismatch")?,
+            IngestionMode::Live,
+        )
+        .map_err(|_| "binding_mismatch")?;
+        let provider = LiveProvider::try_from(binding.provider).map_err(|_| "binding_mismatch")?;
+        let stage = match range {
+            SyncRange::Dates { .. } => SyncStage::DateRange,
+            SyncRange::AllHistory => SyncStage::History,
+        };
+        let adapter = self.providers.get(provider).ok_or_else(|| {
+            report_failure(provider, stage, &UtilityError::NotConfigured);
+            "credentials_not_configured"
+        })?;
         let mut continuation = None;
         let mut seen = std::collections::HashSet::new();
         let observed_at = Utc::now();
@@ -389,7 +420,10 @@ impl SyncWorker {
                         .await
                 }
             }
-            .map_err(error_code)?;
+            .map_err(|error| {
+                report_failure(provider, stage, &error);
+                error.code()
+            })?;
             if page.observations.len() > 20_000 {
                 return Err("invalid_response");
             }
@@ -444,8 +478,17 @@ impl SyncWorker {
         Err("sync_page_budget_exceeded")
     }
 
-    async fn fail(&self, job: &SyncJob, reason: &str, interrupted: bool) -> Result<(), StoreError> {
-        let progress = self.store.job(&job.id).await?;
+    async fn fail(
+        &self,
+        job: &SyncJob,
+        reason: &'static str,
+        interrupted: bool,
+    ) -> Result<(), StoreError> {
+        let progress = self
+            .store
+            .job(&job.id)
+            .await
+            .inspect_err(|_| report_terminal_failure(None, reason))?;
         // Shutdown can win the select after the final transaction committed.
         if progress.state != SyncState::Running {
             return Ok(());
@@ -453,12 +496,18 @@ impl SyncWorker {
         let account = self
             .store
             .binding(&self.config.deployment, &job.account_id)
-            .await?;
+            .await;
+        let provider = account
+            .as_ref()
+            .ok()
+            .and_then(|binding| LiveProvider::try_from(binding.provider).ok());
+        report_terminal_failure(provider, reason);
+        let account = account?;
         let capabilities = self
             .providers
             .info()
             .into_iter()
-            .find(|p| p.id == account.provider)
+            .find(|p| p.id.issuer() == account.provider)
             .ok_or(StoreError::InvalidObservation)?
             .capabilities;
         self.store
@@ -493,20 +542,6 @@ impl SyncWorker {
                 Some(reason),
             )
             .await
-    }
-}
-
-fn error_code(error: UtilityError) -> &'static str {
-    match error {
-        UtilityError::NotConfigured => "credentials_not_configured",
-        UtilityError::Authentication => "authentication_required",
-        UtilityError::AccessDenied => "access_denied",
-        UtilityError::RateLimited => "rate_limited",
-        UtilityError::Unavailable => "provider_unavailable",
-        UtilityError::HistoryPreparing => "provider_preparing_history",
-        UtilityError::InvalidResponse => "invalid_response",
-        UtilityError::BindingMismatch => "binding_mismatch",
-        UtilityError::InvalidContinuation => "invalid_continuation",
     }
 }
 
@@ -713,7 +748,7 @@ mod tests {
                     provider_account: PROVIDER_ACCOUNT.to_owned(),
                     services: vec![ServiceBinding {
                         id: "demo-electric".to_owned(),
-                        name: "Electricity".to_owned(),
+                        name: Some("Electricity".to_owned()),
                         provider_service: METER.to_owned(),
                         kind: ServiceKind::Electricity,
                     }],

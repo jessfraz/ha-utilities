@@ -2,9 +2,17 @@ mod support;
 
 use ha_utilities::{
     client::{Client, Transport},
-    imports::{ImportAccountPurge, ImportAccountPurgeReceipt, ImportError, ImportRequest, digest},
-    models::{Bill, ListQuery, Page, ProviderId, Summary, SyncJob, SyncState},
-    store::Store,
+    config::AccountBinding,
+    imports::{
+        BillInput, BillReference, BillScope, BillTotals, ImportAccount, ImportAccountPurge,
+        ImportAccountPurgeReceipt, ImportError, ImportRecord, ImportRequest, SourceRef, SourceRole,
+        digest,
+    },
+    models::{
+        Bill, ListQuery, Observation, Page, ProviderId, Service, Summary, SyncJob, SyncState,
+    },
+    store::{Store, StoreError},
+    utility::SyncPage,
 };
 use serde_json::json;
 
@@ -25,6 +33,260 @@ fn request(records: serde_json::Value) -> ImportRequest {
         "records": records
     }))
     .unwrap()
+}
+
+fn api_bill_import(binding: &AccountBinding, bill: &Bill, source: &str) -> ImportRequest {
+    ImportRequest {
+        account: ImportAccount {
+            id: binding.id.clone(),
+            name: binding.name.clone(),
+            provider: serde_json::from_str("\"waste_management\"").unwrap(),
+            start_on: bill.issued_on,
+            provider_account_sha256: Some(digest(binding.provider_account.as_bytes())),
+            services: binding
+                .services
+                .iter()
+                .map(|service| Service {
+                    id: service.id.clone(),
+                    name: "Service".to_owned(),
+                    kind: service.kind,
+                })
+                .collect(),
+        },
+        currency: binding.currency.clone(),
+        records: vec![ImportRecord::Bill(BillInput {
+            reference: BillReference::InvoiceNumber("0".to_owned()),
+            scope: BillScope::Account,
+            issued_on: bill.issued_on,
+            due_on: bill.due_on,
+            period: None,
+            totals: BillTotals {
+                new_charges_minor: Some(bill.total.minor_units),
+                ..BillTotals::default()
+            },
+            services: Vec::new(),
+            charges: Vec::new(),
+            sources: vec![SourceRef {
+                sha256: source.to_owned(),
+                role: SourceRole::Invoice,
+                pages: Vec::new(),
+            }],
+            replaces_revision: None,
+        })],
+    }
+}
+
+#[tokio::test]
+async fn api_backed_accounts_reject_matching_imports_without_modifying_sqlite() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = support::populated(&directory.path().join("api-import.sqlite3")).await;
+    let config = support::config();
+    let binding = &config.accounts[0];
+    let accounts = vec![binding.id.clone()];
+    let original = store.bill("demo-wm:bill:0", &accounts).await.unwrap();
+    let source = document(&store, b"Matching API bill").await;
+    let input = api_bill_import(binding, &original, &source);
+    input.validate().unwrap();
+
+    assert!(matches!(
+        store.import(&config.deployment, input).await,
+        Err(ImportError::Binding)
+    ));
+
+    assert_eq!(store.bill(&original.id, &accounts).await.unwrap(), original);
+    let state: (bool, Option<String>, Option<String>) =
+        sqlx::query_as("SELECT import_only,import_start_on,imported_at FROM accounts WHERE id=?")
+            .bind(&binding.id)
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+    assert_eq!(state, (false, None, None));
+    let counts: (i64, i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM imported_records), (SELECT count(*) FROM imported_evidence), (SELECT count(*) FROM import_receipts)",
+    )
+    .fetch_one(store.pool())
+    .await
+    .unwrap();
+    assert_eq!(counts, (0, 0, 0));
+    store.pool().close().await;
+}
+
+#[tokio::test]
+async fn api_backed_accounts_reject_imports_over_real_http_including_spoofed_bayou() {
+    let app = support::App::start().await;
+    let client = reqwest::Client::new();
+    let binding = &app.config.accounts[0];
+    let accounts = vec![binding.id.clone()];
+    let original = app.store.bill("demo-wm:bill:0", &accounts).await.unwrap();
+    let bytes = b"Matching API bill";
+    let source = digest(bytes);
+    client
+        .put(format!("{}/v1/documents/{source}", app.url))
+        .bearer_auth(support::TOKEN)
+        .header("content-type", "application/octet-stream")
+        .body(bytes.to_vec())
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let wm = api_bill_import(binding, &original, &source);
+    let mut bayou = api_bill_import(&app.config.accounts[1], &original, &source);
+    let mut spoofed_bayou = bayou.clone();
+    spoofed_bayou.account.provider = serde_json::from_str("\"lvmwd\"").unwrap();
+    spoofed_bayou.account.services.clear();
+    bayou.account.services.clear();
+    let mut unproven_wm = wm.clone();
+    unproven_wm.account.id = "another-waste".to_owned();
+    unproven_wm.account.provider_account_sha256 = None;
+    unproven_wm.account.services.clear();
+
+    #[derive(serde::Deserialize)]
+    struct ApiError {
+        error_code: String,
+    }
+    for (input, status, code) in [
+        (wm, reqwest::StatusCode::CONFLICT, "import_binding_conflict"),
+        (
+            bayou,
+            reqwest::StatusCode::CONFLICT,
+            "import_binding_conflict",
+        ),
+        (
+            spoofed_bayou,
+            reqwest::StatusCode::CONFLICT,
+            "import_binding_conflict",
+        ),
+        (
+            unproven_wm,
+            reqwest::StatusCode::CONFLICT,
+            "import_binding_conflict",
+        ),
+    ] {
+        let response = client
+            .post(format!("{}/v1/imports", app.url))
+            .bearer_auth(support::TOKEN)
+            .json(&input)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), status);
+        assert_eq!(response.json::<ApiError>().await.unwrap().error_code, code);
+    }
+
+    assert_eq!(
+        app.store.bill(&original.id, &accounts).await.unwrap(),
+        original
+    );
+    for binding in &app.config.accounts {
+        let state: bool = sqlx::query_scalar("SELECT import_only FROM accounts WHERE id=?")
+            .bind(&binding.id)
+            .fetch_one(app.store.pool())
+            .await
+            .unwrap();
+        assert!(!state);
+    }
+    app.close().await;
+}
+
+#[tokio::test]
+async fn a_new_manual_bayou_issuer_is_rejected_at_the_http_request_boundary() {
+    let app = support::App::start().await;
+    let bill = app
+        .store
+        .bill("demo-wm:bill:0", &["demo-wm".to_owned()])
+        .await
+        .unwrap();
+    let source = document(&app.store, b"Invalid issuer statement").await;
+    let mut input = api_bill_import(&app.config.accounts[0], &bill, &source);
+    input.account.id = "new-manual-energy".to_owned();
+    input.account.services.clear();
+    let client = reqwest::Client::new();
+    for services in [
+        Vec::new(),
+        vec![Service {
+            id: "fictional-energy-meter".to_owned(),
+            name: "Electricity".to_owned(),
+            kind: ha_utilities::models::ServiceKind::Electricity,
+        }],
+    ] {
+        input.account.services = services;
+        // Deliberately invalid wire data cannot be constructed with ImportProvider.
+        let body = serde_json::to_string(&input).unwrap().replace(
+            "\"provider\":\"waste_management\"",
+            "\"provider\":\"bayou\"",
+        );
+        let response = client
+            .post(format!("{}/v1/imports", app.url))
+            .bearer_auth(support::TOKEN)
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+    }
+    assert!(app.store.binding("demo", &input.account.id).await.is_err());
+    app.close().await;
+}
+
+#[tokio::test]
+async fn manual_accounts_reject_live_ingestion_without_changing_imported_facts() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(&directory.path().join("manual-source.sqlite3"))
+        .await
+        .unwrap();
+    let source = document(&store, b"Manual water bill").await;
+    let mut input = api_bill_import(
+        &support::config().accounts[0],
+        &Bill {
+            id: "unused".to_owned(),
+            account_id: "manual-water".to_owned(),
+            provider: ProviderId::Lvmwd,
+            issued_on: "2025-02-20".parse().unwrap(),
+            due_on: None,
+            period_from: None,
+            period_to: None,
+            total: ha_utilities::models::Money {
+                minor_units: 1000,
+                currency: "USD".to_owned(),
+            },
+            new_charges: None,
+            reported_quantities: Vec::new(),
+            outstanding_balance: None,
+            source_status: None,
+            observed_at: chrono::Utc::now(),
+        },
+        &source,
+    );
+    input.account.id = "manual-water".to_owned();
+    input.account.provider = serde_json::from_str("\"lvmwd\"").unwrap();
+    input.account.services.clear();
+    store.import("demo", input).await.unwrap();
+    let binding = store.binding("demo", "manual-water").await.unwrap();
+    let id: String =
+        sqlx::query_scalar("SELECT id FROM observations WHERE account_id=? AND kind='bill'")
+            .bind(&binding.id)
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+    let accounts = vec![binding.id.clone()];
+    let original = store.bill(&id, &accounts).await.unwrap();
+    let mut replacement = original.clone();
+    replacement.total.minor_units = 1;
+    let result = store
+        .ingest(
+            &binding,
+            &SyncPage {
+                observations: vec![Observation::Bill(replacement)],
+                coverage: Vec::new(),
+                continuation: None,
+            },
+        )
+        .await;
+    assert!(matches!(result, Err(StoreError::InvalidObservation)));
+    assert_eq!(store.bill(&id, &accounts).await.unwrap(), original);
+    store.pool().close().await;
 }
 
 #[tokio::test]

@@ -39,7 +39,7 @@ schema:
       currency: str
       services:
         - id: str
-          name: str
+          name: str?
           provider_service: str
           kind: list(waste|recycling|electricity|gas|other)
   wm_token: password

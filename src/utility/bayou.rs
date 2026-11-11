@@ -19,10 +19,13 @@ use crate::{
     config::{AccountBinding, BayouConfig, ServiceBinding, read_secret, valid_id},
     models::{
         Bill, Capability, ConnectableUtility, ConnectionAccount, ConnectionAuthStatus,
-        ConnectionMeter, Coverage, CoverageState, Money, Observation, ProviderId, Service,
-        ServiceKind, Usage, UsageUnit,
+        ConnectionMeter, Coverage, CoverageState, LiveProvider, Money, Observation, ProviderId,
+        Service, ServiceKind, Usage, UsageUnit,
     },
-    utility::{Continuation, HistoryRequest, SyncPage, SyncRequest, Utility, UtilityError},
+    utility::{
+        Continuation, HistoryRequest, SyncPage, SyncRequest, SyncStage, Utility, UtilityError,
+        report_failure,
+    },
 };
 
 const BASE: &str = "https://bayou.energy/api/v2/";
@@ -542,6 +545,10 @@ fn remote_text(value: &str) -> bool {
 }
 
 impl Utility for Bayou {
+    fn provider(&self) -> LiveProvider {
+        LiveProvider::Bayou
+    }
+
     fn capabilities(&self) -> &'static [Capability] {
         CAPABILITIES
     }
@@ -549,13 +556,19 @@ impl Utility for Bayou {
     async fn sync(&self, request: SyncRequest) -> Result<SyncPage, UtilityError> {
         validate_request(&request)?;
         let cursor = Cursor::for_request(&request)?;
-        let customer = self.customer(&request.binding).await?;
+        let customer = self
+            .customer(&request.binding)
+            .await
+            .inspect_err(|error| report_failure(self.provider(), SyncStage::Customer, error))?;
         self.sync_page(request, customer, cursor, false).await
     }
 
     async fn sync_history(&self, request: HistoryRequest) -> Result<SyncPage, UtilityError> {
         validate_binding(&request.binding)?;
-        let mut customer = self.customer(&request.binding).await?;
+        let mut customer = self
+            .customer(&request.binding)
+            .await
+            .inspect_err(|error| report_failure(self.provider(), SyncStage::Customer, error))?;
         if request.continuation.is_none() {
             // A successful sign-in can precede provider discovery. Give the
             // first job time to read the history instead of reporting an empty
@@ -635,7 +648,10 @@ impl Bayou {
             Stage::Bills { day } => {
                 let (bills, incomplete) = self
                     .bills(&request, &customer, (!history).then_some(day))
-                    .await?;
+                    .await
+                    .inspect_err(|error| {
+                        report_failure(self.provider(), SyncStage::Bills, error)
+                    })?;
                 observations.extend(bills);
                 cursor.bills_incomplete |= incomplete;
                 if !history && day < request.to {
@@ -686,7 +702,10 @@ impl Bayou {
                                 previous_end: cursor.last_interval_end,
                             },
                         )
-                        .await?;
+                        .await
+                        .inspect_err(|error| {
+                            report_failure(self.provider(), SyncStage::Usage, error)
+                        })?;
                     observations.extend(page.observations);
                     cursor.intervals_incomplete |= page.incomplete;
                     cursor.last_interval_end = page.last_end;
@@ -721,7 +740,7 @@ impl Bayou {
         observations.extend(request.binding.services.iter().map(|service| {
             Observation::Service(Service {
                 id: service.id.clone(),
-                name: service.name.clone(),
+                name: service.name().to_owned(),
                 kind: service.kind,
             })
         }));

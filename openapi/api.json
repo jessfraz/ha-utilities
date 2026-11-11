@@ -18,10 +18,6 @@
           "id": {
             "type": "string"
           },
-          "import_only": {
-            "default": false,
-            "type": "boolean"
-          },
           "name": {
             "type": "string"
           },
@@ -33,15 +29,55 @@
               "$ref": "#/components/schemas/Service"
             },
             "type": "array"
+          },
+          "source": {
+            "$ref": "#/components/schemas/AccountSource"
           }
         },
         "required": [
           "id",
           "name",
           "provider",
-          "services"
+          "services",
+          "source"
         ],
         "type": "object"
+      },
+      "AccountSource": {
+        "oneOf": [
+          {
+            "properties": {
+              "kind": {
+                "enum": [
+                  "manual_import"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "enum": [
+                  "live"
+                ],
+                "type": "string"
+              },
+              "provider": {
+                "$ref": "#/components/schemas/LiveProvider"
+              }
+            },
+            "required": [
+              "kind",
+              "provider"
+            ],
+            "type": "object"
+          }
+        ]
       },
       "Balance": {
         "properties": {
@@ -838,7 +874,7 @@
             "type": "string"
           },
           "provider": {
-            "$ref": "#/components/schemas/ProviderId"
+            "$ref": "#/components/schemas/ImportProvider"
           },
           "provider_account_sha256": {
             "default": null,
@@ -905,6 +941,17 @@
           "removed"
         ],
         "type": "object"
+      },
+      "ImportProvider": {
+        "description": "A manual statement names its issuer, never an API adapter.",
+        "enum": [
+          "waste_management",
+          "lvmwd",
+          "superior_propane",
+          "starlink",
+          "spectrum"
+        ],
+        "type": "string"
       },
       "ImportReceipt": {
         "properties": {
@@ -1254,6 +1301,14 @@
         ],
         "type": "object"
       },
+      "LiveProvider": {
+        "description": "API adapters are separate from the issuer identifiers retained on old records.",
+        "enum": [
+          "waste_management",
+          "bayou"
+        ],
+        "type": "string"
+      },
       "Login": {
         "additionalProperties": false,
         "properties": {
@@ -1554,7 +1609,7 @@
             "type": "boolean"
           },
           "id": {
-            "$ref": "#/components/schemas/ProviderId"
+            "$ref": "#/components/schemas/LiveProvider"
           },
           "name": {
             "type": "string"
@@ -1642,13 +1697,13 @@
             "$ref": "#/components/schemas/ServiceKind"
           },
           "name": {
+            "default": "",
             "type": "string"
           }
         },
         "required": [
           "id",
-          "kind",
-          "name"
+          "kind"
         ],
         "type": "object"
       },

@@ -178,7 +178,7 @@ impl WasteManagement {
             .map(|s| {
                 Observation::Service(Service {
                     id: s.id.clone(),
-                    name: s.name.clone(),
+                    name: s.name().to_owned(),
                     kind: s.kind,
                 })
             })
@@ -399,6 +399,10 @@ impl WasteManagement {
 }
 
 impl Utility for WasteManagement {
+    fn provider(&self) -> LiveProvider {
+        LiveProvider::WasteManagement
+    }
+
     fn capabilities(&self) -> &'static [Capability] {
         CAPABILITIES
     }
