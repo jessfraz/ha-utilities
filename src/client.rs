@@ -1,6 +1,7 @@
 //! Native and HA transports share the same typed local read model.
 use crate::imports::{
-    ImportReceipt, ImportRequest, MAX_DOCUMENT_BYTES, MAX_IMPORT_REQUEST_BYTES, valid_digest,
+    ImportAccountConsolidation, ImportAccountConsolidationReceipt, ImportReceipt, ImportRequest,
+    MAX_DOCUMENT_BYTES, MAX_IMPORT_REQUEST_BYTES, valid_digest,
 };
 use crate::models::*;
 use reqwest::{
@@ -315,6 +316,28 @@ impl Client {
                 Some(response.status().as_u16()),
             ));
         }
+        Self::response_json(response).await
+    }
+
+    pub async fn consolidate_import_accounts(
+        &self,
+        input: &ImportAccountConsolidation,
+    ) -> Result<ImportAccountConsolidationReceipt, ClientError> {
+        input
+            .validate()
+            .map_err(|_| ClientError::new("invalid_import", None))?;
+        let body =
+            serde_json::to_vec(input).map_err(|_| ClientError::new("invalid_import", None))?;
+        if body.len() > MAX_IMPORT_REQUEST_BYTES {
+            return Err(ClientError::new("request_too_large", None));
+        }
+        let mut url = self.endpoint("imports", None, None)?;
+        url.path_segments_mut()
+            .map_err(|_| ClientError::new("invalid_url", None))?
+            .push("consolidate");
+        let response = self
+            .send(Method::POST, url, Some(("application/json", body)))
+            .await?;
         Self::response_json(response).await
     }
 

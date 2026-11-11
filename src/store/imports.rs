@@ -156,7 +156,7 @@ impl Store {
         .await?;
         for sql in [
             "DELETE FROM imported_revisions WHERE account_id=?",
-            "DELETE FROM import_receipts WHERE account_id=?",
+            "DELETE FROM import_receipts WHERE origin_id IN (SELECT id FROM import_origins WHERE account_id=?)",
             "DELETE FROM imported_records WHERE account_id=?",
             "DELETE FROM observations WHERE account_id=?",
             "DELETE FROM coverage WHERE account_id=?",
@@ -221,10 +221,11 @@ impl Store {
         binding: &AccountBinding,
     ) -> Result<bool, StoreError> {
         let provider = crate::store::enum_key(&binding.provider)?;
-        Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM accounts WHERE import_only=1 AND deployment=? AND json_extract(binding,'$.provider')=? AND json_extract(binding,'$.provider_account')=?)")
+        Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM import_origins o JOIN accounts a ON a.id=o.account_id WHERE a.import_only=1 AND o.binding IS NOT NULL AND json_extract(o.binding,'$.deployment')=? AND json_extract(o.binding,'$.provider')=? AND json_extract(o.binding,'$.provider_account')=?) OR EXISTS(SELECT 1 FROM import_origins WHERE id=? AND account_id<>?)")
             .bind(&binding.deployment)
             .bind(provider)
             .bind(digest(binding.provider_account.as_bytes()))
+            .bind(&binding.id).bind(&binding.id)
             .fetch_one(&mut **tx).await?)
     }
 
@@ -250,14 +251,15 @@ impl Store {
         // Admit the manual source before receipts or legacy projection repairs.
         let binding = import_binding(&mut tx, deployment, &input).await?;
         let replayed: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM import_receipts WHERE account_id=? AND digest=?)",
+            "SELECT EXISTS(SELECT 1 FROM import_receipts WHERE origin_id=? AND digest=?)",
         )
-        .bind(&binding.id)
+        .bind(&input.account.id)
         .bind(&receipt_digest)
         .fetch_one(&mut *tx)
         .await?;
         if replayed {
-            Self::restore_unknown_usage(&mut tx, &binding, &input.records).await?;
+            Self::restore_unknown_usage(&mut tx, &binding, &input.records, &input.account.id)
+                .await?;
             tx.commit().await?;
             return Ok(ImportReceipt {
                 unchanged: records.len(),
@@ -290,7 +292,7 @@ impl Store {
         let mut capabilities = Vec::new();
         for incoming in records {
             let kind = incoming.kind();
-            let id = incoming.id(&binding.id)?;
+            let id = incoming.id(&input.account.id)?;
             let row = sqlx::query("SELECT revision,payload FROM imported_records WHERE account_id=? AND kind=? AND id=?")
                 .bind(&binding.id).bind(kind).bind(&id).fetch_optional(&mut *tx).await?;
             let (value, facts_changed) = if let Some(row) = row {
@@ -323,7 +325,7 @@ impl Store {
                 (incoming, true)
             };
             value.validate(&input.account)?;
-            let bill_link = value.bill_link(&binding.id)?;
+            let bill_link = value.bill_link(&input.account.id)?;
             let facts = serde_json::to_string(&value.facts())?;
             let revision = digest(facts.as_bytes());
             let payload = serde_json::to_string(&value)?;
@@ -340,7 +342,9 @@ impl Store {
                     .execute(&mut *tx).await?;
             }
             if facts_changed {
-                if let Some(observation) = value.observation(&binding, &id, observed_at)? {
+                if let Some(observation) =
+                    value.observation(&binding, &id, observed_at, &input.account.id)?
+                {
                     let row = ObservationRow::new(&binding, &observation)?;
                     if row.kind == "usage" {
                         let overlap: bool = sqlx::query_scalar(queries::OVERLAP)
@@ -402,9 +406,9 @@ impl Store {
             )
             .await?;
         }
-        Self::restore_unknown_usage(&mut tx, &binding, &input.records).await?;
-        sqlx::query("INSERT INTO import_receipts(account_id,digest) VALUES(?,?)")
-            .bind(&binding.id)
+        Self::restore_unknown_usage(&mut tx, &binding, &input.records, &input.account.id).await?;
+        sqlx::query("INSERT INTO import_receipts(origin_id,digest) VALUES(?,?)")
+            .bind(&input.account.id)
             .bind(&receipt_digest)
             .execute(&mut *tx)
             .await?;
@@ -423,11 +427,12 @@ impl Store {
         tx: &mut Transaction<'_, Sqlite>,
         binding: &AccountBinding,
         incoming: &[ImportRecord],
+        origin_id: &str,
     ) -> Result<(), ImportError> {
         let requested = incoming
             .iter()
             .filter(|record| matches!(record, ImportRecord::MeterInterval(value) if value.quality == Quality::Unknown))
-            .map(|record| Ok((record.id(&binding.id)?, record.facts())))
+            .map(|record| Ok((record.id(origin_id)?, record.facts())))
             .collect::<Result<BTreeMap<_, _>, ImportError>>()?;
         if requested.is_empty() {
             return Ok(());
@@ -455,7 +460,7 @@ impl Store {
                 continue;
             }
             if let Some(Observation::Usage(usage)) =
-                record.observation(binding, &id, observed_at)?
+                record.observation(binding, &id, observed_at, origin_id)?
             {
                 candidates.push(usage);
             }
@@ -552,11 +557,12 @@ async fn import_binding(
     input: &ImportRequest,
 ) -> Result<AccountBinding, ImportError> {
     let proposed = input.binding(deployment);
-    let existing = sqlx::query("SELECT binding,import_only,import_start_on FROM accounts WHERE id=? AND deployment=? AND binding IS NOT NULL")
+    let existing = sqlx::query("SELECT o.binding AS origin_binding,o.start_on AS import_start_on,a.binding,a.import_only FROM import_origins o JOIN accounts a ON a.id=o.account_id WHERE o.id=? AND a.deployment=? AND a.binding IS NOT NULL")
         .bind(&proposed.id).bind(deployment).fetch_optional(&mut **tx).await?;
     let start = input.account.start_on.to_string();
     if let Some(row) = existing {
-        let current: AccountBinding = serde_json::from_str(row.try_get("binding")?)?;
+        let current: AccountBinding = serde_json::from_str(row.try_get("origin_binding")?)?;
+        let canonical: AccountBinding = serde_json::from_str(row.try_get("binding")?)?;
         require_mode(
             ingestion_mode(row.try_get("import_only")?),
             IngestionMode::ManualImport,
@@ -583,11 +589,22 @@ async fn import_binding(
         if start_on.is_none() {
             sqlx::query("UPDATE accounts SET import_start_on=? WHERE id=?")
                 .bind(&start)
+                .bind(&canonical.id)
+                .execute(&mut **tx)
+                .await?;
+            sqlx::query("UPDATE import_origins SET start_on=? WHERE id=?")
+                .bind(&start)
                 .bind(&current.id)
                 .execute(&mut **tx)
                 .await?;
         }
-        return Ok(current);
+        return Ok(canonical);
+    }
+    let reserved: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM import_origins WHERE id=?) OR EXISTS(SELECT 1 FROM import_origins WHERE binding IS NOT NULL AND json_extract(binding,'$.deployment')=? AND json_extract(binding,'$.provider')=? AND json_extract(binding,'$.provider_account')=?)")
+        .bind(&proposed.id).bind(deployment).bind(crate::store::enum_key(&proposed.provider)?)
+        .bind(&proposed.provider_account).fetch_one(&mut **tx).await?;
+    if reserved {
+        return Err(ImportError::Binding);
     }
     let bindings = sqlx::query("SELECT binding,import_only FROM accounts WHERE deployment=? AND binding IS NOT NULL ORDER BY id LIMIT 101")
         .bind(deployment)
@@ -621,6 +638,13 @@ async fn import_binding(
     sqlx::query("UPDATE accounts SET import_only=1,import_start_on=? WHERE id=?")
         .bind(&start)
         .bind(&proposed.id)
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query("INSERT INTO import_origins(id,account_id,binding,start_on) VALUES(?,?,?,?)")
+        .bind(&proposed.id)
+        .bind(&proposed.id)
+        .bind(serde_json::to_string(&proposed)?)
+        .bind(&start)
         .execute(&mut **tx)
         .await?;
     Ok(proposed)
@@ -783,7 +807,7 @@ mod tests {
             .zip(&ids)
             .map(|(record, id)| {
                 let Some(Observation::Usage(usage)) =
-                    record.observation(&binding, id, now).unwrap()
+                    record.observation(&binding, id, now, &binding.id).unwrap()
                 else {
                     panic!("expected reported usage")
                 };

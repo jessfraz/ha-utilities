@@ -1000,7 +1000,7 @@ async fn financial_snapshot(store: &Store) -> FinancialSnapshot {
         records: sqlx::query_as("SELECT account_id,kind,id,revision,bill_id,payload FROM imported_records ORDER BY account_id,kind,id").fetch_all(store.pool()).await.unwrap(),
         revisions: sqlx::query_as("SELECT account_id,kind,id,revision,facts,sources FROM imported_revisions ORDER BY account_id,kind,id,revision").fetch_all(store.pool()).await.unwrap(),
         evidence: sqlx::query_as("SELECT deployment,digest,account_id,kind,id FROM imported_evidence ORDER BY deployment,digest,account_id,kind,id").fetch_all(store.pool()).await.unwrap(),
-        receipts: sqlx::query_as("SELECT account_id,digest FROM import_receipts ORDER BY account_id,digest").fetch_all(store.pool()).await.unwrap(),
+        receipts: sqlx::query_as("SELECT origin_id,digest FROM import_receipts ORDER BY origin_id,digest").fetch_all(store.pool()).await.unwrap(),
         documents: sqlx::query_as("SELECT deployment,digest,bytes FROM import_documents ORDER BY deployment,digest").fetch_all(store.pool()).await.unwrap(),
         observations: sqlx::query_as("SELECT account_id,id,payload,observed_at FROM observations WHERE kind!='service' ORDER BY account_id,kind,id").fetch_all(store.pool()).await.unwrap(),
         identities: sqlx::query_as("SELECT id,binding_hash FROM accounts ORDER BY id").fetch_all(store.pool()).await.unwrap(),

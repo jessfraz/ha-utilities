@@ -3,8 +3,9 @@ use crate::{
     config::{Config, valid_id},
     connect::{ConnectionError, ConnectionHandle},
     imports::{
-        BillDetails, ImportAccountPurge, ImportAccountPurgeReceipt, ImportError, ImportReceipt,
-        ImportRequest, MAX_DOCUMENT_BYTES, MAX_IMPORT_REQUEST_BYTES,
+        BillDetails, ImportAccountConsolidation, ImportAccountConsolidationReceipt,
+        ImportAccountPurge, ImportAccountPurgeReceipt, ImportError, ImportReceipt, ImportRequest,
+        MAX_DOCUMENT_BYTES, MAX_IMPORT_REQUEST_BYTES,
     },
     models::*,
     store::{Store, StoreError},
@@ -710,6 +711,23 @@ async fn import_records(
     ))
 }
 
+/// Consolidate manual ownership without changing record or collector identities.
+#[endpoint {method=POST,path="/v1/imports/consolidate",tags=["imports"],request_body_max_bytes=MAX_IMPORT_REQUEST_BYTES}]
+async fn consolidate_import_accounts(
+    request: RequestContext<Arc<Context>>,
+    body: TypedBody<ImportAccountConsolidation>,
+) -> Result<PrivateOk<ImportAccountConsolidationReceipt>, HttpError> {
+    authorized(&request)?;
+    let context = request.context();
+    Ok(private(
+        context
+            .store
+            .consolidate_import_accounts(&context.config.deployment, body.into_inner())
+            .await
+            .map_err(import_error)?,
+    ))
+}
+
 /// Remove an import-only account and its exclusively linked source documents.
 #[endpoint {method=POST,path="/v1/imports/accounts/{id}/purge",tags=["imports"],request_body_max_bytes=1024}]
 async fn purge_import_account(
@@ -969,7 +987,7 @@ async fn schema(request: RequestContext<Arc<Context>>) -> Result<Response<Body>,
 
 pub fn description() -> anyhow::Result<ApiDescription<Arc<Context>>> {
     let mut api = ApiDescription::new();
-    let endpoints: [dropshot::ApiEndpoint<Arc<Context>>; 32] = [
+    let endpoints: [dropshot::ApiEndpoint<Arc<Context>>; 33] = [
         system.into(),
         health.into(),
         providers.into(),
@@ -990,6 +1008,7 @@ pub fn description() -> anyhow::Result<ApiDescription<Arc<Context>>> {
         document_get.into(),
         import_records.into(),
         purge_import_account.into(),
+        consolidate_import_accounts.into(),
         balances.into(),
         collections.into(),
         usage.into(),

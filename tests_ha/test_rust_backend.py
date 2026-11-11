@@ -3,6 +3,7 @@
 import asyncio
 import json
 import os
+from hashlib import sha256
 from pathlib import Path
 
 import pytest
@@ -115,6 +116,102 @@ async def test_native_store_read_model_is_shared_by_ha_and_assist(
         json={"account": "demo-wm", "from": "2026-01-01", "to": "2026-01-02"},
     )
     assert accepted.status == 202
+
+
+async def test_actual_cli_ha_consolidation_replays_without_recreating_accounts(
+    hass: HomeAssistant,
+    web_backend: WebBackend,
+    hass_client: ClientSessionGenerator,
+    hass_access_token: str,
+    tmp_path: Path,
+) -> None:
+    await connect_backend(hass, web_backend)
+    client = await hass_client(hass_access_token)
+    source_bytes = b"Fictional invoice PDF source"
+    source_digest = sha256(source_bytes).hexdigest()
+    prefix = "/api/utilities/v1"
+    assert (
+        await client.put(
+            f"{prefix}/documents/{source_digest}",
+            data=source_bytes,
+            headers={"Content-Type": "application/octet-stream"},
+        )
+    ).status == 204
+    accounts = [
+        {
+            "id": name,
+            "provider": "spectrum",
+            "provider_account_sha256": sha256(name.encode()).hexdigest(),
+            "start_on": "2025-02-01",
+            "services": [{"id": f"{name}-internet", "kind": "internet"}],
+        }
+        for name in ["fixture-construction", "fixture-recurring"]
+    ]
+    imports = [
+        {
+            "account": account,
+            "currency": "USD",
+            "records": [
+                {
+                    "kind": "bill",
+                    "reference": {
+                        "kind": "invoice_number",
+                        "value": f"EXAMPLE-{index}",
+                    },
+                    "issued_on": "2025-02-20",
+                    "due_on": "2025-03-10",
+                    "totals": {"new_charges_minor": 12500},
+                    "sources": [{"sha256": source_digest, "role": "invoice"}],
+                }
+            ],
+        }
+        for index, account in enumerate(accounts)
+    ]
+    for request in imports:
+        response = await client.post(f"{prefix}/imports", json=request)
+        assert response.status == 200, await response.text()
+    operation = {
+        "source": accounts[0],
+        "target": accounts[1],
+        "currency": "USD",
+        "expected_source_records": 1,
+        "expected_target_records": 1,
+    }
+    request_file = tmp_path / "consolidation.json"
+    await asyncio.to_thread(request_file.write_text, json.dumps(operation))
+    token_file = tmp_path / "ha-token"
+    await asyncio.to_thread(token_file.write_text, hass_access_token)
+    arguments = [
+        "--transport",
+        "ha",
+        "--url",
+        str(client.make_url("/")).rstrip("/"),
+        "--token-file",
+        str(token_file),
+        "--json",
+        "consolidate-imports",
+        str(request_file),
+    ]
+    for replayed in [False, True]:
+        result, stdout, stderr = await run_cli(arguments)
+        assert result == 0, stderr.decode()
+        receipt = record(json.loads(stdout))
+        assert receipt["replayed"] is replayed
+        assert receipt["account_id"] == "fixture-recurring"
+    for request in imports:
+        response = await client.post(f"{prefix}/imports", json=request)
+        assert response.status == 200
+        assert record(await response.json())["replayed"] is True
+    response = await client.get(f"{prefix}/accounts")
+    items, _, _ = page(await response.json())
+    spectrum = [
+        record(item) for item in items if record(item)["provider"] == "spectrum"
+    ]
+    assert len(spectrum) == 1
+    assert spectrum[0]["id"] == "fixture-recurring"
+    response = await client.get(f"{prefix}/bills?account=fixture-recurring")
+    items, _, _ = page(await response.json())
+    assert len(items) == 2
 
 
 @pytest.mark.parametrize("revocation", ["inactive", "revoked_token"])

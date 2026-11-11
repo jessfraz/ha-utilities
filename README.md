@@ -114,6 +114,24 @@ service IDs and printed record references stable across runs. A replay
 reports zero new records. A conflicting fact requires review or an explicit
 replacement against the current record revision.
 
+To combine duplicate manual accounts, prepare an
+`ImportAccountConsolidation` JSON request with the existing `source` and
+`target` import-account identities, `currency`, `expected_source_records`,
+and `expected_target_records`. Both accounts must have the same issuer and
+cutoff, and neither can be connected to a live adapter.
+
+```sh
+fetch-home-assistant ha-utilities --transport home-assistant consolidate-imports ./consolidation.json --json
+```
+
+`POST /v1/imports/consolidate` moves all source ownership in one transaction.
+Record IDs, revisions, service IDs, documents, and original provider-account
+fingerprints remain intact. Keep the original two intake requests in future
+bundles. Each original account ID routes to the surviving account, retaining
+its own financial identity and replay receipts. Repeating the exact
+consolidation request returns its saved receipt. Account filters use the
+surviving ID, and existing bill URLs continue to work.
+
 The native owner API can remove an entire import-only account with
 `POST /v1/imports/accounts/{id}/purge`. Confirm the exact `provider` and
 `expected_records` count in the request. The transaction removes the account,
