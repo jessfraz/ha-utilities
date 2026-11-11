@@ -1,8 +1,9 @@
 use crate::{
-    config::AccountBinding,
+    config::{AccountBinding, valid_id},
     imports::{
-        BillDetails, BillReference, ImportError, ImportReceipt, ImportRecord, ImportRequest,
-        ImportedRecord, MAX_DOCUMENT_BYTES, Quality, combined_sources, digest, valid_digest,
+        BillDetails, BillReference, ImportAccountPurge, ImportAccountPurgeReceipt, ImportError,
+        ImportReceipt, ImportRecord, ImportRequest, ImportedRecord, MAX_DOCUMENT_BYTES, Quality,
+        combined_sources, digest, valid_digest,
     },
     models::{Bill, Capability, Coverage, CoverageState, Observation, Payment, ProviderId},
     store::{ObservationRow, Store, StoreError, connections, queries},
@@ -70,6 +71,92 @@ impl Store {
                 .await?
                 .unwrap_or(false),
         )
+    }
+
+    pub(crate) async fn import_account_ids(
+        &self,
+        deployment: &str,
+        provider: ProviderId,
+    ) -> Result<Vec<String>, StoreError> {
+        let provider = crate::store::enum_key(&provider)?;
+        Ok(sqlx::query_scalar(
+            "SELECT id FROM accounts WHERE deployment=? AND import_only=1
+                AND json_extract(binding,'$.provider')=? ORDER BY id",
+        )
+        .bind(deployment)
+        .bind(provider)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    pub async fn purge_import_account(
+        &self,
+        deployment: &str,
+        account_id: &str,
+        input: ImportAccountPurge,
+    ) -> Result<ImportAccountPurgeReceipt, ImportError> {
+        if !valid_id(account_id) || input.expected_records == 0 {
+            return Err(ImportError::Invalid);
+        }
+        let provider = crate::store::enum_key(&input.provider)?;
+        let mut tx = self.pool.begin_with(queries::BEGIN_INGEST).await?;
+        let account: Option<(bool, i64)> = sqlx::query_as(
+            "SELECT import_only=1 AND connection_id IS NULL
+                    AND COALESCE(json_extract(binding,'$.provider')=?,0)
+                    AND NOT EXISTS (SELECT 1 FROM sync_jobs WHERE account_id=accounts.id),
+                    (SELECT count(*) FROM imported_records WHERE account_id=accounts.id)
+             FROM accounts WHERE id=? AND deployment=?",
+        )
+        .bind(provider)
+        .bind(account_id)
+        .bind(deployment)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((eligible, records)) = account else {
+            tx.commit().await?;
+            return Ok(ImportAccountPurgeReceipt::default());
+        };
+        if !eligible || u64::try_from(records).ok() != Some(input.expected_records) {
+            return Err(ImportError::Binding);
+        }
+        let digests: Vec<String> = sqlx::query_scalar(
+            "DELETE FROM imported_evidence WHERE deployment=? AND account_id=? RETURNING digest",
+        )
+        .bind(deployment)
+        .bind(account_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        for sql in [
+            "DELETE FROM imported_revisions WHERE account_id=?",
+            "DELETE FROM import_receipts WHERE account_id=?",
+            "DELETE FROM imported_records WHERE account_id=?",
+            "DELETE FROM observations WHERE account_id=?",
+            "DELETE FROM coverage WHERE account_id=?",
+        ] {
+            sqlx::query(sql).bind(account_id).execute(&mut *tx).await?;
+        }
+        sqlx::query("DELETE FROM accounts WHERE id=? AND deployment=?")
+            .bind(account_id)
+            .bind(deployment)
+            .execute(&mut *tx)
+            .await?;
+        let documents = sqlx::query(
+            "DELETE FROM import_documents AS d WHERE deployment=?
+                AND digest IN (SELECT value FROM json_each(?))
+                AND NOT EXISTS (SELECT 1 FROM imported_evidence e
+                    WHERE e.deployment=d.deployment AND e.digest=d.digest)",
+        )
+        .bind(deployment)
+        .bind(serde_json::to_string(&digests)?)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        tx.commit().await?;
+        Ok(ImportAccountPurgeReceipt {
+            removed: true,
+            records: input.expected_records,
+            documents,
+        })
     }
 
     pub(crate) async fn import_states(

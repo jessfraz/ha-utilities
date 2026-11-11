@@ -1,8 +1,9 @@
 mod support;
 
 use ha_utilities::{
-    imports::{ImportError, ImportRequest, digest},
-    models::{Summary, SyncJob, SyncState},
+    client::{Client, Transport},
+    imports::{ImportAccountPurge, ImportAccountPurgeReceipt, ImportError, ImportRequest, digest},
+    models::{Bill, ListQuery, Page, ProviderId, Summary, SyncJob, SyncState},
     store::Store,
 };
 use serde_json::json;
@@ -223,5 +224,160 @@ async fn imported_accounts_remain_outside_provider_sync_and_freshness() {
         .unwrap();
     assert_eq!(jobs.len(), app.config.accounts.len());
     assert!(jobs.iter().all(|job| job.account_id != "fictional-water"));
+    app.close().await;
+}
+
+#[tokio::test]
+async fn owner_can_purge_only_the_confirmed_import_account() {
+    use reqwest::StatusCode;
+
+    let app = support::App::start().await;
+    let deployment = &app.config.deployment;
+    let private = document(&app.store, b"Statement for removed account").await;
+    let shared = document(&app.store, b"Statement evidence shared across accounts").await;
+    let bill = |source: &str, supporting: &str| {
+        request(json!([{
+            "kind": "bill",
+            "reference": {"kind": "invoice_number", "value": "EXAMPLE-4"},
+            "issued_on": "2025-02-20",
+            "totals": {"new_charges_minor": 1000},
+            "sources": [{"sha256": source, "role": "invoice"},
+                        {"sha256": supporting, "role": "supporting"}]
+        }]))
+    };
+    let removed = bill(&private, &shared);
+    let mut retained = bill(&shared, &shared);
+    retained.account.id = "retained-water".to_owned();
+    retained.account.services[0].id = "retained-meter".to_owned();
+    app.store.import(deployment, retained).await.unwrap();
+    app.store.import(deployment, removed.clone()).await.unwrap();
+
+    let native = Client::new(&app.url, Transport::Native, support::TOKEN).unwrap();
+    let mut group = ListQuery {
+        import_provider: Some(ProviderId::Lvmwd),
+        limit: Some(1),
+        ..ListQuery::default()
+    };
+    let first = native.bills(&group).await.unwrap();
+    group.page = first.next_page;
+    assert!(group.page.is_some());
+    let second = native.bills(&group).await.unwrap();
+    assert!(second.next_page.is_none());
+    let mut account_ids = [
+        first.items[0].account_id.as_str(),
+        second.items[0].account_id.as_str(),
+    ];
+    account_ids.sort_unstable();
+    assert_eq!(account_ids, ["fictional-water", "retained-water"]);
+    group.import_provider = None;
+    assert_eq!(native.bills(&group).await.unwrap_err().status, Some(400));
+
+    let client = reqwest::Client::new();
+    let purge_url = |id: &str| format!("{}/v1/imports/accounts/{id}/purge", app.url);
+    let purge = |id: &str, provider, expected_records| {
+        client.post(purge_url(id)).json(&ImportAccountPurge {
+            provider,
+            expected_records,
+        })
+    };
+    let request = || purge("fictional-water", ProviderId::Lvmwd, 1);
+    assert_eq!(
+        request().send().await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+    for conflict in [
+        purge("fictional-water", ProviderId::Lvmwd, 2),
+        purge("fictional-water", ProviderId::Starlink, 1),
+        purge("demo-wm", ProviderId::WasteManagement, 1),
+    ] {
+        assert_eq!(
+            conflict
+                .bearer_auth(support::TOKEN)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CONFLICT
+        );
+    }
+    let execute = || async {
+        request()
+            .bearer_auth(support::TOKEN)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json::<ImportAccountPurgeReceipt>()
+            .await
+            .unwrap()
+    };
+    assert_eq!(
+        execute().await,
+        ImportAccountPurgeReceipt {
+            removed: true,
+            records: 1,
+            documents: 1
+        }
+    );
+    assert_eq!(execute().await, ImportAccountPurgeReceipt::default());
+    let bills = client
+        .get(format!("{}/v1/bills?limit=100", app.url))
+        .bearer_auth(support::TOKEN)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json::<Page<Bill>>()
+        .await
+        .unwrap();
+    assert!(
+        bills
+            .items
+            .iter()
+            .all(|bill| bill.account_id != "fictional-water")
+    );
+    assert!(
+        bills
+            .items
+            .iter()
+            .any(|bill| bill.account_id == "retained-water")
+    );
+    assert!(bills.items.iter().any(|bill| bill.account_id == "demo-wm"));
+    for (source, status) in [(&private, StatusCode::NOT_FOUND), (&shared, StatusCode::OK)] {
+        assert_eq!(
+            client
+                .get(format!("{}/v1/documents/{source}", app.url))
+                .bearer_auth(support::TOKEN)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            status
+        );
+    }
+    let retained_rows: i64 = sqlx::query_scalar("SELECT count(*) FROM imported_revisions")
+        .fetch_one(app.store.pool())
+        .await
+        .unwrap();
+    assert_eq!(retained_rows, 1);
+    let blobs: i64 = sqlx::query_scalar("SELECT count(*) FROM import_documents")
+        .fetch_one(app.store.pool())
+        .await
+        .unwrap();
+    assert_eq!(blobs, 1);
+    app.store
+        .put_document(deployment, &private, b"Statement for removed account")
+        .await
+        .unwrap();
+    assert_eq!(
+        app.store
+            .import(deployment, removed)
+            .await
+            .unwrap()
+            .inserted,
+        1
+    );
     app.close().await;
 }

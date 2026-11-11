@@ -11,7 +11,7 @@ const retry = byId('retry');
 const detail = byId('bill-detail');
 const views = {
   overview: ['Overview', 'Bills and service data from your utilities.'],
-  bills: ['Bills', 'Whole-account bills. Meter selection limits usage, not bill totals. A bill is not proof of payment.'],
+  bills: ['Bills', 'Billing history, charges, and source documents.'],
   collections: ['Trash collections', 'Scheduled pickups, completion reports, and exceptions.'],
   usage: ['Usage', 'Meter intervals, with the units and time ranges reported by the provider.'],
   settings: ['Settings', 'Utility connections, provider coverage, and sync.'],
@@ -25,7 +25,8 @@ const names = {
   unsupported: 'Not supported', not_configured: 'Not configured',
   scheduled: 'Scheduled', completed: 'Completed', exception: 'Exception', unknown: 'Unknown',
   running: 'Syncing', failed: 'Sync failed', interrupted: 'Sync interrupted',
-  waste: 'Waste', recycling: 'Recycling', electricity: 'Electricity', gas: 'Gas', water: 'Water', other: 'Other',
+  waste: 'Waste', recycling: 'Recycling', electricity: 'Electricity', gas: 'Gas', water: 'Water',
+  internet: 'Internet', propane: 'Propane', other: 'Other',
 };
 const billingUnits = {
   hundred_cubic_feet: 'CCF', us_gallon: 'US gal', cubic_meter: 'm³', byte: 'B',
@@ -84,6 +85,7 @@ let syncJobs = [];
 let updateSyncForm = null;
 let loadController = null;
 const listState = new Map();
+const importProviderPrefix = 'import_provider/';
 const refresh = node('button', 'Refresh');
 refresh.type = 'button';
 refresh.className = 'quiet';
@@ -108,6 +110,28 @@ function node(tag, text, className) {
 
 function label(value) { return names[value] ?? String(value).replaceAll('_', ' '); }
 function accountName(id) { return accounts.find((account) => account.id === id)?.name ?? 'Unknown account'; }
+function providerName(id) { return providers.find((provider) => provider.id === id)?.name ?? label(id); }
+function importedVendors(bindings = accounts) {
+  const vendors = new Map();
+  for (const account of bindings) {
+    if (!account.import_only) continue;
+    if (!vendors.has(account.provider)) vendors.set(account.provider, []);
+    vendors.get(account.provider).push(account);
+  }
+  return vendors;
+}
+function accountDisplay(id) {
+  const account = accounts.find((item) => item.id === id);
+  if (!account?.import_only) return { name: account?.name ?? 'Unknown account' };
+  const name = providerName(account.provider);
+  return { name, context: account.name === name ? undefined : account.name };
+}
+function accountCell(id) {
+  const { name, context } = accountDisplay(id);
+  const result = cell(name);
+  if (context) result.append(node('small', context));
+  return result;
+}
 function serviceName(id) {
   for (const account of accounts) {
     const service = account.services.find((item) => item.id === id);
@@ -388,7 +412,7 @@ function coveragePanel(items) {
       status.append(badge(item.state, item.reason === 'document_import' ? 'Imported documents' : label(item.state)));
       if (item.reason) status.append(node('small', reasonLabels[item.reason] ?? 'The provider reported a coverage limitation. Check provider configuration and try syncing again.'));
     }
-    row.append(cell(accountName(item.account_id)), cell(label(item.capability)), status,
+    row.append(accountCell(item.account_id), cell(label(item.capability)), status,
       cell(item.from && item.to ? `${timestamp(item.from)} to ${timestamp(item.to)} (end exclusive)` : 'Not reported'), cell(timestamp(item.checked_at)));
     body.append(row);
   }
@@ -450,7 +474,9 @@ async function renderOverview(signal, current) {
   const fragment = document.createDocumentFragment();
   const metrics = node('section', undefined, 'metrics');
   metrics.setAttribute('aria-label', 'Saved utility data');
-  const values = [[summary.accounts, 'Utility accounts'], [summary.bills, 'Saved bills'], ...(hasCollections ? [[summary.collections, 'Saved trash collections']] : []), [summary.usage_intervals, 'Usage intervals']];
+  const vendors = importedVendors();
+  const utilityCount = vendors.size + accounts.filter((account) => !account.import_only).length;
+  const values = [[utilityCount, vendors.size ? 'Utilities' : 'Utility accounts'], [summary.bills, 'Saved bills'], ...(hasCollections ? [[summary.collections, 'Saved trash collections']] : []), [summary.usage_intervals, 'Usage intervals']];
   for (const [value, title] of values) {
     const metric = node('div', undefined, 'metric');
     metric.append(node('span', count(value), 'metric-value'), node('span', title, 'metric-label'));
@@ -476,7 +502,10 @@ async function renderOverview(signal, current) {
     for (const balance of balances.items) {
       const item = node('li');
       const description = node('div');
-      description.append(node('strong', accountName(balance.account_id)), node('p', `As of ${timestamp(balance.as_of)}`));
+      const { name, context } = accountDisplay(balance.account_id);
+      description.append(node('strong', name));
+      if (context) description.append(node('p', context));
+      description.append(node('p', `As of ${timestamp(balance.as_of)}`));
       item.append(description, node('strong', money(balance.amount), 'amount'));
       list.append(item);
     }
@@ -503,12 +532,36 @@ async function renderOverview(signal, current) {
   columns.append(collectionPanel);
   }
   fragment.append(metrics, freshness, syncStatus());
+  const billVendors = importedVendors(accountsFor('bills'));
+  if (billVendors.size) fragment.append(importedVendorPanel(billVendors));
   const cost = billingTrend(bills);
   if (cost) fragment.append(cost);
   const reportedUsage = reportedUsageTrend(bills);
   if (reportedUsage) fragment.append(reportedUsage);
   fragment.append(columns, coveragePanel(summary.coverage));
   content.replaceChildren(fragment);
+}
+
+function importedVendorPanel(vendors) {
+  const section = panel('Imported vendors');
+  section.setAttribute('aria-label', 'Imported vendors');
+  const list = node('ul', undefined, 'record-list');
+  for (const id of vendors.keys()) {
+    const name = providerName(id);
+    const row = node('li');
+    const open = node('button', 'View bills', 'quiet');
+    open.type = 'button';
+    open.setAttribute('aria-label', `View ${name} bills`);
+    open.addEventListener('click', () => {
+      const state = listStateFor('bills');
+      state.filters = { ...state.filters, account: '', import_provider: id };
+      navigate('bills');
+    });
+    row.append(node('strong', name), open);
+    list.append(row);
+  }
+  section.append(list);
+  return section;
 }
 
 function billingTrend(bills) {
@@ -595,6 +648,10 @@ function reportedUsageTrend(bills) {
 function initialFilters(type) {
   return { account: '', service: '', from: dateOffset(type === 'bills' ? -365 : type === 'collections' ? -30 : -7), to: dateOffset(type === 'collections' ? 30 : 0) };
 }
+function listStateFor(type) {
+  if (!listState.has(type)) listState.set(type, { filters: initialFilters(type), items: [], next: null, coverage: [] });
+  return listState.get(type);
+}
 function selectField(title, name, options, value = '', required = false) {
   const field = node('div', undefined, 'form-field');
   const caption = node('label', title);
@@ -629,7 +686,20 @@ function setDateValidity(from, to) {
 function filterForm(type, state, onSubmit) {
   const form = node('form', undefined, 'toolbar');
   form.setAttribute('aria-label', `Filter ${type}`);
-  const account = selectField('Account', 'account', [['', 'All accounts'], ...accountsFor(type).map((item) => [item.id, item.name])], state.filters.account);
+  const matchingAccounts = accountsFor(type);
+  const vendors = type === 'bills' ? importedVendors(matchingAccounts) : new Map();
+  let selected = state.filters.import_provider ? importProviderPrefix + state.filters.import_provider : state.filters.account;
+  const options = [
+    ['', 'All accounts'],
+    ...matchingAccounts.filter((item) => type !== 'bills' || !item.import_only).map((item) => [item.id, item.name]),
+    ...Array.from(vendors.keys(), (id) => [importProviderPrefix + id, providerName(id)]),
+  ];
+  if (!options.some(([id]) => id === selected)) {
+    selected = '';
+    state.filters.account = '';
+    delete state.filters.import_provider;
+  }
+  const account = selectField(vendors.size ? 'Account or vendor' : 'Account', 'account', options, selected);
   form.append(account.field);
   let service = null;
   if (type !== 'bills') {
@@ -655,7 +725,13 @@ function filterForm(type, state, onSubmit) {
     event.preventDefault();
     setDateValidity(from.input, to.input);
     if (!form.reportValidity()) return;
-    state.filters = { account: account.select.value, service: service?.select.value ?? '', from: from.input.value, to: to.input.value };
+    const selected = account.select.value;
+    const vendor = type === 'bills' && selected.startsWith(importProviderPrefix);
+    state.filters = {
+      account: vendor ? '' : selected,
+      ...(vendor ? { import_provider: selected.slice(importProviderPrefix.length) } : {}),
+      service: service?.select.value ?? '', from: from.input.value, to: to.input.value,
+    };
     onSubmit();
   });
   return form;
@@ -666,8 +742,7 @@ function serviceOptions(account, capability) {
 }
 
 async function renderList(type, signal, current) {
-  if (!listState.has(type)) listState.set(type, { filters: initialFilters(type), items: [], next: null, coverage: [] });
-  const state = listState.get(type);
+  const state = listStateFor(type);
   const filter = filterForm(type, state, () => renderView());
   const results = node('section');
   results.setAttribute('aria-label', `${label(type)} results`);
@@ -732,12 +807,13 @@ function recordTable(type, items) {
       const issued = cell();
       const open = node('button', calendarDate(item.issued_on), 'record-button');
       open.type = 'button';
-      open.setAttribute('aria-label', `View ${accountName(item.account_id)} bill issued ${calendarDate(item.issued_on)}`);
+      const { name, context } = accountDisplay(item.account_id);
+      open.setAttribute('aria-label', `View ${context ? `${name}, ${context}` : name} bill issued ${calendarDate(item.issued_on)}`);
       open.addEventListener('click', () => openBill(item.id));
       issued.append(open);
       const providerStatus = cell(item.source_status ?? 'Not reported');
       if (item.provider === 'bayou' && item.source_status) providerStatus.append(node('small', 'Data access status, not payment'));
-      row.append(issued, cell(accountName(item.account_id)), cell(calendarDate(item.due_on)), cell(money(item.total), true), providerStatus);
+      row.append(issued, accountCell(item.account_id), cell(calendarDate(item.due_on)), cell(money(item.total), true), providerStatus);
     } else if (type === 'collections') {
       const service = cell(serviceName(item.service_id));
       service.append(node('small', accountName(item.account_id)));
@@ -879,7 +955,9 @@ function importedBill(bill, { currency, bill: { record }, related }) {
   const amount = (minor_units) => minor_units == null ? null : money({ currency, minor_units });
   const selectedServices = record.scope === 'selected_services';
   const sheet = node('article', undefined, 'imported-bill');
-  sheet.append(node('h3', accountName(bill.account_id), 'billing-account'));
+  const { name, context } = accountDisplay(bill.account_id);
+  sheet.append(node('h3', name, 'billing-account'));
+  if (context) sheet.append(node('p', context, 'billing-account-context'));
   const totals = node('dl', undefined, 'billing-totals');
   for (const [title, value] of [
     ['Amount due', record.totals.amount_due_minor],
@@ -952,6 +1030,8 @@ function importedBill(bill, { currency, bill: { record }, related }) {
 function renderSettings() {
   const fragment = document.createDocumentFragment();
   fragment.append(connectionManager.section());
+  const vendors = importedVendors();
+  const syncAccounts = accounts.filter((account) => !account.import_only);
   const providerGrid = node('section', undefined, 'provider-grid');
   providerGrid.setAttribute('aria-label', 'Utility providers');
   for (const provider of providers) {
@@ -976,6 +1056,20 @@ function renderSettings() {
     capabilities.setAttribute('aria-label', 'Supported data');
     for (const capability of provider.capabilities) capabilities.append(node('span', label(capability)));
     card.append(capabilities);
+    const imported = vendors.get(provider.id);
+    if (imported) {
+      const bindings = node('ul', undefined, 'imported-accounts');
+      bindings.setAttribute('aria-label', 'Imported billing accounts');
+      for (const account of imported) {
+        const row = node('li');
+        row.append(node('strong', account.name));
+        if (account.services.length) {
+          row.append(node('p', account.services.map((service) => service.name).join(', ')));
+        }
+        bindings.append(row);
+      }
+      card.append(bindings);
+    }
     providerGrid.append(card);
   }
   if (!providers.length) providerGrid.append(empty('No providers available', 'Check the app configuration.'));
@@ -986,7 +1080,7 @@ function renderSettings() {
   else {
     const grid = node('div', undefined, 'panel-body');
     grid.classList.add('account-grid');
-    for (const account of accounts) {
+    for (const account of syncAccounts) {
       const card = node('article');
       card.append(node('h3', account.name), node('p', label(account.provider)));
       const services = node('ul');
@@ -1000,7 +1094,6 @@ function renderSettings() {
   const sync = panel('Sync provider data');
   sync.classList.add('settings-section');
   const body = node('div', undefined, 'panel-body');
-  const syncAccounts = accounts.filter((account) => !account.import_only);
   if (syncAccounts.length) {
     body.append(node('p', 'Fetch bills, collections, and usage for one bound account. This only reads provider data. It cannot pay a bill, book a pickup, or change a service.', 'muted'),
       syncForm(syncAccounts));
@@ -1009,7 +1102,8 @@ function renderSettings() {
   }
   body.append(syncStatus());
   sync.append(body);
-  fragment.append(bindings, sync, coveragePanel(summary.coverage));
+  if (syncAccounts.length || !accounts.length) fragment.append(bindings);
+  fragment.append(sync, coveragePanel(summary.coverage));
   content.replaceChildren(fragment);
 }
 

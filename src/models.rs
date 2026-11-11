@@ -183,6 +183,13 @@ pub struct CreateConnection {
 
 #[derive(JsonSchema, Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct ConnectionRename {
+    pub name: String,
+    pub expected_name: String,
+}
+
+#[derive(JsonSchema, Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ConnectionSelection {
     pub account: String,
     pub meters: Vec<String>,
@@ -366,6 +373,8 @@ pub struct Page<T> {
 #[serde(deny_unknown_fields)]
 pub struct ListQuery {
     pub account: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub import_provider: Option<ProviderId>,
     pub service: Option<String>,
     pub from: Option<NaiveDate>,
     pub to: Option<NaiveDate>,

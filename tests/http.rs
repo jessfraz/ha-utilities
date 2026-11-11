@@ -6,6 +6,19 @@ use reqwest::StatusCode;
 async fn real_http_auth_pagination_and_sync_outcomes() {
     let app = support::App::start().await;
     let client = reqwest::Client::new();
+    let rename = client
+        .post(format!(
+            "{}/v1/connections/fictional-connection/rename",
+            app.url
+        ))
+        .json(&ConnectionRename {
+            name: "Example utility".to_owned(),
+            expected_name: "Original label".to_owned(),
+        });
+    assert_eq!(
+        rename.send().await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
     assert_eq!(
         client
             .get(format!("{}/v1/bills", app.url))

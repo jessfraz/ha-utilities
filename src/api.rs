@@ -3,8 +3,8 @@ use crate::{
     config::{Config, valid_id},
     connect::{ConnectionError, ConnectionHandle},
     imports::{
-        BillDetails, ImportError, ImportReceipt, ImportRequest, MAX_DOCUMENT_BYTES,
-        MAX_IMPORT_REQUEST_BYTES,
+        BillDetails, ImportAccountPurge, ImportAccountPurgeReceipt, ImportError, ImportReceipt,
+        ImportRequest, MAX_DOCUMENT_BYTES, MAX_IMPORT_REQUEST_BYTES,
     },
     models::*,
     store::{Store, StoreError},
@@ -67,6 +67,17 @@ impl Context {
             .into_iter()
             .map(|account| account.id)
             .collect())
+    }
+
+    async fn list_accounts(&self, query: &ListQuery) -> Result<Vec<String>, HttpError> {
+        if let Some(provider) = query.import_provider {
+            self.store
+                .import_account_ids(&self.config.deployment, provider)
+                .await
+                .map_err(store_error)
+        } else {
+            self.accounts().await
+        }
     }
 }
 
@@ -407,6 +418,27 @@ async fn connection_get(
     ))
 }
 
+#[endpoint {method=POST,path="/v1/connections/{id}/rename",tags=["connections"],request_body_max_bytes=1024}]
+async fn connection_rename(
+    request: RequestContext<Arc<Context>>,
+    path: Path<RecordPath>,
+    body: TypedBody<ConnectionRename>,
+) -> Result<PrivateOk<Connection>, HttpError> {
+    authorized(&request)?;
+    let context = request.context();
+    Ok(private(
+        context
+            .store
+            .rename_connection(
+                &context.config.deployment,
+                &path.into_inner().id,
+                body.into_inner(),
+            )
+            .await
+            .map_err(|error| connection_error(ConnectionError::Store(error)))?,
+    ))
+}
+
 #[endpoint {method=POST,path="/v1/connections/{id}/refresh",tags=["connections"]}]
 async fn connection_refresh(
     request: RequestContext<Arc<Context>>,
@@ -536,14 +568,15 @@ async fn bills(
     query: Query<ListQuery>,
 ) -> Result<PrivateOk<Page<Bill>>, HttpError> {
     authorized(&request)?;
+    let query = query.into_inner();
     Ok(private(
         request
             .context()
             .store
             .list(
                 "bill",
-                &query.into_inner(),
-                &request.context().accounts().await?,
+                &query,
+                &request.context().list_accounts(&query).await?,
             )
             .await
             .map_err(store_error)?,
@@ -555,14 +588,15 @@ async fn balances(
     query: Query<ListQuery>,
 ) -> Result<PrivateOk<Page<Balance>>, HttpError> {
     authorized(&request)?;
+    let query = query.into_inner();
     Ok(private(
         request
             .context()
             .store
             .list(
                 "balance",
-                &query.into_inner(),
-                &request.context().accounts().await?,
+                &query,
+                &request.context().list_accounts(&query).await?,
             )
             .await
             .map_err(store_error)?,
@@ -574,14 +608,15 @@ async fn collections(
     query: Query<ListQuery>,
 ) -> Result<PrivateOk<Page<Collection>>, HttpError> {
     authorized(&request)?;
+    let query = query.into_inner();
     Ok(private(
         request
             .context()
             .store
             .list(
                 "collection",
-                &query.into_inner(),
-                &request.context().accounts().await?,
+                &query,
+                &request.context().list_accounts(&query).await?,
             )
             .await
             .map_err(store_error)?,
@@ -593,14 +628,15 @@ async fn usage(
     query: Query<ListQuery>,
 ) -> Result<PrivateOk<Page<Usage>>, HttpError> {
     authorized(&request)?;
+    let query = query.into_inner();
     Ok(private(
         request
             .context()
             .store
             .list(
                 "usage",
-                &query.into_inner(),
-                &request.context().accounts().await?,
+                &query,
+                &request.context().list_accounts(&query).await?,
             )
             .await
             .map_err(store_error)?,
@@ -683,6 +719,28 @@ async fn import_records(
         context
             .store
             .import(&context.config.deployment, body.into_inner())
+            .await
+            .map_err(import_error)?,
+    ))
+}
+
+/// Remove an import-only account and its exclusively linked source documents.
+#[endpoint {method=POST,path="/v1/imports/accounts/{id}/purge",tags=["imports"],request_body_max_bytes=1024}]
+async fn purge_import_account(
+    request: RequestContext<Arc<Context>>,
+    path: Path<RecordPath>,
+    body: TypedBody<ImportAccountPurge>,
+) -> Result<PrivateOk<ImportAccountPurgeReceipt>, HttpError> {
+    authorized(&request)?;
+    let context = request.context();
+    Ok(private(
+        context
+            .store
+            .purge_import_account(
+                &context.config.deployment,
+                &path.into_inner().id,
+                body.into_inner(),
+            )
             .await
             .map_err(import_error)?,
     ))
@@ -925,7 +983,7 @@ async fn schema(request: RequestContext<Arc<Context>>) -> Result<Response<Body>,
 
 pub fn description() -> anyhow::Result<ApiDescription<Arc<Context>>> {
     let mut api = ApiDescription::new();
-    let endpoints: [dropshot::ApiEndpoint<Arc<Context>>; 31] = [
+    let endpoints: [dropshot::ApiEndpoint<Arc<Context>>; 33] = [
         system.into(),
         health.into(),
         providers.into(),
@@ -934,6 +992,7 @@ pub fn description() -> anyhow::Result<ApiDescription<Arc<Context>>> {
         connections.into(),
         connection_start.into(),
         connection_get.into(),
+        connection_rename.into(),
         connection_refresh.into(),
         connection_resume.into(),
         connection_authorization.into(),
@@ -945,6 +1004,7 @@ pub fn description() -> anyhow::Result<ApiDescription<Arc<Context>>> {
         document_put.into(),
         document_get.into(),
         import_records.into(),
+        purge_import_account.into(),
         balances.into(),
         collections.into(),
         usage.into(),

@@ -60,6 +60,20 @@ pub struct ImportReceipt {
     pub replayed: bool,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ImportAccountPurge {
+    pub provider: ProviderId,
+    pub expected_records: u64,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+pub struct ImportAccountPurgeReceipt {
+    pub removed: bool,
+    pub records: u64,
+    pub documents: u64,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ImportRecord {
