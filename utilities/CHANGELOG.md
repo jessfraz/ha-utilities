@@ -1,3 +1,8 @@
+# 0.1.9
+
+Show billed water use and propane deliveries in Usage, with billing periods
+and original source documents. Show the import state for saved documents.
+
 # 0.1.8
 
 Allow the owner to remove an import-only account and its exclusive source
