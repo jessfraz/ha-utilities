@@ -1,7 +1,8 @@
 //! Native and HA transports share the same typed local read model.
 use crate::imports::{
-    ImportAccountConsolidation, ImportAccountConsolidationReceipt, ImportReceipt, ImportRequest,
-    MAX_DOCUMENT_BYTES, MAX_IMPORT_REQUEST_BYTES, valid_digest,
+    ImportAccountConsolidation, ImportAccountConsolidationReceipt, ImportBillPurge,
+    ImportBillPurgeReceipt, ImportReceipt, ImportRequest, MAX_DOCUMENT_BYTES,
+    MAX_IMPORT_REQUEST_BYTES, valid_digest,
 };
 use crate::models::*;
 use reqwest::{
@@ -339,6 +340,27 @@ impl Client {
             .send(Method::POST, url, Some(("application/json", body)))
             .await?;
         Self::response_json(response).await
+    }
+
+    pub async fn purge_imported_bill(
+        &self,
+        id: &str,
+        input: &ImportBillPurge,
+    ) -> Result<ImportBillPurgeReceipt, ClientError> {
+        input
+            .validate()
+            .map_err(|_| ClientError::new("invalid_import", None))?;
+        let mut url = self.endpoint("imports", Some("bills"), None)?;
+        url.path_segments_mut()
+            .map_err(|_| ClientError::new("invalid_url", None))?
+            .push(id)
+            .push("purge");
+        self.request(
+            Method::POST,
+            url,
+            Some(serde_json::to_vec(input).map_err(|_| ClientError::new("invalid_import", None))?),
+        )
+        .await
     }
 
     pub async fn connection_utilities(&self) -> Result<Page<ConnectableUtility>, ClientError> {

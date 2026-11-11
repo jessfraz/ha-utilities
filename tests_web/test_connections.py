@@ -47,6 +47,7 @@ class BayouFixture:
     bills_queries: list[set[str]] = field(default_factory=list)
     bill: dict[str, object] | None = None
     bill_requests: list[str] = field(default_factory=list)
+    extra_accounts: list[dict[str, object]] = field(default_factory=list)
 
     async def handle(self, request: web.Request) -> web.Response:
         if request.path == "/api/v2/utilities":
@@ -117,7 +118,8 @@ class BayouFixture:
                             {"id": "fictional-electric-5678", "type": "electric"},
                             {"id": "fictional-gas-9012", "type": "gas"},
                         ],
-                    }
+                    },
+                    *self.extra_accounts,
                 ]
                 if self.authenticated
                 else [],
@@ -215,6 +217,12 @@ async def sign_in(page: Page, fixture: ConnectionBackend) -> None:
     await expect(page.locator("#content")).to_have_attribute("aria-busy", "false")
 
 
+async def reopen_connection_settings(page: Page) -> None:
+    await page.get_by_role("button", name="Settings", exact=True).click()
+    await page.get_by_role("button", name="Connection settings", exact=True).click()
+    await expect(page.get_by_role("dialog")).to_be_visible()
+
+
 async def start_connection(
     page: Page | Frame,
     provider: BayouFixture,
@@ -233,7 +241,7 @@ async def start_connection(
     await dialog.get_by_label("Utility", exact=True).select_option("speculoos_power")
     await expect(dialog.get_by_label("Display name (optional)")).to_have_count(0)
     if screenshot is not None:
-        await owner.screenshot(path=str(screenshot), full_page=True)
+        await owner.screenshot(path=str(screenshot), full_page=False)
     consent = dialog.get_by_role("checkbox")
     await expect(consent).not_to_be_checked()
     submit = dialog.get_by_role("button", name="Continue to sign-in")
@@ -250,11 +258,12 @@ async def start_connection(
     await expect(
         dialog.get_by_role("button", name="Close utility connection")
     ).to_be_in_viewport(ratio=1)
+    await consent.check()
+    await expect(submit).to_be_enabled()
     if screenshot is not None:
         await owner.screenshot(
-            path=str(screenshot.with_stem(screenshot.stem + "-policy")), full_page=True
+            path=str(screenshot.with_stem(screenshot.stem + "-policy")), full_page=False
         )
-    await consent.check()
     await dialog.get_by_role("button", name="Continue to sign-in").click()
     await expect(page.get_by_role("dialog").get_by_role("status")).to_have_text(
         "Sign-in needed", timeout=15000
@@ -519,19 +528,20 @@ async def test_hosted_link_meter_selection_and_saved_connection(
             await page.keyboard.press("Space")
             await expect(choice).to_be_checked()
             await submit.click()
-            await expect(dialog.get_by_role("status")).to_have_text("Connected")
+            await expect(dialog.locator(".connection-status")).to_have_text(
+                "Accounts linked"
+            )
             await expect(page.locator(".account-grid h3")).to_have_text(
                 "Speculoos Power"
             )
-            await expect(page.locator(".sync-form select option")).to_have_count(2)
+            await expect(dialog.locator(".sync-form")).to_have_count(1)
+            await expect(page.get_by_label("Account to sync")).to_have_count(0)
             await page.screenshot(
                 path=str(tmp_path / f"connections-{width}-{theme}-connected.png"),
                 full_page=True,
             )
-            await dialog.get_by_role("button", name="Go to sync settings").click()
-            await expect(
-                page.get_by_label("Account to sync").locator("option")
-            ).to_have_count(2)
+            await dialog.get_by_role("button", name="Close utility connection").click()
+            await expect(page.locator(".sync-form")).to_have_count(0)
             await expect(
                 page.get_by_role(
                     "button", name=re.compile(r"^(Trash )?[Cc]ollections$")
@@ -542,13 +552,13 @@ async def test_hosted_link_meter_selection_and_saved_connection(
                 page.get_by_role("heading", name="Speculoos Power", exact=True)
             ).to_have_count(1)
             await page.get_by_role(
-                "button", name="Connection details", exact=True
+                "button", name="Connection settings", exact=True
             ).click()
-            await expect(dialog.get_by_role("status")).to_have_text("Connected")
+            await expect(dialog.locator(".connection-status")).to_have_text(
+                "Accounts linked"
+            )
             await dialog.get_by_role("button", name="Close utility connection").click()
-            await expect(
-                page.get_by_label("Account to sync").locator("option")
-            ).to_have_count(2)
+            await expect(page.locator(".sync-form")).to_have_count(0)
             assert len(fixture.provider.posts) == 1
             raw = await asyncio.to_thread(fixture.backend.database.read_bytes)
             assert (
@@ -558,6 +568,224 @@ async def test_hosted_link_meter_selection_and_saved_connection(
             )
             assert not errors
         finally:
+            await browser.close()
+
+
+async def test_connected_utility_owns_sync_without_a_global_account_picker(
+    connection_backend: ConnectionBackend,
+) -> None:
+    fixture = connection_backend
+    fixture.provider.bills_ready = True
+    gate = asyncio.Event()
+    fixture.provider.bills_gate = gate
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch()
+        try:
+            page = await browser.new_page()
+            await sign_in(page, fixture)
+            await start_connection(page, fixture.provider)
+            dialog = page.get_by_role("dialog")
+            fixture.provider.authenticated = True
+            await dialog.get_by_role("button", name="Check status", exact=True).click()
+            await dialog.get_by_role("checkbox", name="Electricity").check()
+            await dialog.get_by_role("button", name="Connect selected meters").click()
+            submit = dialog.get_by_role("button", name="Sync account", exact=True)
+            await expect(submit).to_be_visible()
+            await expect(page.get_by_label("Account to sync")).to_have_count(0)
+            await expect(
+                page.get_by_role("heading", name="Sync provider data", exact=True)
+            ).to_have_count(0)
+            await expect(dialog.locator(".sync-status")).to_contain_text("Syncing")
+            await expect(submit).to_be_disabled()
+            gate.set()
+            await expect(dialog.locator(".sync-status")).to_contain_text(
+                "Coverage gaps"
+            )
+            await expect(submit).to_be_enabled()
+            async with page.expect_request(
+                lambda request: (
+                    request.method == "POST" and request.url.endswith("/v1/sync")
+                )
+            ) as started:
+                await submit.click()
+            body = (await started.value).post_data_json
+            assert isinstance(body, dict)
+            async with ClientSession(
+                headers={"Authorization": f"Bearer {TOKEN}"}
+            ) as client:
+                async with client.get(
+                    f"{fixture.backend.origin}/v1/accounts"
+                ) as response:
+                    account = (await response.json())["items"][0]
+            assert body["account"] == account["id"]
+            assert set(body) == {"account", "from", "to"}
+            await dialog.get_by_role("button", name="Close utility connection").click()
+            await expect(page.locator(".sync-form")).to_have_count(0)
+            await page.get_by_role(
+                "button", name="Connection settings", exact=True
+            ).click()
+            await expect(dialog.get_by_label("From", exact=True)).to_be_visible()
+        finally:
+            gate.set()
+            await browser.close()
+
+
+@pytest.mark.parametrize(
+    ("device", "width", "height", "touch"),
+    [
+        ("iphone", 390, 844, True),
+        ("ipad", 820, 1180, True),
+        ("desktop", 1440, 1000, False),
+    ],
+)
+async def test_each_connected_account_has_its_own_sync_context(
+    connection_backend: ConnectionBackend,
+    tmp_path: Path,
+    device: str,
+    width: int,
+    height: int,
+    touch: bool,
+) -> None:
+    fixture = connection_backend
+    fixture.provider.bills_ready = True
+    fixture.provider.extra_accounts = [
+        {
+            "id": "fictional-account-8765",
+            "meters": [{"id": "fictional-gas-4321", "type": "gas"}],
+        }
+    ]
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch()
+        try:
+            page = await browser.new_page(
+                viewport={"width": width, "height": height},
+                is_mobile=touch,
+                has_touch=touch,
+            )
+            await sign_in(page, fixture)
+            await start_connection(page, fixture.provider)
+            dialog = page.get_by_role("dialog")
+            fixture.provider.authenticated = True
+            await dialog.get_by_role("button", name="Check status", exact=True).click()
+            await (
+                dialog.get_by_role("group", name="Account ending 1234")
+                .get_by_role("checkbox", name="Electricity")
+                .check()
+            )
+            await (
+                dialog.get_by_role("group", name="Account ending 8765")
+                .get_by_role("checkbox", name="Gas")
+                .check()
+            )
+            await dialog.get_by_role("button", name="Connect selected meters").click()
+            first = dialog.get_by_role("region", name="Account 1", exact=True)
+            second = dialog.get_by_role("region", name="Account 2", exact=True)
+            await expect(first.get_by_text("Electricity", exact=True)).to_be_visible()
+            await expect(second.get_by_text("Gas", exact=True)).to_be_visible()
+            await expect(dialog.get_by_role("combobox")).to_have_count(0)
+            submit = second.get_by_role("button", name="Sync account", exact=True)
+            await expect(submit).to_be_enabled()
+            await expect(
+                first.get_by_role("button", name="Sync account", exact=True)
+            ).to_be_enabled()
+            assert not await page.evaluate(
+                "document.documentElement.scrollWidth > innerWidth"
+            )
+            await page.screenshot(
+                path=str(tmp_path / f"{device}-multiple-accounts.png"), full_page=False
+            )
+            await second.scroll_into_view_if_needed()
+            await page.screenshot(
+                path=str(tmp_path / f"{device}-second-account.png"), full_page=False
+            )
+            async with page.expect_request(
+                lambda request: (
+                    request.method == "POST" and request.url.endswith("/v1/sync")
+                )
+            ) as started:
+                await submit.click()
+            body = (await started.value).post_data_json
+            assert isinstance(body, dict)
+            async with ClientSession(
+                headers={"Authorization": f"Bearer {TOKEN}"}
+            ) as client:
+                async with client.get(
+                    f"{fixture.backend.origin}/v1/accounts"
+                ) as result:
+                    bound = (await result.json())["items"]
+            gas = next(
+                account for account in bound if account["services"][0]["kind"] == "gas"
+            )
+            assert body["account"] == gas["id"]
+            ids = await dialog.locator("[id]").evaluate_all(
+                "elements => elements.map(element => element.id)"
+            )
+            assert len(ids) == len(set(ids))
+        finally:
+            await browser.close()
+
+
+async def test_reopening_connection_cannot_repeat_a_pending_sync(
+    connection_backend: ConnectionBackend,
+) -> None:
+    fixture = connection_backend
+    fixture.provider.bills_ready = True
+    provider_gate = asyncio.Event()
+    provider_gate.set()
+    fixture.provider.bills_gate = provider_gate
+    response_gate = asyncio.Event()
+    accepted = asyncio.Event()
+    submissions: list[object] = []
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch()
+        try:
+            page = await browser.new_page()
+            await sign_in(page, fixture)
+            await start_connection(page, fixture.provider)
+            dialog = page.get_by_role("dialog")
+            fixture.provider.authenticated = True
+            await dialog.get_by_role("button", name="Check status", exact=True).click()
+            await dialog.get_by_role("checkbox", name="Electricity").check()
+            await dialog.get_by_role("button", name="Connect selected meters").click()
+            await expect(dialog.locator(".sync-status")).to_contain_text(
+                "Coverage gaps"
+            )
+
+            async def hold_response(route: Route) -> None:
+                if route.request.method != "POST":
+                    await route.continue_()
+                    return
+                submissions.append(route.request.post_data_json)
+                response = await route.fetch()
+                accepted.set()
+                await response_gate.wait()
+                await route.fulfill(response=response)
+
+            await page.route("**/v1/sync", hold_response)
+            provider_gate.clear()
+            await dialog.get_by_role("button", name="Sync account", exact=True).click()
+            await accepted.wait()
+            await dialog.get_by_role("button", name="Close utility connection").click()
+            await reopen_connection_settings(page)
+            await expect(
+                dialog.get_by_role("button", name="Sync account", exact=True)
+            ).to_be_disabled()
+            await expect(
+                dialog.get_by_role("button", name="Sync all available history")
+            ).to_be_disabled()
+            response_gate.set()
+            await expect(dialog.locator(".sync-status")).to_contain_text("Syncing")
+            provider_gate.set()
+            await expect(dialog.locator(".sync-status")).to_contain_text(
+                "Coverage gaps"
+            )
+            await expect(
+                dialog.get_by_role("button", name="Sync account", exact=True)
+            ).to_be_enabled()
+            assert len(submissions) == 1
+        finally:
+            response_gate.set()
+            provider_gate.set()
             await browser.close()
 
 
@@ -586,7 +814,7 @@ async def test_manual_sync_progress_survives_reload_and_reconciles_overlapping_r
         "total_amount": 12050,
         "meters": [{"id": "fictional-electric-5678", "type": "electric"}],
     }
-    running = re.compile(r"(?:syncing|running).*speculoos power", re.I)
+    running = re.compile(r"^Syncing")
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch()
         try:
@@ -598,23 +826,19 @@ async def test_manual_sync_progress_survives_reload_and_reconciles_overlapping_r
             await dialog.get_by_role("button", name="Check status", exact=True).click()
             await dialog.get_by_role("checkbox", name="Electricity").check()
             await dialog.get_by_role("button", name="Connect selected meters").click()
-            await dialog.get_by_role("button", name="Go to sync settings").click()
-
-            status = page.locator("#sync-status")
+            status = dialog.locator(".sync-status")
             await expect(status).to_contain_text("Coverage gaps")
             gate.clear()
-            account = page.get_by_label("Account to sync")
-            await account.select_option(label="Speculoos Power")
             submit = page.get_by_role("button", name="Sync account")
             await submit.click()
             await expect(status).to_have_text(running)
             await page.reload()
+            await reopen_connection_settings(page)
             await expect(status).to_have_text(running)
             from_field = page.get_by_label("From", exact=True)
             to_field = page.get_by_label("To", exact=True)
             await expect(from_field).to_have_value(from_default.isoformat())
             await expect(to_field).to_have_value(today.isoformat())
-            await account.select_option(label="Speculoos Power")
             await expect(submit).to_be_disabled()
             gate.set()
             await expect(status).to_contain_text("Coverage gaps")
@@ -624,9 +848,10 @@ async def test_manual_sync_progress_survives_reload_and_reconciles_overlapping_r
             gate.clear()
             await from_field.fill((today - timedelta(days=30)).isoformat())
             await submit.click()
-            await expect(status).to_contain_text("Syncing Speculoos Power")
+            await expect(status).to_contain_text("Syncing")
             await page.reload()
-            await expect(status).to_contain_text("Syncing Speculoos Power")
+            await reopen_connection_settings(page)
+            await expect(status).to_contain_text("Syncing")
             gate.set()
             await expect(status).to_contain_text("Coverage gaps")
             assert fixture.provider.bill_requests.count(billed_on.isoformat()) == 2
@@ -640,6 +865,7 @@ async def test_manual_sync_progress_survives_reload_and_reconciles_overlapping_r
 
             await page.clock.set_fixed_time(datetime(2026, 5, 31, 12, tzinfo=UTC))
             await page.reload()
+            await reopen_connection_settings(page)
             await expect(from_field).to_have_value("2026-02-28")
             await expect(to_field).to_have_value("2026-05-31")
         finally:
@@ -665,15 +891,11 @@ async def test_first_and_manual_sync_share_saved_progress(
             await dialog.get_by_role("button", name="Check status", exact=True).click()
             await dialog.get_by_role("checkbox", name="Electricity").check()
             await dialog.get_by_role("button", name="Connect selected meters").click()
-            await dialog.get_by_role("button", name="Go to sync settings").click()
-
-            status = page.locator("#sync-status")
-            await expect(status).to_contain_text("Syncing Speculoos Power")
+            status = dialog.locator(".sync-status")
+            await expect(status).to_contain_text("Syncing")
             await page.reload()
-            await expect(status).to_contain_text("Syncing Speculoos Power")
-            await page.get_by_label("Account to sync").select_option(
-                label="Speculoos Power"
-            )
+            await reopen_connection_settings(page)
+            await expect(status).to_contain_text("Syncing")
             submit = page.get_by_role("button", name="Sync account")
             await expect(submit).to_be_disabled()
             gate.set()
@@ -683,15 +905,13 @@ async def test_first_and_manual_sync_share_saved_progress(
 
             gate.clear()
             await submit.click()
-            await expect(status).to_contain_text("Syncing Speculoos Power")
+            await expect(status).to_contain_text("Syncing")
             await page.reload()
-            await expect(status).to_contain_text("Syncing Speculoos Power")
+            await reopen_connection_settings(page)
+            await expect(status).to_contain_text("Syncing")
             gate.set()
             await expect(status).to_contain_text("Coverage gaps")
 
-            await page.get_by_label("Account to sync").select_option(
-                label="Speculoos Power"
-            )
             await page.get_by_label("From", exact=True).fill("")
             await page.get_by_label("To", exact=True).fill("")
             gate.clear()
@@ -706,7 +926,7 @@ async def test_first_and_manual_sync_share_saved_progress(
             body = (await submitted.value).post_data_json
             assert isinstance(body, dict) and set(body) == {"account", "range"}
             assert body["range"] == "all"
-            await expect(status).to_contain_text("Syncing Speculoos Power")
+            await expect(status).to_contain_text("Syncing")
             gate.set()
             await expect(status).to_contain_text("Coverage gaps")
             assert fixture.provider.bills_queries[-1] == {"account_number"}
@@ -735,7 +955,7 @@ async def test_sync_progress_stays_visible_outside_settings(
             await dialog.get_by_role("checkbox", name="Electricity").check()
             await dialog.get_by_role("button", name="Connect selected meters").click()
             await expect(
-                dialog.get_by_role("button", name="Go to sync settings")
+                dialog.get_by_role("button", name="Sync account", exact=True)
             ).to_be_visible()
             await dialog.get_by_role("button", name="Close utility connection").click()
             await expect(
@@ -760,16 +980,16 @@ async def test_sync_progress_stays_visible_outside_settings(
             gate.set()
             await expect(status).not_to_contain_text("Syncing", timeout=10000)
             await expect(status).not_to_contain_text("Sync finished")
-            await expect(page.locator("#sync-status")).to_have_count(0)
+            await expect(page.locator(".sync-status")).to_have_count(0)
 
-            await page.get_by_role("button", name="Settings", exact=True).click()
-            await expect(page.locator("#sync-status")).to_contain_text("Coverage gaps")
-            gate.clear()
-            await page.get_by_label("Account to sync").select_option(
-                label="Speculoos Power"
+            await reopen_connection_settings(page)
+            await expect(dialog.locator(".sync-status")).to_contain_text(
+                "Coverage gaps"
             )
+            gate.clear()
             await page.get_by_role("button", name="Sync account", exact=True).click()
-            await expect(page.locator("#sync-status")).to_contain_text(progress)
+            await expect(dialog.locator(".sync-status")).to_contain_text("Syncing")
+            await dialog.get_by_role("button", name="Close utility connection").click()
             await page.get_by_role("button", name="Bills", exact=True).click()
             await expect(status).to_have_text(progress)
             await page.reload()
@@ -777,7 +997,7 @@ async def test_sync_progress_stays_visible_outside_settings(
             gate.set()
             await expect(status).not_to_contain_text("Syncing", timeout=10000)
             await expect(status).not_to_contain_text("Sync finished")
-            await expect(page.locator("#sync-status")).to_have_count(0)
+            await expect(page.locator(".sync-status")).to_have_count(0)
         finally:
             gate.set()
             await browser.close()

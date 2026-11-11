@@ -4,8 +4,8 @@ use ha_utilities::{
     client::{Client, ClientError, Transport},
     config::read_secret,
     imports::{
-        ImportAccountConsolidation, ImportReceipt, ImportRequest, MAX_DOCUMENT_BYTES,
-        MAX_IMPORT_REQUEST_BYTES, digest,
+        ImportAccountConsolidation, ImportBillPurge, ImportReceipt, ImportRequest,
+        MAX_DOCUMENT_BYTES, MAX_IMPORT_REQUEST_BYTES, digest,
     },
     models::{
         BindConnection, ConnectionProvider, ConnectionSelection, CreateConnection, ListQuery,
@@ -103,6 +103,17 @@ enum Command {
     /// Consolidate manual accounts using a reviewed JSON request.
     ConsolidateImports {
         request: PathBuf,
+    },
+    /// Delete an imported bill and exclude its identity from later imports.
+    PurgeImportedBill {
+        id: String,
+        #[arg(long)]
+        origin_id: String,
+        #[arg(long)]
+        expected_revision: String,
+        /// Remove a service only when this origin owns it and no records use it.
+        #[arg(long = "remove-unused-service")]
+        remove_unused_services: Vec<String>,
     },
 }
 
@@ -415,6 +426,24 @@ async fn ingest(
 async fn run(cli: Cli) -> Result<(), ClientError> {
     let client = || configured_client(&cli.client);
     match cli.command {
+        Command::PurgeImportedBill {
+            id,
+            origin_id,
+            expected_revision,
+            remove_unused_services,
+        } => print(
+            &client()?
+                .purge_imported_bill(
+                    &id,
+                    &ImportBillPurge {
+                        origin_id,
+                        expected_revision,
+                        remove_unused_services,
+                    },
+                )
+                .await?,
+            cli.json,
+        ),
         Command::ConsolidateImports { request } => {
             let file = File::open(request).map_err(|_| ClientError::new("invalid_import", None))?;
             let mut body = Vec::new();

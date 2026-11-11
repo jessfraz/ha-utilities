@@ -1,4 +1,5 @@
 //! Reconciled observations, indexed keyset reads, and durable sync lifecycle.
+mod bill_purge;
 pub(crate) mod connections;
 mod consolidation;
 mod imports;

@@ -26,6 +26,8 @@ pub enum ImportError {
     MissingDocument,
     #[error("an existing record has conflicting facts")]
     Conflict,
+    #[error("import includes an explicitly removed bill or related record")]
+    PurgedBill,
     #[error("import store operation failed")]
     Store(#[from] crate::store::StoreError),
 }
@@ -91,6 +93,39 @@ pub struct ImportAccountPurge {
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 pub struct ImportAccountPurgeReceipt {
+    pub removed: bool,
+    pub records: u64,
+    pub documents: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ImportBillPurge {
+    pub origin_id: String,
+    pub expected_revision: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub remove_unused_services: Vec<String>,
+}
+
+impl ImportBillPurge {
+    pub fn validate(&self) -> Result<(), ImportError> {
+        let mut services = BTreeSet::new();
+        if !valid_id(&self.origin_id)
+            || !valid_digest(&self.expected_revision)
+            || self.remove_unused_services.len() > 64
+            || self
+                .remove_unused_services
+                .iter()
+                .any(|id| !valid_id(id) || !services.insert(id))
+        {
+            return Err(ImportError::Invalid);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+pub struct ImportBillPurgeReceipt {
     pub removed: bool,
     pub records: u64,
     pub documents: u64,
@@ -591,6 +626,31 @@ impl ChargeLine {
 }
 
 impl ImportRecord {
+    pub(crate) fn references_services(&self, ids: &BTreeSet<&str>) -> bool {
+        match self {
+            Self::Bill(bill) => {
+                bill.services.iter().any(|service| {
+                    let id = match service {
+                        ServiceDetail::Water { service_id, .. }
+                        | ServiceDetail::Internet { service_id, .. }
+                        | ServiceDetail::Propane { service_id, .. } => service_id,
+                        ServiceDetail::Waste(detail) | ServiceDetail::Recycling(detail) => {
+                            &detail.service_id
+                        }
+                    };
+                    ids.contains(id.as_str())
+                }) || bill
+                    .charges
+                    .iter()
+                    .filter_map(|line| line.service_id.as_deref())
+                    .any(|id| ids.contains(id))
+            }
+            Self::MeterInterval(value) => ids.contains(value.service_id.as_str()),
+            Self::PropaneDelivery(value) => ids.contains(value.service_id.as_str()),
+            Self::Payment(_) | Self::BalanceSnapshot(_) => false,
+        }
+    }
+
     pub fn sources(&self) -> &[SourceRef] {
         match self {
             Self::Bill(value) => &value.sources,

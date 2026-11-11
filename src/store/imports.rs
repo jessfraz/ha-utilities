@@ -250,6 +250,28 @@ impl Store {
         let mut tx = self.pool.begin_with(queries::BEGIN_INGEST).await?;
         // Admit the manual source before receipts or legacy projection repairs.
         let binding = import_binding(&mut tx, deployment, &input).await?;
+        Self::reject_purged_bill_records(&mut tx, &input.account.id, &input.records).await?;
+        if input.account.services.iter().any(|service| {
+            !binding
+                .services
+                .iter()
+                .any(|active| active.id == service.id)
+        }) {
+            let mut active = input.account.clone();
+            active.services.retain(|service| {
+                binding
+                    .services
+                    .iter()
+                    .any(|current| current.id == service.id)
+            });
+            for record in &input.records {
+                if matches!(record,ImportRecord::Bill(bill) if bill.scope==crate::imports::BillScope::Account)
+                {
+                    return Err(ImportError::Binding);
+                }
+                record.validate(&active).map_err(|_| ImportError::Binding)?;
+            }
+        }
         let replayed: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM import_receipts WHERE origin_id=? AND digest=?)",
         )

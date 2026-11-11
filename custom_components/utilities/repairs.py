@@ -1,25 +1,29 @@
 """Use the shared version repair for the loaded Utilities entry."""
 
-from typing import TYPE_CHECKING
-
 from homeassistant.components.repairs import RepairsFlow
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from ._app_kit.repairs import VersionRepairSpec, create_version_fix_flow
 from ._app_kit.version import LOADED_VERSION
 from ._app_kit.versions import ReleaseVersion
-from .const import CONF_ADDON_SLUG, DOMAIN
+from .client import UtilitiesClient
+from .const import CONF_ADDON_SLUG, CONF_BACKEND_URL, CONF_TOKEN, DOMAIN
 from .models import record, valid_system
 
-if TYPE_CHECKING:
-    from .coordinator import UtilitiesCoordinator
 
-
-async def _async_probe(_hass: HomeAssistant, entry: ConfigEntry) -> ReleaseVersion:
-    coordinator: UtilitiesCoordinator = entry.runtime_data
-    system = record(await coordinator.read("/v1/system"))
+async def _async_probe(hass: HomeAssistant, entry: ConfigEntry) -> ReleaseVersion:
+    client = UtilitiesClient(
+        async_get_clientsession(hass),
+        entry.data[CONF_BACKEND_URL],
+        entry.data[CONF_TOKEN],
+    )
+    response = await client.request("GET", "/v1/system")
+    if response.status != 200:
+        raise HomeAssistantError("Utilities version is unavailable")
+    system = record(response.json())
     if not valid_system(system):
         raise HomeAssistantError("Utilities version is unavailable")
     return ReleaseVersion.parse(system.get("version"))

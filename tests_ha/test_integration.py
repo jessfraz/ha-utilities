@@ -592,6 +592,71 @@ async def test_bridge_consolidation_is_an_admin_only_bounded_import_command(
     assert received.authorization == f"Bearer {TOKEN}"
 
 
+async def test_bridge_bill_purge_requires_admin_and_an_exact_revision_guard(
+    entry: UtilitiesConfigEntry,
+    backend: Backend,
+    hass_client: ClientSessionGenerator,
+    hass_user_token: str,
+) -> None:
+    user = await hass_client(hass_user_token)
+    admin = await hass_client()
+    path = f"imports/bills/example-origin:import:bill:{'a' * 64}/purge"
+    body = {
+        "origin_id": "example-origin",
+        "expected_revision": "b" * 64,
+        "remove_unused_services": ["example-service"],
+    }
+    metadata = {"Content-Type": "application/json"}
+    backend.responses[f"/v1/{path}"] = (
+        200,
+        b'{"removed":true,"records":1,"documents":1}',
+        {},
+    )
+    backend.requests.clear()
+    assert (await user.post(f"{PREFIX}/{path}", json=body)).status == 403
+    assert (await admin.get(f"{PREFIX}/{path}")).status == 405
+    assert (await admin.post(f"{PREFIX}/{path}", data=json.dumps(body))).status == 415
+    assert (
+        await admin.post(
+            f"{PREFIX}/{path}",
+            data=b" " * (MAX_IMPORT_REQUEST_BYTES + 1),
+            headers=metadata,
+        )
+    ).status == 413
+    for invalid in [
+        {},
+        {**body, "account_id": "example-account"},
+        {**body, "origin_id": "../example-origin"},
+        {**body, "expected_revision": "b" * 63},
+        {**body, "expected_revision": "B" * 64},
+        {**body, "remove_unused_services": "example-service"},
+        {**body, "remove_unused_services": ["../example-service"]},
+    ]:
+        assert (await admin.post(f"{PREFIX}/{path}", json=invalid)).status == 400
+    assert not backend.requests
+    response = await admin.post(f"{PREFIX}/{path}", json=body)
+    assert response.status == 200
+    assert response.headers["Cache-Control"] == "no-store"
+    assert len(backend.requests) == 1
+    received = backend.requests[0]
+    assert received.method == "POST"
+    assert received.path == f"/v1/{path}"
+    assert received.content_type == "application/json"
+    assert json.loads(received.body) == body
+    assert received.authorization == f"Bearer {TOKEN}"
+    large = {
+        **body,
+        "remove_unused_services": [
+            f"service-{index:02}-" + "x" * 189 for index in range(64)
+        ],
+    }
+    assert len(json.dumps(large).encode()) > MAX_REQUEST_BYTES
+    response = await admin.post(f"{PREFIX}/{path}", json=large)
+    assert response.status == 200
+    assert len(backend.requests) == 2
+    assert json.loads(backend.requests[-1].body) == large
+
+
 async def test_hosted_connections_require_admin_even_for_the_authorization_link(
     entry: UtilitiesConfigEntry,
     backend: Backend,

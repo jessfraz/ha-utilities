@@ -88,6 +88,7 @@ kind = "electricity"
     if getattr(request, "param", None) == "account_cards":
 
         def attach_company() -> None:
+            connection_id = "019f442a-1100-7000-8000-000000000001"
             progress = {
                 "state": "connected",
                 "customer_id": "fictional-customer",
@@ -105,7 +106,7 @@ kind = "electricity"
                     "external_id,utility_id,utility_name,currency,progress) "
                     "VALUES(?,?,?,?,?,?,?,?)",
                     (
-                        "fixture-connection",
+                        connection_id,
                         "demo",
                         "fixture-request",
                         "fixture-external",
@@ -117,7 +118,7 @@ kind = "electricity"
                 )
                 connection.execute(
                     "UPDATE accounts SET connection_id=? WHERE id=?",
-                    ("fixture-connection", "demo-energy"),
+                    (connection_id, "demo-energy"),
                 )
 
         await asyncio.to_thread(attach_company)

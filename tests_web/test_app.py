@@ -28,6 +28,17 @@ async def open_app(page: Page, backend: WebBackend) -> None:
     await expect(page.locator(".coverage-panel")).to_have_count(0)
 
 
+async def open_connection_settings(page: Page, company: str) -> Locator:
+    await page.get_by_role("button", name="Settings", exact=True).click()
+    card = page.locator(".account-grid article").filter(
+        has=page.get_by_role("heading", name=company, exact=True)
+    )
+    await card.get_by_role("button", name="Connection settings", exact=True).click()
+    dialog = page.get_by_role("dialog", name=company, exact=True)
+    await expect(dialog).to_be_visible()
+    return dialog
+
+
 @pytest.mark.parametrize("web_backend", ["account_cards"], indirect=True)
 async def test_settings_show_sources_categories_and_collapsed_diagnostics(
     utility_page: Page, web_backend: WebBackend, tmp_path: Path
@@ -124,23 +135,30 @@ async def test_settings_show_sources_categories_and_collapsed_diagnostics(
     ).to_have_text(["Manual import", "Water"])
     await expect(water.locator("li")).to_have_count(0)
     await expect(water.locator(".account-services")).to_have_count(0)
+    await expect(water.get_by_role("button", name="Connection settings")).to_have_count(
+        0
+    )
     waste = cards.filter(
         has=page.get_by_role("heading", name="Waste Management", exact=True)
     )
     await expect(waste.get_by_text("API", exact=True)).to_have_count(1)
     await expect(waste.get_by_text("Waste Management", exact=True)).to_have_count(1)
     assert (await waste.inner_text()).count("Waste Management") == 1
-    await page.get_by_label("Account to sync", exact=True).select_option("demo-wm")
-    await expect(page.locator("#sync-availability")).to_have_text(
+    dialog = await open_connection_settings(page, "Waste Management")
+    await expect(dialog.locator(".sync-availability")).to_have_text(
         "Provider credentials are not configured."
     )
-    await expect(page.locator("#sync-status")).not_to_contain_text(
+    await expect(dialog.locator(".sync-status")).not_to_contain_text(
         "Waste Management · Waste Management"
     )
+    await dialog.get_by_role("button", name="Close utility connection").click()
     internet = cards.filter(
         has=page.get_by_role("heading", name="Starlink", exact=True)
     )
     await expect(internet.get_by_text("Manual import", exact=True)).to_have_count(1)
+    await expect(
+        internet.get_by_role("button", name="Connection settings")
+    ).to_have_count(0)
     await expect(
         internet.get_by_role(
             "group", name="Data source and service categories"
@@ -598,9 +616,9 @@ async def test_imported_vendor_bills_include_construction_across_pages(
     await page.set_viewport_size({"width": 390, "height": 844})
     await expect(card).to_be_visible()
     assert not await page.evaluate("document.documentElement.scrollWidth > innerWidth")
-    await page.get_by_label("Account to sync", exact=True).select_option("demo-wm")
+    dialog = await open_connection_settings(page, "Waste Management")
     await expect(
-        page.get_by_role("button", name="Sync account", exact=True)
+        dialog.get_by_role("button", name="Sync account", exact=True)
     ).to_be_disabled()
 
 
@@ -798,7 +816,7 @@ async def test_sync_poll_preserves_other_account_warnings(
     await page.clock.fast_forward(1500)
     await expect(status).not_to_contain_text("Syncing")
     await expect(status).to_contain_text("Bayou · Needs attention")
-    await expect(page.locator("#sync-status")).to_have_count(0)
+    await expect(page.locator(".sync-status")).to_have_count(0)
 
 
 async def test_sync_warnings_name_the_affected_provider_and_account(
@@ -865,13 +883,12 @@ async def test_sync_warnings_name_the_affected_provider_and_account(
     await expect(freshness).to_contain_text("Sync failed.")
     await expect(freshness).to_contain_text("Bayou")
     await expect(freshness).not_to_contain_text("Waste Management")
-    await expect(page.locator("#sync-status")).to_have_count(0)
-    await page.get_by_role("button", name="Settings", exact=True).click()
-    await expect(
-        page.locator("#sync-status .sync-result").filter(has_text="Sync failed")
-    ).to_contain_text("Bayou")
-    await page.get_by_label("Account to sync", exact=True).select_option("demo-energy")
-    await expect(page.locator("#sync-availability")).to_have_text(
+    await expect(page.locator(".sync-status")).to_have_count(0)
+    dialog = await open_connection_settings(page, "Bayou")
+    await expect(dialog.locator(".sync-status .sync-result")).to_contain_text(
+        "Sync failed"
+    )
+    await expect(dialog.locator(".sync-availability")).to_have_text(
         "Provider credentials are not configured."
     )
 
@@ -880,13 +897,11 @@ async def test_sync_warnings_name_the_affected_provider_and_account(
 
     await page.route("**/v1/sync", fail_status)
     await page.clock.run_for(15_001)
-    await expect(page.locator("#sync-status")).to_contain_text(
-        "Bayou · Sync status could not be checked. The last saved state was failed."
+    await expect(dialog.locator(".sync-status")).to_contain_text(
+        "Sync status could not be checked. The last saved result is shown above."
     )
-    await expect(page.locator("#sync-status")).to_contain_text(
-        "Waste Management · Sync status could not be checked. "
-        "The last saved state was complete."
-    )
+    await expect(dialog.locator(".sync-status")).to_contain_text("Sync failed")
+    await expect(dialog.locator(".sync-status")).not_to_contain_text("Waste Management")
     await page.set_viewport_size({"width": 390, "height": 844})
     assert not await page.evaluate("document.documentElement.scrollWidth > innerWidth")
 
@@ -960,7 +975,7 @@ async def test_failed_refresh_preserves_saved_results_and_recovers(
     await expect(page.get_by_role("region", name="Saved utility data")).to_be_visible()
 
 
-async def test_unconfigured_sync_requires_an_explicit_account_without_sending_requests(
+async def test_unconfigured_connection_sync_sends_no_requests(
     utility_page: Page, web_backend: WebBackend
 ) -> None:
     page = utility_page
@@ -968,22 +983,19 @@ async def test_unconfigured_sync_requires_an_explicit_account_without_sending_re
     page.on("request", lambda request: requests.append(request))
     await open_app(page, web_backend)
     await page.get_by_role("button", name="Settings", exact=True).click()
-    await expect(page.get_by_role("heading", name="Sync provider data")).to_be_visible()
-    await expect(page.get_by_label("Account to sync")).to_have_value("")
+    await expect(page.get_by_role("heading", name="Sync provider data")).to_have_count(
+        0
+    )
+    await expect(page.get_by_label("Account to sync")).to_have_count(0)
+    dialog = await open_connection_settings(page, "Waste Management")
     await expect(
         page.get_by_role("button", name="Sync account", exact=True)
     ).to_be_disabled()
-    await expect(
-        page.get_by_text("Choose an account to sync.", exact=True)
-    ).to_be_visible()
-    await page.get_by_label("Account to sync").select_option("demo-wm")
-    await expect(
-        page.get_by_role("button", name="Sync account", exact=True)
-    ).to_be_disabled()
-    await expect(page.locator("#sync-availability")).to_have_text(
+    await expect(dialog.locator(".sync-availability")).to_have_text(
         "Provider credentials are not configured."
     )
     assert not [request for request in requests if request.method != "GET"]
+    await dialog.get_by_role("button", name="Close utility connection").click()
     diagnostics = page.locator("details.diagnostics")
     await expect(diagnostics).to_have_js_property("open", False)
     await expect(page.get_by_role("heading", name="Data coverage")).to_be_hidden()
