@@ -3,10 +3,10 @@
 use crate::{
     config::{WmConfig, read_secret},
     models::*,
-    utility::{SyncPage, SyncRequest, Utility, UtilityError},
+    utility::{HistoryRequest, SyncPage, SyncRequest, Utility, UtilityError},
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
+use chrono::{DateTime, Days, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use reqwest::{Client, StatusCode};
 use rust_decimal::{Decimal, prelude::ToPrimitive};
 use serde::{Deserialize, de::DeserializeOwned};
@@ -92,8 +92,10 @@ impl WasteManagement {
                 segments.push(segment);
             }
         }
-        url.query_pairs_mut()
-            .extend_pairs(query.iter().map(|(key, value)| (*key, value.as_str())));
+        if !query.is_empty() {
+            url.query_pairs_mut()
+                .extend_pairs(query.iter().map(|(key, value)| (*key, value.as_str())));
+        }
         let mut response = self
             .client
             .get(url)
@@ -131,7 +133,11 @@ impl WasteManagement {
         serde_json::from_slice(&body).map_err(|_| UtilityError::InvalidResponse)
     }
 
-    async fn collect(&self, request: SyncRequest) -> Result<SyncPage, UtilityError> {
+    async fn collect(
+        &self,
+        request: SyncRequest,
+        all_invoices: bool,
+    ) -> Result<SyncPage, UtilityError> {
         if request.continuation.is_some() {
             return Err(UtilityError::InvalidContinuation);
         }
@@ -141,7 +147,7 @@ impl WasteManagement {
             || binding.customer_id.is_empty()
             || binding.services.len() > 64
             || request.from > request.to
-            || request.to.signed_duration_since(request.from).num_days() > 366
+            || (!all_invoices && request.to.signed_duration_since(request.from).num_days() > 366)
         {
             return Err(UtilityError::BindingMismatch);
         }
@@ -191,19 +197,21 @@ impl WasteManagement {
                 Some("provider_not_supported"),
             ),
         ];
+        let invoice_range = [
+            ("fromDate", request.from.to_string()),
+            ("toDate", request.to.to_string()),
+        ];
+        // WM explicitly documents omission of both filters as all invoices.
+        let invoice_filters = if all_invoices {
+            &[][..]
+        } else {
+            &invoice_range[..]
+        };
         let invoices: Result<InvoicesResponse, _> = self
-            .get(
-                "v2",
-                &binding.customer_id,
-                &["invoices"],
-                &[
-                    ("fromDate", request.from.to_string()),
-                    ("toDate", request.to.to_string()),
-                ],
-            )
+            .get("v2", &binding.customer_id, &["invoices"], invoice_filters)
             .await;
 
-        match invoices.and_then(|response| map_invoices(&request, response)) {
+        match invoices.and_then(|response| map_invoices(&request, response, all_invoices)) {
             Ok(mut items) => {
                 observations.append(&mut items);
                 coverages.push(coverage(
@@ -373,6 +381,15 @@ impl WasteManagement {
                 Some("bounded_history_and_next_pickup"),
             ),
         });
+        if all_invoices {
+            for item in coverages
+                .iter_mut()
+                .filter(|item| matches!(item.capability, Capability::Bills | Capability::Payments))
+            {
+                item.from = None;
+                item.to = None;
+            }
+        }
         Ok(SyncPage {
             observations,
             coverage: coverages,
@@ -386,7 +403,28 @@ impl Utility for WasteManagement {
         CAPABILITIES
     }
     async fn sync(&self, request: SyncRequest) -> Result<SyncPage, UtilityError> {
-        self.collect(request).await
+        self.collect(request, false).await
+    }
+
+    async fn sync_history(&self, request: HistoryRequest) -> Result<SyncPage, UtilityError> {
+        let from = request
+            .observed_at
+            .date_naive()
+            .checked_sub_days(Days::new(366))
+            .ok_or(UtilityError::InvalidResponse)?;
+        // Collections only expose a lookback count and current/next service.
+        // Keep the existing bounded coverage there while reading all invoices.
+        self.collect(
+            SyncRequest {
+                binding: request.binding,
+                from,
+                to: NaiveDate::MAX,
+                continuation: request.continuation,
+                observed_at: request.observed_at,
+            },
+            true,
+        )
+        .await
     }
 }
 
@@ -563,6 +601,7 @@ fn money(amount: i64, currency: &str) -> Money {
 fn map_invoices(
     request: &SyncRequest,
     response: InvoicesResponse,
+    all_invoices: bool,
 ) -> Result<Vec<Observation>, UtilityError> {
     if response.currency != request.binding.currency
         || response.currency.len() != 3
@@ -574,7 +613,7 @@ fn map_invoices(
     let mut items = Vec::new();
     for invoice in response.invoices {
         let issued = date(&invoice.date)?;
-        if issued < request.from || issued > request.to {
+        if !all_invoices && (issued < request.from || issued > request.to) {
             return Err(UtilityError::InvalidResponse);
         }
         if !crate::config::valid_id(&invoice.id.text()) {

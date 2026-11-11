@@ -155,6 +155,116 @@ async def test_version_repair_waits_for_loaded_version_parity(
     assert registry.async_get_issue(DOMAIN, issue_id) is None
 
 
+async def test_stale_automatic_accounts_have_independent_repairs(
+    hass: HomeAssistant, entry: UtilitiesConfigEntry, backend: Backend
+) -> None:
+    registry = ir.async_get(hass)
+    backend.stale = True
+    backend.coverage = [
+        coverage(state="partial", reason="provider_reauthentication_required")
+    ]
+    last_data = dt_util.utcnow() - timedelta(days=41)
+    first = {
+        "account_id": "example-automatic-1",
+        "name": "Example electricity",
+        "last_data_at": last_data.isoformat(),
+    }
+    second = {
+        "account_id": "example-automatic-2",
+        "name": "Example waste",
+        "last_data_at": None,
+    }
+    backend.responses["/v1/summary"] = json_response(
+        {
+            **backend.summary(),
+            "manual_accounts_stale": False,
+            "stale_automatic_accounts": [first, second],
+        }
+    )
+    await entry.runtime_data.async_refresh()
+    accounts = {
+        issue.translation_placeholders["account"]: issue
+        for issue in registry.issues.values()
+        if issue.config_entry_id == entry.entry_id
+        and issue.translation_placeholders
+        and "account" in issue.translation_placeholders
+    }
+    assert set(accounts) == {"Example electricity", "Example waste"}
+    electricity, waste = accounts["Example electricity"], accounts["Example waste"]
+    assert electricity.issue_id != waste.issue_id
+    assert "example-automatic" not in electricity.issue_id + waste.issue_id
+    assert electricity.translation_key == "stale_automatic_account"
+    assert electricity.translation_placeholders == {
+        "account": "Example electricity",
+        "last_data_date": dt_util.as_local(last_data).date().isoformat(),
+    }
+    assert waste.translation_key == "stale_automatic_account_without_data"
+    assert registry.async_get_issue(DOMAIN, f"{entry.entry_id}_stale_data") is None
+    for suffix in ("provider_auth", "coverage_incomplete", "version_mismatch"):
+        assert (
+            registry.async_get_issue(DOMAIN, f"{entry.entry_id}_{suffix}") is not None
+        )
+
+    ir.async_ignore_issue(hass, DOMAIN, electricity.issue_id, True)
+    renamed = "Renamed example electricity " + "e" * 200
+    backend.responses["/v1/summary"] = json_response(
+        {
+            **backend.summary(),
+            "manual_accounts_stale": True,
+            "stale_automatic_accounts": [
+                second,
+                {**first, "name": renamed},
+            ],
+        }
+    )
+    await entry.runtime_data.async_refresh()
+    dismissed = registry.async_get_issue(DOMAIN, electricity.issue_id)
+    assert dismissed is not None and dismissed.dismissed_version is not None
+    assert dismissed.translation_placeholders == {
+        "account": renamed,
+        "last_data_date": dt_util.as_local(last_data).date().isoformat(),
+    }
+    assert registry.async_get_issue(DOMAIN, f"{entry.entry_id}_stale_data") is not None
+
+    backend.responses["/v1/summary"] = (503, b"{}", {})
+    await entry.runtime_data.async_refresh()
+    assert registry.async_get_issue(DOMAIN, electricity.issue_id) == dismissed
+    assert registry.async_get_issue(DOMAIN, waste.issue_id) is not None
+
+    backend.responses["/v1/summary"] = json_response(
+        {
+            **backend.summary(),
+            "manual_accounts_stale": False,
+            "stale_automatic_accounts": [second],
+        }
+    )
+    await entry.runtime_data.async_refresh()
+    assert registry.async_get_issue(DOMAIN, electricity.issue_id) is None
+    assert registry.async_get_issue(DOMAIN, waste.issue_id) is not None
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    assert registry.async_get_issue(DOMAIN, waste.issue_id) is None
+
+
+async def test_automatic_accounts_do_not_get_legacy_sync_staleness_repair(
+    hass: HomeAssistant, entry: UtilitiesConfigEntry, backend: Backend
+) -> None:
+    registry = ir.async_get(hass)
+    issue_id = f"{entry.entry_id}_stale_data"
+    backend.stale = True
+    await entry.runtime_data.async_refresh()
+    assert registry.async_get_issue(DOMAIN, issue_id) is not None
+
+    backend.responses["/v1/summary"] = json_response(
+        {
+            **backend.summary(),
+            "manual_accounts_stale": False,
+            "stale_automatic_accounts": [],
+        }
+    )
+    await entry.runtime_data.async_refresh()
+    assert registry.async_get_issue(DOMAIN, issue_id) is None
+
+
 async def test_bridge_allows_reads_and_admin_sync_only(
     hass: HomeAssistant,
     entry: UtilitiesConfigEntry,
@@ -421,11 +531,29 @@ async def test_late_refresh_cannot_recreate_unloaded_repairs(
     pending = asyncio.create_task(coordinator.async_refresh())
     await started.wait()
     backend.stale = True
+    backend.responses["/v1/summary"] = json_response(
+        {
+            **backend.summary(),
+            "manual_accounts_stale": True,
+            "stale_automatic_accounts": [
+                {
+                    "account_id": "example-late-account",
+                    "name": "Example late account",
+                    "last_data_at": None,
+                }
+            ],
+        }
+    )
     coordinator.stop()
     release.set()
     await pending
     registry = ir.async_get(hass)
     assert registry.async_get_issue(DOMAIN, f"{entry.entry_id}_stale_data") is None
+    assert not any(
+        issue.config_entry_id == entry.entry_id
+        and issue.translation_key == "stale_automatic_account_without_data"
+        for issue in registry.issues.values()
+    )
 
 
 async def test_calendar_all_day_dates_and_bounded_pagination(

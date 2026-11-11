@@ -35,6 +35,7 @@ class BayouFixture:
 
     external_id: str | None = None
     authenticated: bool = False
+    bills_ready: bool = False
     posts: list[dict[str, object]] = field(default_factory=list)
     lookup_error_status: int | None = None
     lookup_gate: asyncio.Event | None = None
@@ -43,6 +44,7 @@ class BayouFixture:
     lose_post_response: bool = False
     post_received: asyncio.Event = field(default_factory=asyncio.Event)
     bills_gate: asyncio.Event | None = None
+    bills_queries: list[set[str]] = field(default_factory=list)
     bill: dict[str, object] | None = None
     bill_requests: list[str] = field(default_factory=list)
 
@@ -77,14 +79,16 @@ class BayouFixture:
             return web.json_response({}, status=self.lookup_error_status)
         if request.path.endswith("/bills"):
             assert request.match_info["customer"] == "71001"
-            day = request.query["start"]
-            assert day == request.query["end"]
-            self.bill_requests.append(day)
+            self.bills_queries.append(set(request.query))
+            day = request.query.get("start")
+            assert day == request.query.get("end")
+            if day is not None:
+                self.bill_requests.append(day)
             if self.bills_gate is not None:
                 await self.bills_gate.wait()
             bill = self.bill
             return web.json_response(
-                [bill] if bill and bill["billed_on"] == day else []
+                [bill] if bill and (day is None or bill["billed_on"] == day) else []
             )
         if self.external_id is None:
             return web.json_response({}, status=404)
@@ -102,7 +106,7 @@ class BayouFixture:
                 "auth_status": "authenticated"
                 if self.authenticated
                 else "onboarding_credentials_needed",
-                "bills_are_ready": False,
+                "bills_are_ready": self.bills_ready,
                 "intervals_are_ready": False,
                 "utility_has_intervals": False,
                 "account_has_intervals": False,
@@ -551,7 +555,9 @@ async def test_manual_sync_progress_survives_reload_and_reconciles_overlapping_r
     connection_backend: ConnectionBackend,
 ) -> None:
     fixture = connection_backend
+    fixture.provider.bills_ready = True
     gate = asyncio.Event()
+    gate.set()
     fixture.provider.bills_gate = gate
     today = datetime.now(UTC).date()
     year, month = divmod(today.year * 12 + today.month - 4, 12)
@@ -585,6 +591,8 @@ async def test_manual_sync_progress_survives_reload_and_reconciles_overlapping_r
             await dialog.get_by_role("button", name="Go to sync settings").click()
 
             status = page.locator("#sync-status")
+            await expect(status).to_contain_text("Sync finished with coverage gaps")
+            gate.clear()
             account = page.get_by_label("Account to sync")
             await account.select_option(label="Example electricity")
             submit = page.get_by_role("button", name="Sync account")
@@ -624,6 +632,74 @@ async def test_manual_sync_progress_survives_reload_and_reconciles_overlapping_r
             await page.reload()
             await expect(from_field).to_have_value("2026-02-28")
             await expect(to_field).to_have_value("2026-05-31")
+        finally:
+            gate.set()
+            await browser.close()
+
+
+async def test_first_and_manual_sync_share_saved_progress(
+    connection_backend: ConnectionBackend,
+) -> None:
+    fixture = connection_backend
+    fixture.provider.bills_ready = True
+    gate = asyncio.Event()
+    fixture.provider.bills_gate = gate
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch()
+        try:
+            page = await browser.new_page()
+            await sign_in(page, fixture)
+            await start_connection(page, fixture.provider)
+            dialog = page.get_by_role("dialog")
+            fixture.provider.authenticated = True
+            await dialog.get_by_role("button", name="Check status", exact=True).click()
+            await dialog.get_by_role("checkbox", name="Electricity").check()
+            await dialog.get_by_role("button", name="Connect selected meters").click()
+            await dialog.get_by_role("button", name="Go to sync settings").click()
+
+            status = page.locator("#sync-status")
+            await expect(status).to_contain_text("Syncing Example electricity")
+            await page.reload()
+            await expect(status).to_contain_text("Syncing Example electricity")
+            await page.get_by_label("Account to sync").select_option(
+                label="Example electricity"
+            )
+            submit = page.get_by_role("button", name="Sync account")
+            await expect(submit).to_be_disabled()
+            gate.set()
+            await expect(status).to_contain_text("Sync finished with coverage gaps")
+            await expect(submit).to_be_enabled()
+            assert fixture.provider.bills_queries == [{"account_number"}]
+
+            gate.clear()
+            await submit.click()
+            await expect(status).to_contain_text("Syncing Example electricity")
+            await page.reload()
+            await expect(status).to_contain_text("Syncing Example electricity")
+            gate.set()
+            await expect(status).to_contain_text("Sync finished with coverage gaps")
+
+            await page.get_by_label("Account to sync").select_option(
+                label="Example electricity"
+            )
+            await page.get_by_label("From", exact=True).fill("")
+            await page.get_by_label("To", exact=True).fill("")
+            gate.clear()
+            async with page.expect_request(
+                lambda request: (
+                    request.method == "POST" and request.url.endswith("/v1/sync")
+                )
+            ) as submitted:
+                await page.get_by_role(
+                    "button", name="Sync all available history"
+                ).click()
+            body = (await submitted.value).post_data_json
+            assert isinstance(body, dict) and set(body) == {"account", "range"}
+            assert body["range"] == "all"
+            await expect(status).to_contain_text("Syncing Example electricity")
+            gate.set()
+            await expect(status).to_contain_text("Sync finished with coverage gaps")
+            assert fixture.provider.bills_queries[-1] == {"account_number"}
         finally:
             gate.set()
             await browser.close()
@@ -783,6 +859,7 @@ async def test_hosted_sync_failure_is_terminal_and_next_sync_can_succeed(
 ) -> None:
     fixture = connection_backend
     fixture.provider.authenticated = True
+    fixture.provider.bills_ready = True
     async with ClientSession(headers={"Authorization": f"Bearer {TOKEN}"}) as client:
 
         async def call(
@@ -829,6 +906,15 @@ async def test_hosted_sync_failure_is_terminal_and_next_sync_can_succeed(
         row = rows[0]
         assert isinstance(row, dict) and isinstance(row["id"], str)
         account = row["id"]
+        for _ in range(100):
+            async with client.get(f"{fixture.backend.origin}/v1/sync") as response:
+                assert response.status == 200
+                first_jobs = await response.json()
+            assert len(first_jobs) == 1 and first_jobs[0]["account_id"] == account
+            if first_jobs[0]["state"] != "running":
+                break
+            await asyncio.sleep(0.02)
+        assert first_jobs[0]["state"] == "partial"
         fixture.provider.lookup_error_status = 503
 
         async def sync() -> dict[str, object]:

@@ -5,7 +5,7 @@
 //! Sources: https://docs.bayou.energy/reference/get_customers-customer-id-bills
 //! and https://docs.bayou.energy/reference/get_customers-customer-id-intervals.
 
-use std::{str::FromStr, time::Duration};
+use std::{borrow::Cow, str::FromStr, time::Duration};
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Days, NaiveDate, Utc};
@@ -22,12 +22,13 @@ use crate::{
         ConnectionMeter, Coverage, CoverageState, Money, Observation, ProviderId, Service,
         ServiceKind, Usage, UsageUnit,
     },
-    utility::{Continuation, SyncPage, SyncRequest, Utility, UtilityError},
+    utility::{Continuation, HistoryRequest, SyncPage, SyncRequest, Utility, UtilityError},
 };
 
 const BASE: &str = "https://bayou.energy/api/v2/";
+const SOUTHERN_CALIFORNIA_EDISON: &str = "southern_california_edison";
 const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
-const MAX_BILLS_PER_DAY: usize = 4096;
+const MAX_BILLS_PER_RESPONSE: usize = 4096;
 const MAX_INTERVALS_PER_WINDOW: usize = 10_000;
 pub(crate) const CAPABILITIES: &[Capability] = &[
     Capability::Bills,
@@ -291,16 +292,19 @@ impl Bayou {
         &self,
         request: &SyncRequest,
         customer: &Customer,
-        day: NaiveDate,
+        day: Option<NaiveDate>,
     ) -> Result<(Vec<Observation>, bool), UtilityError> {
         let mut url = self.endpoint(&request.binding.customer_id, Some("bills"))?;
         url.query_pairs_mut()
-            .append_pair("account_number", &request.binding.provider_account)
-            .append_pair("start", &day.to_string())
-            .append_pair("end", &day.to_string());
+            .append_pair("account_number", &request.binding.provider_account);
+        if let Some(day) = day {
+            url.query_pairs_mut()
+                .append_pair("start", &day.to_string())
+                .append_pair("end", &day.to_string());
+        }
         // Omitting limit is deliberate: the documented API has no next/offset.
         let bills: Vec<WireBill> = self.get(url).await?;
-        if bills.len() > MAX_BILLS_PER_DAY {
+        if bills.len() > MAX_BILLS_PER_RESPONSE {
             return Err(UtilityError::InvalidResponse);
         }
         let mut observations = Vec::with_capacity(bills.len());
@@ -329,7 +333,7 @@ impl Bayou {
                 incomplete = true;
                 continue;
             };
-            if issued_on != day {
+            if day.is_some_and(|day| issued_on != day) {
                 return Err(UtilityError::InvalidResponse);
             }
             if bill
@@ -374,20 +378,21 @@ impl Bayou {
     async fn intervals(
         &self,
         request: &SyncRequest,
+        customer: &Customer,
         service: &ServiceBinding,
-        day: NaiveDate,
-        prior_end: Option<DateTime<Utc>>,
+        window: IntervalWindow,
     ) -> Result<IntervalPage, UtilityError> {
-        let start = midnight(day)?;
-        let next = midnight(add_days(day, 1)?)?;
+        let meter_id = customer.interval_meter_id(service)?;
+        let start = midnight(window.first_day)?;
+        let next = midnight(add_days(window.last_day, 1)?)?;
         // Bayou filters both period start AND end. Overlap accommodates daily
         // local-time intervals crossing UTC midnight (including 25-hour DST days).
         // Retaining only starts in this day avoids duplicate observations.
-        let query_end = midnight(add_days(day, 3)?)?;
+        let query_end = midnight(add_days(window.last_day, 3)?)?;
         let mut url = self.endpoint(&request.binding.customer_id, Some("intervals"))?;
         url.query_pairs_mut()
             .append_pair("account_number", &request.binding.provider_account)
-            .append_pair("meter_id", &service.provider_service)
+            .append_pair("meter_id", &meter_id)
             .append_pair("start", &start.to_rfc3339())
             .append_pair("end", &query_end.to_rfc3339())
             .append_pair("latest_only", "true");
@@ -399,7 +404,7 @@ impl Bayou {
         let mut rows = match meters.pop() {
             None => Vec::new(),
             Some(meter) => {
-                if meter.id.text() != service.provider_service {
+                if meter.id.text() != meter_id.as_ref() {
                     return Err(UtilityError::BindingMismatch);
                 }
                 meter.intervals
@@ -410,7 +415,7 @@ impl Bayou {
         }
         rows.sort_by_key(|row| (row.start, row.end));
         let mut observations = Vec::new();
-        let mut last_end = prior_end;
+        let mut last_end = window.previous_end;
         let mut incomplete = false;
         let mut seen = std::collections::HashSet::new();
         for row in rows {
@@ -432,7 +437,7 @@ impl Bayou {
             if let Some(end) = last_end {
                 incomplete |= row.start != end;
             } else {
-                incomplete |= row.start != midnight(request.from)?;
+                incomplete |= row.start != window.expected_start;
             }
             last_end = Some(row.end);
             let (quantity, unit) = match service.kind {
@@ -542,10 +547,73 @@ impl Utility for Bayou {
 
     async fn sync(&self, request: SyncRequest) -> Result<SyncPage, UtilityError> {
         validate_request(&request)?;
-        let mut cursor = Cursor::for_request(&request)?;
+        let cursor = Cursor::for_request(&request)?;
+        let customer = self.customer(&request.binding).await?;
+        self.sync_page(request, customer, cursor, false).await
+    }
+
+    async fn sync_history(&self, request: HistoryRequest) -> Result<SyncPage, UtilityError> {
+        validate_binding(&request.binding)?;
+        let mut customer = self.customer(&request.binding).await?;
+        if request.continuation.is_none() {
+            // A successful sign-in can precede provider discovery. Give the
+            // first job time to read the history instead of reporting an empty
+            // result before Bayou finishes preparing it.
+            let discovery_deadline = tokio::time::Instant::now() + Duration::from_secs(300);
+            while customer.is_currently_authenticated
+                && customer.history_preparing(&request.binding)
+                && tokio::time::Instant::now() < discovery_deadline
+            {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                customer = self.customer(&request.binding).await?;
+            }
+        }
+        if !customer.is_currently_authenticated {
+            return Err(UtilityError::Authentication);
+        }
+        if customer.history_preparing(&request.binding) {
+            return Err(UtilityError::HistoryPreparing);
+        }
+        let mut bounds = customer.history_bounds()?;
+        if request.continuation.is_none()
+            && bounds.is_none()
+            && customer.account_has_intervals
+            && customer.utility_has_intervals
+            && !request.binding.services.is_empty()
+        {
+            // The interval response also exposes the global bounds, even on
+            // an empty window. Avoid requesting an unbounded array just for metadata.
+            let tomorrow = add_days(request.observed_at.date_naive(), 1)?;
+            let mut url = self.endpoint(&request.binding.customer_id, Some("intervals"))?;
+            url.query_pairs_mut()
+                .append_pair("account_number", &request.binding.provider_account)
+                .append_pair("start", &midnight(tomorrow)?.to_rfc3339())
+                .append_pair("end", &midnight(add_days(tomorrow, 1)?)?.to_rfc3339());
+            let response: IntervalResponse = self.get(url).await?;
+            bounds = response.history_bounds()?;
+        }
+        let cursor = Cursor::for_history(&request, bounds)?;
+        let request = SyncRequest {
+            binding: request.binding,
+            from: cursor.from,
+            to: cursor.to,
+            continuation: None,
+            observed_at: request.observed_at,
+        };
+        self.sync_page(request, customer, cursor, true).await
+    }
+}
+
+impl Bayou {
+    async fn sync_page(
+        &self,
+        request: SyncRequest,
+        customer: Customer,
+        mut cursor: Cursor,
+        history: bool,
+    ) -> Result<SyncPage, UtilityError> {
         // Recheck the current account, service bindings and auth verdict on every
         // page, not just on a now-stale initial customer response.
-        let customer = self.customer(&request.binding).await?;
         cursor.auth_incomplete |= !customer.is_currently_authenticated
             || customer.auth_status.as_deref() != Some("authenticated");
         cursor.bills_incomplete |= !customer.bills_are_ready;
@@ -553,17 +621,21 @@ impl Utility for Bayou {
         let usage_available = customer.utility_has_intervals
             && customer.account_has_intervals
             && !request.binding.services.is_empty();
+        let read_usage = usage_available && (!history || cursor.history_bounds.is_some());
+        cursor.intervals_incomplete |= usage_available && !read_usage;
         let mut observations = Vec::new();
         let next = match cursor.stage {
             Stage::Bills { day } => {
-                let (bills, incomplete) = self.bills(&request, &customer, day).await?;
+                let (bills, incomplete) = self
+                    .bills(&request, &customer, (!history).then_some(day))
+                    .await?;
                 observations.extend(bills);
                 cursor.bills_incomplete |= incomplete;
-                if day < request.to {
+                if !history && day < request.to {
                     Some(Stage::Bills {
                         day: add_days(day, 1)?,
                     })
-                } else if usage_available {
+                } else if read_usage {
                     Some(Stage::Usage {
                         day: request.from,
                         meter: 0,
@@ -573,7 +645,7 @@ impl Utility for Bayou {
                 }
             }
             Stage::Usage { day, meter } => {
-                if !usage_available {
+                if !read_usage {
                     // A revoked/changed account cannot cause a formerly valid
                     // continuation to silently become a complete usage import.
                     cursor.intervals_incomplete = true;
@@ -584,20 +656,46 @@ impl Utility for Bayou {
                         .services
                         .get(meter)
                         .ok_or(UtilityError::InvalidContinuation)?;
+                    // 28-day windows keep quarter-hour arrays well within the
+                    // provider response cap without scanning undiscovered dates.
+                    let last_day = if history {
+                        add_days(day, 27)?.min(request.to)
+                    } else {
+                        day
+                    };
+                    let expected_start = cursor
+                        .history_bounds
+                        .map(|range| range.first)
+                        .unwrap_or(midnight(request.from)?);
                     let page = self
-                        .intervals(&request, service, day, cursor.last_interval_end)
+                        .intervals(
+                            &request,
+                            &customer,
+                            service,
+                            IntervalWindow {
+                                first_day: day,
+                                last_day,
+                                expected_start,
+                                previous_end: cursor.last_interval_end,
+                            },
+                        )
                         .await?;
                     observations.extend(page.observations);
                     cursor.intervals_incomplete |= page.incomplete;
                     cursor.last_interval_end = page.last_end;
-                    if day < request.to {
+                    if last_day < request.to {
                         Some(Stage::Usage {
-                            day: add_days(day, 1)?,
+                            day: add_days(last_day, 1)?,
                             meter,
                         })
                     } else {
-                        cursor.intervals_incomplete |=
-                            cursor.last_interval_end != Some(midnight(add_days(request.to, 1)?)?);
+                        cursor.intervals_incomplete |= if let Some(bounds) = cursor.history_bounds {
+                            cursor
+                                .last_interval_end
+                                .is_none_or(|end| end <= bounds.last)
+                        } else {
+                            cursor.last_interval_end != Some(midnight(add_days(request.to, 1)?)?)
+                        };
                         cursor.last_interval_end = None;
                         if meter + 1 < request.binding.services.len() {
                             Some(Stage::Usage {
@@ -620,7 +718,15 @@ impl Utility for Bayou {
                 kind: service.kind,
             })
         }));
-        let coverage = coverage(&request, &customer, &cursor, next.as_ref())?;
+        let mut coverage = coverage(&request, &customer, &cursor, next.as_ref())?;
+        if history {
+            for row in &mut coverage {
+                if row.capability != Capability::Usage || cursor.history_bounds.is_none() {
+                    row.from = None;
+                    row.to = None;
+                }
+            }
+        }
         let continuation = if let Some(stage) = next {
             cursor.stage = stage;
             Some(Continuation(URL_SAFE_NO_PAD.encode(
@@ -638,7 +744,14 @@ impl Utility for Bayou {
 }
 
 fn validate_request(request: &SyncRequest) -> Result<(), UtilityError> {
-    let binding = &request.binding;
+    validate_binding(&request.binding)?;
+    if request.from > request.to || (request.to - request.from).num_days() > 365 {
+        return Err(UtilityError::InvalidResponse);
+    }
+    Ok(())
+}
+
+fn validate_binding(binding: &AccountBinding) -> Result<(), UtilityError> {
     if binding.provider != ProviderId::Bayou
         || !valid_id(&binding.id)
         || binding.deployment.trim().is_empty()
@@ -657,9 +770,6 @@ fn validate_request(request: &SyncRequest) -> Result<(), UtilityError> {
         })
     {
         return Err(UtilityError::BindingMismatch);
-    }
-    if request.from > request.to || (request.to - request.from).num_days() > 365 {
-        return Err(UtilityError::InvalidResponse);
     }
     let mut ids = std::collections::HashSet::new();
     let mut meters = std::collections::HashSet::new();
@@ -784,6 +894,8 @@ struct Cursor {
     intervals_incomplete: bool,
     auth_incomplete: bool,
     last_interval_end: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    history_bounds: Option<HistoryBounds>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -795,23 +907,15 @@ enum Stage {
 
 impl Cursor {
     fn for_request(request: &SyncRequest) -> Result<Self, UtilityError> {
-        let binding_digest = URL_SAFE_NO_PAD.encode(Sha256::digest(
-            serde_json::to_vec(&request.binding).map_err(|_| UtilityError::BindingMismatch)?,
-        ));
+        let binding_digest = binding_digest(&request.binding)?;
         if let Some(token) = &request.continuation {
-            if token.0.len() > 2048 {
-                return Err(UtilityError::InvalidContinuation);
-            }
-            let bytes = URL_SAFE_NO_PAD
-                .decode(&token.0)
-                .map_err(|_| UtilityError::InvalidContinuation)?;
-            let cursor: Self =
-                serde_json::from_slice(&bytes).map_err(|_| UtilityError::InvalidContinuation)?;
+            let cursor = Self::decode(token)?;
             let (day, meter) = match cursor.stage {
                 Stage::Bills { day } => (day, None),
                 Stage::Usage { day, meter } => (day, Some(meter)),
             };
             if cursor.version != 1
+                || cursor.history_bounds.is_some()
                 || cursor.binding_digest != binding_digest
                 || cursor.from != request.from
                 || cursor.to != request.to
@@ -833,7 +937,102 @@ impl Cursor {
             intervals_incomplete: false,
             auth_incomplete: false,
             last_interval_end: None,
+            history_bounds: None,
         })
+    }
+
+    fn for_history(
+        request: &HistoryRequest,
+        bounds: Option<HistoryBounds>,
+    ) -> Result<Self, UtilityError> {
+        let binding_digest = binding_digest(&request.binding)?;
+        let today = request.observed_at.date_naive();
+        if let Some(token) = &request.continuation {
+            let cursor = Self::decode(token)?;
+            let Stage::Usage { day, meter } = cursor.stage else {
+                return Err(UtilityError::InvalidContinuation);
+            };
+            let range = cursor
+                .history_bounds
+                .ok_or(UtilityError::InvalidContinuation)?;
+            if cursor.version != 2
+                || cursor.binding_digest != binding_digest
+                || cursor.from != range.first.date_naive()
+                || cursor.to != range.last.date_naive()
+                || day < cursor.from
+                || day > cursor.to
+                || cursor.to > today
+                || meter >= request.binding.services.len()
+            {
+                return Err(UtilityError::InvalidContinuation);
+            }
+            return Ok(cursor);
+        }
+        if bounds.is_some_and(|range| range.last.date_naive() > today) {
+            return Err(UtilityError::InvalidResponse);
+        }
+        let from = bounds.map_or(today, |range| range.first.date_naive());
+        let to = bounds.map_or(today, |range| range.last.date_naive());
+        Ok(Self {
+            version: 2,
+            binding_digest,
+            from,
+            to,
+            stage: Stage::Bills { day: from },
+            bills_incomplete: false,
+            intervals_incomplete: false,
+            auth_incomplete: false,
+            last_interval_end: None,
+            history_bounds: bounds,
+        })
+    }
+
+    fn decode(token: &Continuation) -> Result<Self, UtilityError> {
+        if token.0.len() > 2048 {
+            return Err(UtilityError::InvalidContinuation);
+        }
+        let bytes = URL_SAFE_NO_PAD
+            .decode(&token.0)
+            .map_err(|_| UtilityError::InvalidContinuation)?;
+        serde_json::from_slice(&bytes).map_err(|_| UtilityError::InvalidContinuation)
+    }
+}
+
+fn binding_digest(binding: &AccountBinding) -> Result<String, UtilityError> {
+    Ok(URL_SAFE_NO_PAD.encode(Sha256::digest(
+        serde_json::to_vec(binding).map_err(|_| UtilityError::BindingMismatch)?,
+    )))
+}
+
+struct IntervalWindow {
+    first_day: NaiveDate,
+    last_day: NaiveDate,
+    expected_start: DateTime<Utc>,
+    previous_end: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Copy, Deserialize, Serialize)]
+struct HistoryBounds {
+    first: DateTime<Utc>,
+    last: DateTime<Utc>,
+}
+
+#[derive(Deserialize)]
+struct DiscoveredIntervals {
+    first_interval_discovered: Option<DateTime<Utc>>,
+    last_interval_discovered: Option<DateTime<Utc>>,
+}
+
+impl DiscoveredIntervals {
+    fn bounds(&self) -> Result<Option<HistoryBounds>, UtilityError> {
+        match (
+            self.first_interval_discovered,
+            self.last_interval_discovered,
+        ) {
+            (Some(first), Some(last)) if first <= last => Ok(Some(HistoryBounds { first, last })),
+            (Some(_), Some(_)) => Err(UtilityError::InvalidResponse),
+            _ => Ok(None),
+        }
     }
 }
 
@@ -849,6 +1048,7 @@ struct IntervalPage {
 struct Customer {
     id: u64,
     external_id: Option<String>,
+    utility: Option<String>,
     is_currently_authenticated: bool,
     auth_status: Option<String>,
     bills_are_ready: bool,
@@ -856,9 +1056,21 @@ struct Customer {
     account_has_intervals: bool,
     intervals_are_ready: bool,
     account_numbers: Vec<WireAccount>,
+    #[serde(flatten)]
+    discovered_intervals: DiscoveredIntervals,
 }
 
 impl Customer {
+    fn history_preparing(&self, binding: &AccountBinding) -> bool {
+        !self.bills_are_ready
+            || (self.utility_has_intervals
+                && !binding.services.is_empty()
+                && !self.intervals_are_ready)
+    }
+
+    fn history_bounds(&self) -> Result<Option<HistoryBounds>, UtilityError> {
+        self.discovered_intervals.bounds()
+    }
     fn matches_id(&self, requested: &str) -> bool {
         if let Some(external) = requested.strip_prefix("external_id:") {
             self.external_id.as_deref() == Some(external)
@@ -878,6 +1090,50 @@ impl Customer {
         }
         Ok(account)
     }
+
+    fn interval_meter_id<'a>(
+        &self,
+        service: &'a ServiceBinding,
+    ) -> Result<Cow<'a, str>, UtilityError> {
+        let registered = &service.provider_service;
+        if self.utility.as_deref() != Some(SOUTHERN_CALIFORNIA_EDISON)
+            || service.kind != ServiceKind::Electricity
+        {
+            return Ok(Cow::Borrowed(registered));
+        }
+
+        // SCE registers and bills meters with a hyphen, while the intervals
+        // endpoint uses the digits. The exact registered binding was already
+        // checked against this customer. Interval rows omit the account number,
+        // so reject collisions across the customer's accounts.
+        let wire = sce_interval_meter_id(registered);
+        if wire.bytes().all(|byte| byte.is_ascii_digit())
+            && self
+                .account_numbers
+                .iter()
+                .flat_map(|account| &account.meters)
+                .filter(|meter| sce_interval_meter_id(&meter.id) == wire)
+                .nth(1)
+                .is_some()
+        {
+            return Err(UtilityError::BindingMismatch);
+        }
+        Ok(wire)
+    }
+}
+
+fn sce_interval_meter_id(id: &str) -> Cow<'_, str> {
+    if let Some((left, right)) = id.split_once('-')
+        && !left.is_empty()
+        && !right.is_empty()
+        && left
+            .bytes()
+            .chain(right.bytes())
+            .all(|byte| byte.is_ascii_digit())
+    {
+        return Cow::Owned([left, right].concat());
+    }
+    Cow::Borrowed(id)
 }
 
 #[derive(Deserialize)]
@@ -971,11 +1227,30 @@ impl IntervalResponse {
                 .collect(),
         }
     }
+
+    fn history_bounds(&self) -> Result<Option<HistoryBounds>, UtilityError> {
+        let responses = match self {
+            Self::Single(response) => std::slice::from_ref(response),
+            Self::Multiple(responses) => responses,
+        };
+        let mut bounds: Option<HistoryBounds> = None;
+        for response in responses {
+            if let Some(next) = response.discovered_intervals.bounds()? {
+                bounds = Some(bounds.map_or(next, |current| HistoryBounds {
+                    first: current.first.min(next.first),
+                    last: current.last.max(next.last),
+                }));
+            }
+        }
+        Ok(bounds)
+    }
 }
 
 #[derive(Deserialize)]
 struct Intervals {
     meters: Vec<IntervalMeter>,
+    #[serde(flatten)]
+    discovered_intervals: DiscoveredIntervals,
 }
 
 #[derive(Deserialize)]

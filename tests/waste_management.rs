@@ -3,7 +3,9 @@ use chrono::{DateTime, NaiveDate, Utc};
 use ha_utilities::{
     config::{AccountBinding, ServiceBinding},
     models::*,
-    utility::{SyncRequest, Utility, UtilityError, waste_management::WasteManagement},
+    utility::{
+        HistoryRequest, SyncRequest, Utility, UtilityError, waste_management::WasteManagement,
+    },
 };
 use std::sync::{Arc, Mutex};
 use tokio::{
@@ -116,6 +118,49 @@ fn reply(path: &str) -> (u16, String) {
         return (404, "{}".to_owned());
     };
     (200, body.to_owned())
+}
+
+#[tokio::test]
+async fn all_history_omits_invoice_dates_but_keeps_collection_lookback_bounded() {
+    let fixture = Fixture::new(|path| {
+        if path.starts_with("/v2/customers/900000001/invoices") {
+            assert_eq!(path, "/v2/customers/900000001/invoices");
+            return (200, r#"{"currency":"USD","invoices":[{"id":"DEMO-OLD-INVOICE","date":"2023-05-01","amount":"10.25","balance_amount":"null"}]}"#.to_owned());
+        }
+        if path.starts_with("/v1/customers/900000001/services/stats") {
+            assert!(path.contains("numberOfDays=366"));
+        }
+        reply(path)
+    }).await;
+    let requested = request();
+    let page = fixture
+        .adapter()
+        .sync_history(HistoryRequest {
+            binding: requested.binding,
+            continuation: None,
+            observed_at: requested.observed_at,
+        })
+        .await
+        .unwrap();
+    assert!(page.observations.iter().any(
+        |row| matches!(row, Observation::Bill(bill) if bill.issued_on.to_string() == "2023-05-01")
+    ));
+    let bills = page
+        .coverage
+        .iter()
+        .find(|row| row.capability == Capability::Bills)
+        .unwrap();
+    assert_eq!(bills.state, CoverageState::Complete);
+    assert!(bills.from.is_none() && bills.to.is_none());
+    let collections = page
+        .coverage
+        .iter()
+        .find(|row| row.capability == Capability::Collections)
+        .unwrap();
+    assert_eq!(
+        collections.reason.as_deref(),
+        Some("bounded_history_and_next_pickup")
+    );
 }
 
 #[tokio::test]

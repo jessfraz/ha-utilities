@@ -46,6 +46,7 @@ const reasonLabels = {
   rate_limited: 'The provider has limited requests. Try syncing later.',
   unavailable: 'The provider could not be reached.',
   provider_unavailable: 'The provider could not be reached.',
+  provider_preparing_history: 'The provider is still preparing your history. Try again later.',
   invalid_response: 'The provider response could not be verified.',
   binding_mismatch: 'Provider data did not match the configured account or service.',
   unsupported: 'This provider does not report this data through the supported API.',
@@ -371,16 +372,22 @@ function coveragePanel(items) {
   section.classList.add('coverage-panel');
   const note = node('p', 'Available means the provider returned the requested data, not that all history is present. Missing coverage is never treated as a zero balance or a completed pickup.', 'coverage-note');
   section.append(note);
-  if (!items.length) {
+  const irrelevant = new Set(['provider_not_supported', 'no_documented_payment_history', 'not_a_collection_provider']);
+  const relevant = items.filter((item) => item.state !== 'unsupported' || !irrelevant.has(item.reason));
+  if (!relevant.length) {
     section.append(node('p', 'No provider coverage has been checked yet. Configure an account and run a sync to establish what is available.', 'panel-empty'));
     return section;
   }
   const { wrapper, body } = table(['Account', 'Data', 'Coverage', 'Range checked', 'Checked'], 'Provider coverage by account and data type', 'coverage-table');
-  for (const item of items) {
+  for (const item of relevant) {
     const row = node('tr');
     const status = cell();
-    status.append(badge(item.state, item.reason === 'document_import' ? 'Imported documents' : label(item.state)));
-    if (item.reason) status.append(node('small', reasonLabels[item.reason] ?? 'The provider reported a coverage limitation. Check provider configuration and try syncing again.'));
+    if (item.reason === 'not_synced') {
+      status.append(node('span', 'Awaiting first sync', 'badge'));
+    } else {
+      status.append(badge(item.state, item.reason === 'document_import' ? 'Imported documents' : label(item.state)));
+      if (item.reason) status.append(node('small', reasonLabels[item.reason] ?? 'The provider reported a coverage limitation. Check provider configuration and try syncing again.'));
+    }
     row.append(cell(accountName(item.account_id)), cell(label(item.capability)), status,
       cell(item.from && item.to ? `${timestamp(item.from)} to ${timestamp(item.to)} (end exclusive)` : 'Not reported'), cell(timestamp(item.checked_at)));
     body.append(row);
@@ -1028,12 +1035,15 @@ function syncForm(syncAccounts) {
   const to = dateField('To', 'to', defaultTo);
   const submit = node('button', 'Sync account');
   submit.type = 'submit';
+  const all = node('button', 'Sync all available history', 'quiet');
+  all.type = 'button';
   form.append(account.field, from.field, to.field, submit);
   const availability = node('p', '', 'sync-availability');
   availability.id = 'sync-availability';
   availability.setAttribute('role', 'status');
   availability.setAttribute('aria-live', 'polite');
   submit.setAttribute('aria-describedby', availability.id);
+  all.setAttribute('aria-describedby', availability.id);
   let submitting = false;
   function canSync() {
     const binding = syncAccounts.find((item) => item.id === account.select.value);
@@ -1043,6 +1053,7 @@ function syncForm(syncAccounts) {
     const binding = syncAccounts.find((item) => item.id === account.select.value);
     const running = syncJobs.some((job) => job.account_id === binding?.id && job.state === 'running');
     submit.disabled = submitting || running || !canSync();
+    all.disabled = submit.disabled;
     availability.textContent = submitting ? 'Starting sync…' : running ? 'This account is already syncing.'
       : !binding ? 'Choose an account to sync.'
       : !canSync() ? `${label(binding.provider)} credentials are not configured.` : '';
@@ -1052,15 +1063,19 @@ function syncForm(syncAccounts) {
   updateAvailability();
   from.input.addEventListener('input', () => setDateValidity(from.input, to.input));
   to.input.addEventListener('input', () => setDateValidity(from.input, to.input));
-  form.addEventListener('submit', async (event) => {
+  form.addEventListener('submit', (event) => {
     event.preventDefault();
     setDateValidity(from.input, to.input);
-    if (!form.reportValidity() || submit.disabled || !canSync()) return;
+    if (form.reportValidity()) startSync({ from: from.input.value, to: to.input.value });
+  });
+  all.addEventListener('click', () => startSync({ range: 'all' }));
+  async function startSync(range) {
+    if (submit.disabled || !canSync()) return;
     submitting = true;
     updateAvailability();
     showNotice(''); retry.hidden = true;
     try {
-      const job = await api('v1/sync', { body: { account: account.select.value, from: from.input.value, to: to.input.value } });
+      const job = await api('v1/sync', { body: { account: account.select.value, ...range } });
       syncJobs = [...syncJobs.filter((item) => item.account_id !== job.account_id), job];
       const status = byId('sync-status');
       if (status) renderSyncStatus(status);
@@ -1071,27 +1086,30 @@ function syncForm(syncAccounts) {
       submitting = false;
       updateAvailability();
     }
-  });
-  wrapper.append(form, availability);
+  }
+  const history = node('div', undefined, 'history-sync');
+  history.append(all, node('p', 'Reads the history your provider already makes available.', 'muted'));
+  wrapper.append(form, history, availability);
   return wrapper;
 }
 function syncDescription(job) {
   if (job.state === 'running') return `Syncing ${accountName(job.account_id)}…`;
   const state = job.state === 'complete' ? 'Sync complete' : job.state === 'partial' ? 'Sync finished with coverage gaps' : label(job.state);
-  const records = `${count(job.observations)} saved ${job.observations === 1 ? 'observation' : 'observations'}`;
+  const records = `${count(job.observations)} ${job.observations === 1 ? 'observation' : 'observations'} processed`;
   return `${state} · ${accountName(job.account_id)} · ${records}${job.error ? '. Check provider coverage and configuration.' : '.'}`;
 }
 function pollSync() {
   clearTimeout(syncTimer);
   syncPollController?.abort();
-  if (!syncJobs.some((job) => job.state === 'running')) return;
+  if (!ready || document.hidden) return;
+  const delay = syncJobs.some((job) => job.state === 'running') ? 1500 : 15000;
   syncTimer = setTimeout(async () => {
     const controller = new AbortController();
     syncPollController = controller;
     try {
       const next = await api('v1/sync', { signal: controller.signal });
       if (controller.signal.aborted) return;
-      const completed = syncJobs.some((job) => job.state === 'running' && next.some((item) => item.id === job.id && item.state !== 'running'));
+      const completed = next.some((job) => job.state !== 'running' && !syncJobs.some((prior) => prior.id === job.id && prior.state === job.state));
       syncJobs = next;
       const status = byId('sync-status');
       if (status) renderSyncStatus(status);
@@ -1111,9 +1129,10 @@ function pollSync() {
       if (status) status.textContent = 'Sync status could not be checked. The sync may still be running.';
       showError(error);
     }
-  }, 1500);
+  }, delay);
 }
 
+document.addEventListener('visibilitychange', pollSync);
 for (const button of document.querySelectorAll('[data-view]')) button.addEventListener('click', () => navigate(button.dataset.view));
 window.addEventListener('hashchange', () => {
   const requested = location.hash.slice(1);

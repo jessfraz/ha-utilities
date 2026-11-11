@@ -464,26 +464,71 @@ async fn connection_bind(
     body: TypedBody<BindConnection>,
 ) -> Result<PrivateOk<Connection>, HttpError> {
     authorized(&request)?;
-    Ok(private(
-        request
-            .context()
-            .connections
-            .bind(&path.into_inner().id, body.into_inner())
-            .await
-            .map_err(connection_error)?,
-    ))
+    let (connection, jobs) = request
+        .context()
+        .connections
+        .bind(&path.into_inner().id, body.into_inner())
+        .await
+        .map_err(connection_error)?;
+    if request
+        .context()
+        .sync
+        .enqueue_first_syncs(jobs)
+        .await
+        .is_err()
+    {
+        slog::warn!(request.log, "Could not record first sync queue failure");
+    }
+    Ok(private(connection))
 }
 #[endpoint {method=GET,path="/v1/summary",tags=["utilities"]}]
 async fn summary(request: RequestContext<Arc<Context>>) -> Result<PrivateOk<Summary>, HttpError> {
     authorized(&request)?;
-    Ok(private(
-        request
-            .context()
+    let context = request.context();
+    let bindings = context
+        .store
+        .bindings(&context.config.deployment)
+        .await
+        .map_err(store_error)?;
+    let (ids, unconfigured): (Vec<_>, Vec<_>) = (
+        bindings.iter().map(|account| account.id.clone()).collect(),
+        bindings
+            .iter()
+            .filter(|account| !context.providers.configured(account.provider))
+            .map(|account| account.id.clone())
+            .collect(),
+    );
+    let mut summary = context.store.summary(&ids).await.map_err(store_error)?;
+    let cutoff = chrono::Utc::now() - chrono::Duration::days(40);
+    summary.stale_automatic_accounts = context
+        .store
+        .stale_automatic_accounts(&context.config.deployment, cutoff)
+        .await
+        .map_err(store_error)?
+        .into_iter()
+        .filter(|(provider, _)| context.providers.configured(*provider))
+        .map(|(_, item)| item)
+        .collect();
+    let manual = if unconfigured.is_empty() {
+        Vec::new()
+    } else {
+        context
             .store
-            .summary(&request.context().accounts().await?)
+            .import_states(&unconfigured)
             .await
-            .map_err(store_error)?,
-    ))
+            .map_err(store_error)?
+            .into_iter()
+            .filter_map(|account| (!account.import_only).then_some(account.id))
+            .collect::<Vec<_>>()
+    };
+    summary.manual_accounts_stale = !manual.is_empty()
+        && context
+            .store
+            .freshness(&manual)
+            .await
+            .map_err(store_error)?
+            .1;
+    Ok(private(summary))
 }
 #[endpoint {method=GET,path="/v1/bills",tags=["utilities"]}]
 async fn bills(
@@ -690,18 +735,17 @@ async fn bill_get(
 #[endpoint {method=POST,path="/v1/sync",tags=["sync"]}]
 async fn sync_request(
     request: RequestContext<Arc<Context>>,
-    body: TypedBody<SyncInput>,
+    body: TypedBody<SyncSelection>,
 ) -> Result<HttpResponseHeaders<HttpResponseAccepted<SyncJob>, PrivateHeaders>, HttpError> {
     authorized(&request)?;
+    let sync = &request.context().sync;
+    let job = match body.into_inner() {
+        SyncSelection::Dates(input) => sync.request(input).await,
+        SyncSelection::History(input) => sync.request_history(input).await,
+    }
+    .map_err(store_error)?;
     Ok(HttpResponseHeaders::new(
-        HttpResponseAccepted(
-            request
-                .context()
-                .sync
-                .request(body.into_inner())
-                .await
-                .map_err(store_error)?,
-        ),
+        HttpResponseAccepted(job),
         PrivateHeaders::new(),
     ))
 }

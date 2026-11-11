@@ -35,7 +35,7 @@ _ROUTES = (
         {"account", "service", "from", "to", "limit", "page"},
     ),
     (re.compile(rf"bills/{_RECORD_ID}|sync/{_ID}"), {"GET"}, set()),
-    (re.compile("sync"), {"POST"}, set()),
+    (re.compile("sync"), {"GET", "POST"}, set()),
     (re.compile("imports"), {"POST"}, set()),
     (re.compile(r"documents/[0-9a-f]{64}"), {"PUT"}, set()),
     (re.compile("connections"), {"GET", "POST"}, set()),
@@ -158,18 +158,21 @@ class UtilitiesView(HomeAssistantView):
                     connection_input(path, values)
                 elif (
                     not isinstance(values, dict)
-                    or set(values) != {"account", "from", "to"}
-                    or not isinstance(values["account"], str)
+                    or not isinstance(values.get("account"), str)
                     or re.fullmatch(_ID, values["account"]) is None
                 ):
                     raise ValueError("Invalid sync request")
-                if path == "sync":
+                if path == "sync" and set(values) == {"account", "from", "to"}:
                     start, end = (
                         date.fromisoformat(values["from"]),
                         date.fromisoformat(values["to"]),
                     )
                     if start > end or (end - start).days > 366:
                         raise ValueError("Invalid sync window")
+                elif path == "sync" and not (
+                    set(values) == {"account", "range"} and values["range"] == "all"
+                ):
+                    raise ValueError("Invalid sync range")
             except ValueError, TypeError, UnicodeDecodeError:
                 raise web.HTTPBadRequest(reason="Invalid request") from None
         elif request.method == "GET" and payload:

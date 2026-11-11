@@ -18,7 +18,7 @@ use crate::{
     models::{
         BindConnection, ConnectableUtility, Connection, ConnectionAuthStatus,
         ConnectionAuthorization, ConnectionIssue, ConnectionProgress, ConnectionState,
-        CreateConnection, ProviderId, ServiceKind,
+        CreateConnection, ProviderId, ServiceKind, SyncJob,
     },
     store::{Store, StoreError, connections::ConnectionRecord},
     sync::Providers,
@@ -307,7 +307,7 @@ impl ConnectionHandle {
         &self,
         id: &str,
         input: BindConnection,
-    ) -> Result<Connection, ConnectionError> {
+    ) -> Result<(Connection, Vec<SyncJob>), ConnectionError> {
         let mut record = self.engine.record(id).await?;
         let customer = self
             .engine

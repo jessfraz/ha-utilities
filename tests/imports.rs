@@ -1,5 +1,8 @@
+mod support;
+
 use ha_utilities::{
     imports::{ImportError, ImportRequest, digest},
+    models::{Summary, SyncJob, SyncState},
     store::Store,
 };
 use serde_json::json;
@@ -149,4 +152,76 @@ async fn replacing_measured_intervals_and_validating_charge_units_are_atomic() {
         .await
         .unwrap();
     assert_eq!(count, 2);
+}
+
+#[tokio::test]
+async fn imported_accounts_remain_outside_provider_sync_and_freshness() {
+    let app = support::App::start().await;
+    for account in &app.config.accounts {
+        let job = app.store.start_job(&account.id).await.unwrap();
+        app.store
+            .finish_job(&job.id, SyncState::Complete, 0, None)
+            .await
+            .unwrap();
+    }
+    let source = document(&app.store, b"Imported statement").await;
+    app.store
+        .import(
+            &app.config.deployment,
+            request(json!([{
+                "kind": "bill",
+                "reference": {"kind": "invoice_number", "value": "EXAMPLE-3"},
+                "issued_on": "2025-02-20",
+                "totals": {"new_charges_minor": 1000},
+                "sources": [{"sha256": source, "role": "invoice"}]
+            }])),
+        )
+        .await
+        .unwrap();
+
+    let client = reqwest::Client::new();
+    let summary: Summary = client
+        .get(format!("{}/v1/summary", app.url))
+        .bearer_auth(support::TOKEN)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(summary.import_only_accounts, 1);
+    assert!(summary.last_imported_at.is_some());
+    assert!(!summary.manual_accounts_stale);
+    assert!(summary.stale_automatic_accounts.is_empty());
+
+    let sync = format!("{}/v1/sync", app.url);
+    for request in [
+        json!({"account": "fictional-water", "range": "all"}),
+        json!({"account": "fictional-water", "from": "2025-02-01", "to": "2025-02-28"}),
+    ] {
+        let response = client
+            .post(&sync)
+            .bearer_auth(support::TOKEN)
+            .json(&request)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+    }
+    let jobs: Vec<SyncJob> = client
+        .get(&sync)
+        .bearer_auth(support::TOKEN)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(jobs.len(), app.config.accounts.len());
+    assert!(jobs.iter().all(|job| job.account_id != "fictional-water"));
+    app.close().await;
 }

@@ -1,3 +1,10 @@
+# 0.1.7
+
+Read available history when an account connects, then recheck seven days once
+a day. Show a Repair after 40 days without new provider data. Match Settings
+and Marketplace icons to the sidebar, and read SCE intervals with Bayou's
+meter ID format.
+
 # 0.1.6
 
 Import typed billing records with their source documents. View itemized

@@ -158,7 +158,7 @@ export function createConnections({ api, node, providers, updated, connected, on
     body.replaceChildren(steps, status, description);
     if (next.issue) body.append(node('p', issues[next.issue] ?? 'Check the connection status before continuing.', 'connection-note'));
     if (next.state === 'connected') {
-      body.append(node('p', 'The selected accounts and meters are saved. Bills and usage will appear after a sync.'));
+      body.append(node('p', 'Your accounts and meters are saved. The first sync starts automatically. Check its progress in sync settings.'));
       footer.append(action('Go to sync settings', async () => { dialog.close(); await connected(); }));
     } else if (next.state === 'ready') {
       renderMeters(next);
