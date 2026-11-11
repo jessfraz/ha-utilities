@@ -385,6 +385,17 @@ pub struct Summary {
     #[serde(default)]
     pub import_only_accounts: usize,
     pub stale: bool,
+    #[serde(default)]
+    pub stale_automatic_accounts: Vec<StaleAutomaticAccount>,
+    #[serde(default)]
+    pub manual_accounts_stale: bool,
+}
+
+#[derive(JsonSchema, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct StaleAutomaticAccount {
+    pub account_id: String,
+    pub name: String,
+    pub last_data_at: Option<DateTime<Utc>>,
 }
 
 #[derive(JsonSchema, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -413,6 +424,26 @@ pub struct SyncInput {
     pub account: String,
     pub from: NaiveDate,
     pub to: NaiveDate,
+}
+
+#[derive(JsonSchema, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HistorySyncInput {
+    pub account: String,
+    pub range: HistoryRange,
+}
+
+#[derive(JsonSchema, Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryRange {
+    All,
+}
+
+#[derive(JsonSchema, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum SyncSelection {
+    Dates(SyncInput),
+    History(HistorySyncInput),
 }
 
 #[derive(JsonSchema, Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]

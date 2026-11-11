@@ -10,7 +10,7 @@ use crate::{
     config::{AccountBinding, Config},
     models::{
         Connection, ConnectionProgress, ConnectionProvider, ConnectionState, Coverage,
-        CreateConnection,
+        CreateConnection, SyncJob,
     },
     store::{Store, StoreError},
 };
@@ -281,7 +281,7 @@ impl Store {
         record: &ConnectionRecord,
         bindings: &[AccountBinding],
         coverage: &[Coverage],
-    ) -> Result<Connection, StoreError> {
+    ) -> Result<(Connection, Vec<SyncJob>), StoreError> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let current = sqlx::query_as::<_, ConnectionRow>(queries::GET)
             .bind(&config.deployment)
@@ -302,6 +302,7 @@ impl Store {
             .iter()
             .map(|value| serde_json::from_str(value))
             .collect::<Result<Vec<_>, _>>()?;
+        let mut jobs = Vec::new();
         for binding in bindings {
             let new = !candidate
                 .accounts
@@ -314,6 +315,9 @@ impl Store {
             if new {
                 for item in coverage.iter().filter(|item| item.account_id == binding.id) {
                     Self::write_coverage(&mut tx, item).await?;
+                }
+                if Self::mark_automatic_start(&mut tx, &binding.id).await? {
+                    jobs.push(Self::start_job_on(&mut *tx, &binding.id, None, true).await?);
                 }
             }
         }
@@ -334,11 +338,15 @@ impl Store {
             .bind(record.revision)
             .execute(&mut *tx)
             .await?;
-        tx.commit().await?;
-        Ok(self
-            .connection(&config.deployment, &record.connection.id)
+        let connection = sqlx::query_as::<_, ConnectionRow>(queries::GET)
+            .bind(&config.deployment)
+            .bind(&record.connection.id)
+            .fetch_one(&mut *tx)
             .await?
-            .connection)
+            .decode()?
+            .connection;
+        tx.commit().await?;
+        Ok((connection, jobs))
     }
 }
 
@@ -457,11 +465,14 @@ mod tests {
         binding.customer_id = "71888".into();
         binding.provider_account = "fictional-hosted-account".into();
         binding.services[0].id = "hosted-meter".into();
-        let bound = store
+        let (bound, jobs) = store
             .bind_connection(&config, &record, std::slice::from_ref(&binding), &[])
             .await
             .unwrap();
         assert_eq!(bound.progress.linked_account_ids, vec!["hosted-account"]);
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].account_id, "hosted-account");
+        assert_eq!(jobs[0].state, SyncState::Running);
         let now = chrono::Utc::now();
         let balance = Balance {
             id: "hosted-account:balance".into(),
@@ -500,7 +511,7 @@ mod tests {
             .connection(&config.deployment, &record.connection.id)
             .await
             .unwrap();
-        let replay = store
+        let (replay, jobs) = store
             .bind_connection(
                 &config,
                 &current,
@@ -510,6 +521,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(replay.progress.linked_account_ids, vec!["hosted-account"]);
+        assert!(jobs.is_empty());
         let page: Page<Balance> = store
             .list(
                 "balance",

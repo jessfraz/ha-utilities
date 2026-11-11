@@ -167,6 +167,13 @@ enum Sync {
         #[arg(long)]
         to: NaiveDate,
     },
+    /// Read all history available from this account's provider.
+    All {
+        #[arg(long)]
+        account: String,
+    },
+    /// Show the last sync for each bound account.
+    List,
     Get {
         id: String,
     },
@@ -434,6 +441,12 @@ async fn run(cli: Cli) -> Result<(), ClientError> {
         Command::Sync {
             command: Sync::Get { id },
         } => print(&client()?.sync_get(&id).await?, cli.json),
+        Command::Sync {
+            command: Sync::All { account },
+        } => print(&client()?.sync_history(account).await?, cli.json),
+        Command::Sync {
+            command: Sync::List,
+        } => print(&client()?.sync_list().await?, cli.json),
         Command::Connections { command } => {
             let client = client()?;
             match command {

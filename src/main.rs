@@ -65,6 +65,7 @@ async fn main() -> anyhow::Result<()> {
     store.register(&config).await?;
     let (handle, worker) =
         SyncWorker::new(store.clone(), config.clone(), providers.clone()).await?;
+    let worker = worker.with_automatic_sync();
     let (connections, connection_worker) =
         ConnectionWorker::new(store.clone(), config.clone(), providers.clone()).await?;
     let context = api::Context::new(

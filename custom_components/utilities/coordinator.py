@@ -1,7 +1,9 @@
 """Entry-owned polling with explicit provider coverage."""
 
 import logging
+import re
 from datetime import date, timedelta
+from hashlib import sha256
 from urllib.parse import urlencode
 
 from aiohttp import ClientError
@@ -21,6 +23,7 @@ from .models import (
     Collection,
     Coverage,
     Snapshot,
+    StaleAutomaticAccount,
     Summary,
     page,
     record,
@@ -66,6 +69,39 @@ class UtilitiesCoordinator(DataUpdateCoordinator[Snapshot]):
         self.active = False
         for issue in REPAIRS:
             ir.async_delete_issue(self.hass, DOMAIN, f"{self.entry.entry_id}_{issue}")
+        self._async_update_automatic_repairs(())
+
+    @callback
+    def _async_update_automatic_repairs(
+        self, accounts: tuple[StaleAutomaticAccount, ...]
+    ) -> None:
+        """Keep dismissals for ongoing issues and remove resolved accounts."""
+        prefix = f"{self.entry.entry_id}_stale_automatic_account_"
+        with ir.async_refresh_issues(
+            self.hass,
+            DOMAIN,
+            issue_id_pattern=re.escape(prefix),
+            config_entry_id=self.entry.entry_id,
+        ):
+            for account in accounts:
+                identity = sha256(account.account_id.encode()).hexdigest()
+                placeholders = {"account": account.name}
+                key = "stale_automatic_account_without_data"
+                if account.last_data_at is not None:
+                    key = "stale_automatic_account"
+                    placeholders["last_data_date"] = (
+                        dt_util.as_local(account.last_data_at).date().isoformat()
+                    )
+                ir.async_create_issue(
+                    self.hass,
+                    DOMAIN,
+                    prefix + identity,
+                    config_entry_id=self.entry.entry_id,
+                    is_fixable=False,
+                    severity=ir.IssueSeverity.WARNING,
+                    translation_key=key,
+                    translation_placeholders=placeholders,
+                )
 
     async def read(self, path: str) -> object:
         response = await self.client.request("GET", path)
@@ -173,7 +209,7 @@ class UtilitiesCoordinator(DataUpdateCoordinator[Snapshot]):
                 ),
                 "coverage_incomplete": bool(states & {"partial", "unavailable"})
                 or not summary.coverage,
-                "stale_data": summary.stale,
+                "stale_data": summary.manual_accounts_stale,
                 "energy_statistics": energy_incomplete,
             }
             for issue, present in issues.items():
@@ -189,4 +225,5 @@ class UtilitiesCoordinator(DataUpdateCoordinator[Snapshot]):
                     )
                 else:
                     ir.async_delete_issue(self.hass, DOMAIN, issue_id)
+            self._async_update_automatic_repairs(summary.stale_automatic_accounts)
         return Snapshot(summary, collections, complete)

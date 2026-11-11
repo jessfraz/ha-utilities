@@ -88,6 +88,8 @@ td.numeric { font-family: var(--mono); }
 .sync-form button { flex: 0 0 auto; }
 .sync-status { margin: 16px 0 0; font-size: 13px; }
 .sync-status:empty { display: none; }
+.history-sync { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-top: 16px; }
+.history-sync p { margin: 0; }
 .sync-availability { margin: 12px 0 0; font-size: 13px; color: var(--muted); }
 .sync-availability:empty { margin: 0; }
 .detail-total { font-size: 36px; letter-spacing: -.04em; margin: 14px 0 24px; font-variant-numeric: tabular-nums; }

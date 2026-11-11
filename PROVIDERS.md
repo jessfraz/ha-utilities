@@ -24,6 +24,8 @@ do not establish a complete arbitrary future calendar. A name-only next-pickup
 record must uniquely match the validated service catalog. Invoice-associated
 payments are not a complete payment ledger or proof of settlement. Currency
 must match the explicit account binding. No service request is submitted.
+All-history sync omits WM's invoice date filters. Collection history still
+uses the bounded lookback and the current/next service endpoints.
 
 ## Bayou
 
@@ -63,6 +65,9 @@ Every continuation revalidates the exact customer, account number, and meter
 bindings. Date windows bound the documented unpaged arrays without inventing
 an offset API. Overlapping fetch windows preserve daily intervals that cross
 UTC midnight; local filtering selects interval start dates.
+All-history sync reads undated bills and uses Bayou's discovered interval
+bounds to read usage in 28-day windows. It reads already available data;
+locked records remain a coverage limitation.
 
 Amounts are integer cents in the configured currency. `outstanding_balance`
 means the previous billing cycle's balance, not current account balance.

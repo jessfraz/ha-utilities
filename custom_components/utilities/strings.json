@@ -115,7 +115,15 @@
     },
     "stale_data": {
       "title": "Utility data is stale",
-      "description": "Utilities has no recent successful sync. Saved records remain historical data, not current provider state. Check provider coverage and request a sync when access is available."
+      "description": "A utility account has no recent successful sync. Check its provider connection and request a sync in Utilities."
+    },
+    "stale_automatic_account": {
+      "title": "No recent data for {account}",
+      "description": "Utilities has gone 40 days without new provider data. The latest data is from {last_data_date}. Check the connection and sync status in Utilities."
+    },
+    "stale_automatic_account_without_data": {
+      "title": "No recent data for {account}",
+      "description": "Utilities has received no provider data for 40 days. Check the connection and sync status in Utilities."
     },
     "energy_statistics": {
       "title": "Utility Energy statistics are incomplete",

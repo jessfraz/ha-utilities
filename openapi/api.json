@@ -790,6 +790,28 @@
         ],
         "type": "object"
       },
+      "HistoryRange": {
+        "enum": [
+          "all"
+        ],
+        "type": "string"
+      },
+      "HistorySyncInput": {
+        "additionalProperties": false,
+        "properties": {
+          "account": {
+            "type": "string"
+          },
+          "range": {
+            "$ref": "#/components/schemas/HistoryRange"
+          }
+        },
+        "required": [
+          "account",
+          "range"
+        ],
+        "type": "object"
+      },
       "ImportAccount": {
         "additionalProperties": false,
         "properties": {
@@ -1837,6 +1859,26 @@
         ],
         "type": "string"
       },
+      "StaleAutomaticAccount": {
+        "properties": {
+          "account_id": {
+            "type": "string"
+          },
+          "last_data_at": {
+            "format": "date-time",
+            "nullable": true,
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "account_id",
+          "name"
+        ],
+        "type": "object"
+      },
       "Summary": {
         "properties": {
           "accounts": {
@@ -1876,8 +1918,19 @@
             "nullable": true,
             "type": "string"
           },
+          "manual_accounts_stale": {
+            "default": false,
+            "type": "boolean"
+          },
           "stale": {
             "type": "boolean"
+          },
+          "stale_automatic_accounts": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/StaleAutomaticAccount"
+            },
+            "type": "array"
           },
           "usage_intervals": {
             "format": "uint64",
@@ -1955,6 +2008,16 @@
           "state"
         ],
         "type": "object"
+      },
+      "SyncSelection": {
+        "anyOf": [
+          {
+            "$ref": "#/components/schemas/SyncInput"
+          },
+          {
+            "$ref": "#/components/schemas/HistorySyncInput"
+          }
+        ]
       },
       "SyncState": {
         "enum": [
@@ -2070,7 +2133,7 @@
   "info": {
     "description": "Local utility observations and explicit coverage. Bearer owner credential or authenticated HA bridge. Sync reads providers only; no payments or service changes.",
     "title": "Utilities API",
-    "version": "0.1.6"
+    "version": "0.1.7"
   },
   "openapi": "3.0.3",
   "paths": {
@@ -3220,7 +3283,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/SyncInput"
+                "$ref": "#/components/schemas/SyncSelection"
               }
             }
           },

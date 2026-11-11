@@ -7,11 +7,11 @@ use crate::{
     utility::SyncPage,
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use sqlx::{
-    QueryBuilder, Row, Sqlite, SqlitePool,
+    Executor, QueryBuilder, Row, Sqlite, SqlitePool,
     sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteRow},
 };
 use std::{path::Path, time::Duration};
@@ -157,8 +157,14 @@ impl Store {
         // Reserve the SQLite writer before overlap reads. A deferred transaction
         // cannot upgrade a WAL snapshot after concurrent sync admission commits.
         let mut tx = self.pool.begin_with(queries::BEGIN_INGEST).await?;
+        let mut newest_source = None;
         for observation in &page.observations {
             let row = ObservationRow::new(binding, observation)?;
+            if let Some(source) =
+                source_time(observation).filter(|source| *source <= row.observed_at)
+            {
+                newest_source = newest_source.max(Some(source));
+            }
             if row.kind == "usage" {
                 // A revised same-ID interval is reconciled; overlapping distinct intervals are rejected.
                 let overlap: bool = sqlx::query_scalar(queries::OVERLAP)
@@ -182,6 +188,13 @@ impl Store {
                 .bind(row.end_key)
                 .bind(row.observed_at.to_rfc3339())
                 .bind(row.payload)
+                .execute(&mut *tx)
+                .await?;
+        }
+        if let Some(source) = newest_source {
+            sqlx::query(queries::RECORD_NEWEST_PROVIDER_DATA)
+                .bind(source.to_rfc3339_opts(SecondsFormat::Nanos, true))
+                .bind(&binding.id)
                 .execute(&mut *tx)
                 .await?;
         }
@@ -276,6 +289,8 @@ impl Store {
             last_imported_at: None,
             import_only_accounts: 0,
             stale: true,
+            stale_automatic_accounts: Vec::new(),
+            manual_accounts_stale: false,
         };
         for row in query.build().fetch_all(&self.pool).await? {
             let count: i64 = row.try_get("count")?;
@@ -316,7 +331,7 @@ impl Store {
         Ok(summary)
     }
 
-    async fn freshness(
+    pub(crate) async fn freshness(
         &self,
         accounts: &[String],
     ) -> Result<(Option<DateTime<Utc>>, bool), StoreError> {
@@ -340,20 +355,104 @@ impl Store {
     }
 
     pub async fn start_job(&self, account: &str) -> Result<SyncJob, StoreError> {
+        Self::start_job_on(&self.pool, account, None, false).await
+    }
+
+    async fn start_job_on<'e>(
+        executor: impl Executor<'e, Database = Sqlite>,
+        account: &str,
+        scheduled_for: Option<NaiveDate>,
+        initial_history: bool,
+    ) -> Result<SyncJob, StoreError> {
         let id = uuid::Uuid::now_v7().to_string();
         let result = sqlx::query(queries::START_JOB)
             .bind(&id)
             .bind(account)
-            .execute(&self.pool)
+            .bind(scheduled_for.map(|day| day.to_string()))
+            .bind(initial_history)
+            .fetch_one(executor)
             .await;
         match result {
             Err(sqlx::Error::Database(error)) if error.is_unique_violation() => {
-                return Err(StoreError::Busy);
+                Err(StoreError::Busy)
             }
-            Err(error) => return Err(error.into()),
-            Ok(_) => (),
+            Err(error) => Err(error.into()),
+            Ok(row) => Self::decode_job(row),
         }
-        self.job(&id).await
+    }
+
+    async fn mark_automatic_start(
+        tx: &mut sqlx::Transaction<'_, Sqlite>,
+        account: &str,
+    ) -> Result<bool, StoreError> {
+        let updated = sqlx::query(queries::MARK_AUTOMATIC_START)
+            .bind(account)
+            .execute(&mut **tx)
+            .await?;
+        Ok(updated.rows_affected() == 1)
+    }
+
+    pub(crate) async fn automatic_candidates(
+        &self,
+        deployment: &str,
+        today: NaiveDate,
+    ) -> Result<Vec<(AccountBinding, bool)>, StoreError> {
+        let today = today.to_string();
+        let rows = sqlx::query_as::<_, (String, bool)>(queries::AUTOMATIC_CANDIDATES)
+            .bind(deployment)
+            .bind(&today)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter()
+            .map(|(binding, first)| Ok((serde_json::from_str(&binding)?, first)))
+            .collect()
+    }
+
+    pub(crate) async fn start_automatic_job(
+        &self,
+        account: &str,
+        today: NaiveDate,
+        first: bool,
+    ) -> Result<SyncJob, StoreError> {
+        let mut tx = self.pool.begin_with(queries::BEGIN_INGEST).await?;
+        if first && !Self::mark_automatic_start(&mut tx, account).await? {
+            return Err(StoreError::Busy);
+        }
+        let job = Self::start_job_on(&mut *tx, account, (!first).then_some(today), first).await?;
+        tx.commit().await?;
+        Ok(job)
+    }
+
+    pub(crate) async fn stale_automatic_accounts(
+        &self,
+        deployment: &str,
+        cutoff: DateTime<Utc>,
+    ) -> Result<Vec<(ProviderId, StaleAutomaticAccount)>, StoreError> {
+        let rows = sqlx::query_as::<_, (String, Option<String>)>(queries::STALE_AUTOMATIC_ACCOUNTS)
+            .bind(deployment)
+            .bind(cutoff.to_rfc3339())
+            .bind(cutoff.to_rfc3339())
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter()
+            .map(|(binding, last_data_at)| {
+                let binding: AccountBinding = serde_json::from_str(&binding)?;
+                let last_data_at = last_data_at
+                    .as_deref()
+                    .map(DateTime::parse_from_rfc3339)
+                    .transpose()
+                    .map_err(|_| StoreError::InvalidObservation)?
+                    .map(|time| time.with_timezone(&Utc));
+                Ok((
+                    binding.provider,
+                    StaleAutomaticAccount {
+                        account_id: binding.id,
+                        name: binding.name,
+                        last_data_at,
+                    },
+                ))
+            })
+            .collect()
     }
 
     pub async fn finish_job(
@@ -363,13 +462,23 @@ impl Store {
         observations: u64,
         error: Option<&str>,
     ) -> Result<(), StoreError> {
-        sqlx::query(queries::FINISH_JOB)
+        let mut tx = self.pool.begin().await?;
+        let finished: Option<(String, bool)> = sqlx::query_as(queries::FINISH_JOB)
             .bind(enum_key(&state)?)
             .bind(i64::try_from(observations).map_err(|_| StoreError::InvalidObservation)?)
             .bind(error)
             .bind(id)
-            .execute(&self.pool)
+            .fetch_optional(&mut *tx)
             .await?;
+        if let Some((account, true)) = finished
+            && matches!(state, SyncState::Complete | SyncState::Partial)
+        {
+            sqlx::query(queries::FINISH_INITIAL_HISTORY)
+                .bind(account)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -414,6 +523,24 @@ impl Store {
                 .map_err(|_| StoreError::InvalidObservation)?,
             error: row.try_get("error")?,
         })
+    }
+}
+
+fn source_time(observation: &Observation) -> Option<DateTime<Utc>> {
+    let midnight = |day: NaiveDate| day.and_hms_opt(0, 0, 0).map(|date| date.and_utc());
+    match observation {
+        Observation::Bill(row) => midnight(row.issued_on),
+        Observation::Payment(row) => midnight(row.paid_on),
+        Observation::Usage(row) => Some(row.end),
+        Observation::Collection(row) => row.completed_at.or_else(|| {
+            matches!(
+                row.status,
+                CollectionStatus::Completed | CollectionStatus::Exception
+            )
+            .then(|| midnight(row.scheduled_date))
+            .flatten()
+        }),
+        Observation::Balance(_) | Observation::Service(_) => None,
     }
 }
 
@@ -614,7 +741,25 @@ mod queries {
     pub const SUMMARY_PREFIX: &str =
         "SELECT kind,count(*) AS count FROM observations WHERE account_id IN (";
     pub const FRESHNESS_PREFIX: &str = "SELECT count(*) AS accounts,max(finished_at) AS newest,min(finished_at) AS oldest FROM (SELECT account_id,max(finished_at) AS finished_at FROM sync_jobs WHERE state IN ('complete','partial') AND account_id IN (";
-    pub const START_JOB: &str = "INSERT INTO sync_jobs(id,account_id,state,started_at) VALUES(?,?,'running',strftime('%Y-%m-%dT%H:%M:%fZ','now'))";
+    pub const START_JOB: &str = "INSERT INTO sync_jobs(id,account_id,state,started_at,scheduled_for,initial_history) VALUES(?,?,'running',strftime('%Y-%m-%dT%H:%M:%fZ','now'),?,?) RETURNING id,account_id,state,started_at,finished_at,observations,error";
+    pub const MARK_AUTOMATIC_START: &str = "UPDATE accounts SET automatic_started_at=COALESCE(automatic_started_at,strftime('%Y-%m-%dT%H:%M:%fZ','now')) WHERE id=? AND binding IS NOT NULL AND import_only=0 AND initial_history_finished_at IS NULL";
+    pub const FINISH_INITIAL_HISTORY: &str = "UPDATE accounts SET initial_history_finished_at=COALESCE(initial_history_finished_at,strftime('%Y-%m-%dT%H:%M:%fZ','now')) WHERE id=?";
+    pub const RECORD_NEWEST_PROVIDER_DATA: &str = "UPDATE accounts SET newest_provider_data_at=?1 WHERE id=?2 AND (newest_provider_data_at IS NULL OR newest_provider_data_at < ?1)";
+    pub const AUTOMATIC_CANDIDATES: &str = "SELECT account.binding, account.initial_history_finished_at IS NULL
+        FROM accounts AS account WHERE account.deployment=?1 AND account.binding IS NOT NULL AND account.import_only=0
+        AND NOT EXISTS (SELECT 1 FROM sync_jobs WHERE account_id=account.id AND state='running')
+        AND (
+            (account.initial_history_finished_at IS NULL AND
+                (SELECT CASE WHEN COUNT(*) < 2 AND COUNT(*) FILTER (WHERE state='failed') = 0 THEN 1 ELSE 0 END
+                 FROM sync_jobs WHERE account_id=account.id AND initial_history=1 AND started_at>=?2))
+            OR (date(account.initial_history_finished_at) < ?2
+                AND NOT EXISTS (SELECT 1 FROM sync_jobs WHERE account_id=account.id AND scheduled_for=?2))
+        )
+        ORDER BY account.id LIMIT 100";
+    pub const STALE_AUTOMATIC_ACCOUNTS: &str = "SELECT binding,newest_provider_data_at FROM accounts
+        WHERE deployment=? AND binding IS NOT NULL AND import_only=0 AND julianday(automatic_started_at) <= julianday(?)
+        AND (newest_provider_data_at IS NULL OR julianday(newest_provider_data_at) <= julianday(?))
+        ORDER BY id LIMIT 100";
     pub const LATEST_JOBS: &str = "SELECT job.id,job.account_id,job.state,job.started_at,job.finished_at,job.observations,job.error
         FROM accounts AS account
         JOIN sync_jobs AS job ON job.id=(
@@ -622,7 +767,7 @@ mod queries {
         )
         WHERE account.deployment=? AND account.binding IS NOT NULL
         ORDER BY account.id LIMIT 100";
-    pub const FINISH_JOB: &str = "UPDATE sync_jobs SET state=?,finished_at=strftime('%Y-%m-%dT%H:%M:%fZ','now'),observations=?,error=? WHERE id=? AND state='running'";
+    pub const FINISH_JOB: &str = "UPDATE sync_jobs SET state=?,finished_at=strftime('%Y-%m-%dT%H:%M:%fZ','now'),observations=?,error=? WHERE id=? AND state='running' RETURNING account_id,initial_history";
     pub const JOB: &str = "SELECT id,account_id,state,started_at,finished_at,observations,error FROM sync_jobs WHERE id=?";
     pub const LIST_PREFIX: &str =
         "SELECT account_id,id,sort_key,payload FROM observations WHERE kind=";
@@ -652,7 +797,7 @@ mod tests {
     use crate::{
         config::Config,
         models::*,
-        store::{Store, bind_accounts, freshness_sql, list_sql, queries, summary_sql},
+        store::{Store, StoreError, bind_accounts, freshness_sql, list_sql, queries, summary_sql},
         utility::SyncPage,
     };
     use chrono::{Duration, Utc};
@@ -866,6 +1011,25 @@ mod tests {
             sqlx::query(queries::LATEST_JOBS).bind(&config.deployment),
         )
         .await;
+        let today = now.date_naive().to_string();
+        explain(
+            "automatic_candidates",
+            &store,
+            sqlx::query(queries::AUTOMATIC_CANDIDATES)
+                .bind(&config.deployment)
+                .bind(&today),
+        )
+        .await;
+        let cutoff = (now - Duration::days(40)).to_rfc3339();
+        explain(
+            "stale_automatic_accounts",
+            &store,
+            sqlx::query(queries::STALE_AUTOMATIC_ACCOUNTS)
+                .bind(&config.deployment)
+                .bind(&cutoff)
+                .bind(&cutoff),
+        )
+        .await;
         let started = std::time::Instant::now();
         let jobs = store.latest_jobs(&config.deployment).await.unwrap();
         println!(
@@ -927,6 +1091,28 @@ mod tests {
             &store,
             sqlx::query(queries::START_JOB)
                 .bind("fictional-job")
+                .bind("demo-wm")
+                .bind(Option::<String>::None)
+                .bind(false),
+        )
+        .await;
+        explain_write(
+            "mark_automatic_start",
+            &store,
+            sqlx::query(queries::MARK_AUTOMATIC_START).bind("demo-wm"),
+        )
+        .await;
+        explain_write(
+            "finish_initial_history",
+            &store,
+            sqlx::query(queries::FINISH_INITIAL_HISTORY).bind("demo-wm"),
+        )
+        .await;
+        explain_write(
+            "record_newest_provider_data",
+            &store,
+            sqlx::query(queries::RECORD_NEWEST_PROVIDER_DATA)
+                .bind(now.to_rfc3339())
                 .bind("demo-wm"),
         )
         .await;
@@ -957,6 +1143,219 @@ mod tests {
         println!(
             "14,000 observations, 200 sync jobs; bounded usage page runtime: {:?}",
             started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduled_runs_are_scoped_and_deduplicated_after_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(&directory.path().join("schedule.sqlite3"))
+            .await
+            .unwrap();
+        let config: Config = toml::from_str(include_str!("../config/example.toml")).unwrap();
+        store.register(&config).await.unwrap();
+        let account = &config.accounts[0].id;
+        let today = Utc::now().date_naive();
+        let tomorrow = today.succ_opt().unwrap();
+        assert!(
+            store
+                .automatic_candidates(&config.deployment, today)
+                .await
+                .unwrap()
+                .iter()
+                .any(|(binding, first)| binding.id == *account && *first)
+        );
+        let job = store
+            .start_automatic_job(account, today, true)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .automatic_candidates(&config.deployment, today)
+                .await
+                .unwrap()
+                .iter()
+                .all(|(binding, _)| binding.id != *account)
+        );
+        store
+            .finish_job(&job.id, SyncState::Complete, 0, None)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .automatic_candidates(&config.deployment, today)
+                .await
+                .unwrap()
+                .iter()
+                .all(|(binding, _)| binding.id != *account)
+        );
+        assert!(
+            store
+                .automatic_candidates(&config.deployment, tomorrow)
+                .await
+                .unwrap()
+                .iter()
+                .any(|(binding, first)| binding.id == *account && !first)
+        );
+        let daily = store
+            .start_automatic_job(account, tomorrow, false)
+            .await
+            .unwrap();
+        store
+            .finish_job(&daily.id, SyncState::Failed, 0, Some("fixture_failure"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            store.start_automatic_job(account, tomorrow, false).await,
+            Err(StoreError::Busy)
+        ));
+        assert!(
+            store
+                .automatic_candidates(&config.deployment, tomorrow)
+                .await
+                .unwrap()
+                .iter()
+                .all(|(binding, _)| binding.id != *account)
+        );
+        assert!(
+            store
+                .automatic_candidates(&config.deployment, tomorrow.succ_opt().unwrap())
+                .await
+                .unwrap()
+                .iter()
+                .any(|(binding, first)| binding.id == *account && !first)
+        );
+        assert!(
+            store
+                .automatic_candidates("other-home", tomorrow)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_initial_history_is_retried_the_next_day_before_daily_sync() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(&directory.path().join("schedule.sqlite3"))
+            .await
+            .unwrap();
+        let config: Config = toml::from_str(include_str!("../config/example.toml")).unwrap();
+        store.register(&config).await.unwrap();
+        let account = &config.accounts[0].id;
+        let today = Utc::now().date_naive();
+        let first = store
+            .start_automatic_job(account, today, true)
+            .await
+            .unwrap();
+        store
+            .finish_job(
+                &first.id,
+                SyncState::Failed,
+                0,
+                Some("provider_preparing_history"),
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .automatic_candidates(&config.deployment, today)
+                .await
+                .unwrap()
+                .iter()
+                .all(|(binding, _)| binding.id != *account)
+        );
+        assert!(
+            store
+                .automatic_candidates(&config.deployment, today.succ_opt().unwrap())
+                .await
+                .unwrap()
+                .iter()
+                .any(|(binding, first)| binding.id == *account && *first)
+        );
+    }
+
+    #[tokio::test]
+    async fn polling_old_records_does_not_clear_an_automatic_source_data_gap() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(&directory.path().join("source-freshness.sqlite3"))
+            .await
+            .unwrap();
+        let config: Config = toml::from_str(include_str!("../config/example.toml")).unwrap();
+        store.register(&config).await.unwrap();
+        let binding = &config.accounts[0];
+        let now = Utc::now();
+        let cutoff = now - Duration::days(40);
+        sqlx::query("UPDATE accounts SET automatic_started_at=? WHERE id=?")
+            .bind((now - Duration::days(80)).to_rfc3339())
+            .bind(&binding.id)
+            .execute(store.pool())
+            .await
+            .unwrap();
+        let mut bill = Bill {
+            id: "fictional-invoice".to_owned(),
+            account_id: binding.id.clone(),
+            provider: binding.provider,
+            issued_on: (now - Duration::days(42)).date_naive(),
+            due_on: None,
+            period_from: None,
+            period_to: None,
+            total: Money {
+                minor_units: 1200,
+                currency: binding.currency.clone(),
+            },
+            new_charges: None,
+            reported_quantities: vec![],
+            outstanding_balance: None,
+            source_status: None,
+            observed_at: now,
+        };
+        for _ in 0..2 {
+            store
+                .ingest(
+                    binding,
+                    &SyncPage {
+                        observations: vec![Observation::Bill(bill.clone())],
+                        coverage: vec![],
+                        continuation: None,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let stale = store
+            .stale_automatic_accounts(&config.deployment, cutoff)
+            .await
+            .unwrap();
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].1.account_id, binding.id);
+        assert_eq!(
+            stale[0].1.last_data_at.unwrap().date_naive(),
+            bill.issued_on
+        );
+        let summary = store
+            .summary(std::slice::from_ref(&binding.id))
+            .await
+            .unwrap();
+        assert_eq!(summary.bills, 1);
+        bill.issued_on = (now - Duration::days(2)).date_naive();
+        store
+            .ingest(
+                binding,
+                &SyncPage {
+                    observations: vec![Observation::Bill(bill)],
+                    coverage: vec![],
+                    continuation: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .stale_automatic_accounts(&config.deployment, cutoff)
+                .await
+                .unwrap()
+                .is_empty()
         );
     }
 }

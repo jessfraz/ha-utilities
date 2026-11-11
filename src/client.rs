@@ -238,6 +238,16 @@ impl Client {
         self.get("usage", None, Some(query)).await
     }
     pub async fn sync_request(&self, input: &SyncInput) -> Result<SyncJob, ClientError> {
+        self.submit_sync(input).await
+    }
+    pub async fn sync_history(&self, account: String) -> Result<SyncJob, ClientError> {
+        self.submit_sync(&HistorySyncInput {
+            account,
+            range: HistoryRange::All,
+        })
+        .await
+    }
+    async fn submit_sync(&self, input: &impl Serialize) -> Result<SyncJob, ClientError> {
         self.request(
             Method::POST,
             self.endpoint("sync", None, None)?,
@@ -247,6 +257,9 @@ impl Client {
     }
     pub async fn sync_get(&self, id: &str) -> Result<SyncJob, ClientError> {
         self.get("sync", Some(id), None).await
+    }
+    pub async fn sync_list(&self) -> Result<Vec<SyncJob>, ClientError> {
+        self.get("sync", None, None).await
     }
 
     pub async fn upload_document(&self, sha256: &str, bytes: Vec<u8>) -> Result<(), ClientError> {

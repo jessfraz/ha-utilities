@@ -75,6 +75,26 @@ continuing. Restarting the app does not blindly repeat an uncertain create.
 GET action. The Home Assistant bridge requires an administrator for connection
 setup and temporary links. Ordinary read-only Assist tools cannot create them.
 
+## Sync
+
+The first sync reads all history available to the connected account. After
+that, Utilities checks the previous seven completed UTC days once per day. A
+manual sync starts with the past three calendar months filled in. Choose
+**Sync all available history** to read the full provider history again.
+
+Repeated reads update matching bills and meter intervals in place. A Home
+Assistant Repair appears after 40 days without new provider records, even if
+the sync itself has been running. New data clears the Repair.
+
+```sh
+ha-utilities sync list
+ha-utilities sync request --account ACCOUNT_ID --from 2026-08-01 --to 2026-11-01
+ha-utilities sync all --account ACCOUNT_ID
+```
+
+`POST /v1/sync` accepts either `account`, `from`, and `to`, or `account` and
+`"range": "all"`. `GET /v1/sync` returns the latest job for each bound account.
+
 ## Import billing records
 
 Extract bill details, charge lines, payments, and measurements into a typed

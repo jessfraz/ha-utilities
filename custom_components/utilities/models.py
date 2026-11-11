@@ -134,6 +134,25 @@ def page(
 
 
 @dataclass(frozen=True, slots=True)
+class StaleAutomaticAccount:
+    account_id: str
+    name: str
+    last_data_at: datetime | None
+
+    @classmethod
+    def parse(cls, value: object) -> StaleAutomaticAccount:
+        row = record(value)
+        name = row.get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("Expected automatic account name")
+        return cls(
+            text(row.get("account_id")),
+            name,
+            optional_timestamp(row.get("last_data_at")),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class Summary:
     accounts: int
     bills: int
@@ -142,13 +161,22 @@ class Summary:
     coverage: tuple[Coverage, ...]
     last_synced_at: datetime | None
     stale: bool
+    manual_accounts_stale: bool
+    stale_automatic_accounts: tuple[StaleAutomaticAccount, ...]
 
     @classmethod
     def parse(cls, value: object) -> Summary:
         row = record(value)
         stale = row.get("stale")
-        if not isinstance(stale, bool):
+        manual_stale = row.get("manual_accounts_stale", stale)
+        if not isinstance(stale, bool) or not isinstance(manual_stale, bool):
             raise ValueError("Expected freshness")
+        automatic_rows = row.get("stale_automatic_accounts", [])
+        if not isinstance(automatic_rows, list) or len(automatic_rows) > 1000:
+            raise ValueError("Expected bounded automatic account freshness")
+        automatic = tuple(StaleAutomaticAccount.parse(item) for item in automatic_rows)
+        if len({account.account_id for account in automatic}) != len(automatic):
+            raise ValueError("Repeated automatic account")
         return cls(
             count(row.get("accounts")),
             count(row.get("bills")),
@@ -157,6 +185,8 @@ class Summary:
             coverage(row.get("coverage")),
             optional_timestamp(row.get("last_synced_at")),
             stale,
+            manual_stale,
+            automatic,
         )
 
 

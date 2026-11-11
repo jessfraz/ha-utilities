@@ -6,7 +6,9 @@ use chrono::{DateTime, NaiveDate, Utc};
 use ha_utilities::{
     config::{AccountBinding, BayouConfig, ServiceBinding},
     models::{Capability, CoverageState, Observation, ProviderId, ServiceKind, UsageUnit},
-    utility::{Continuation, SyncPage, SyncRequest, Utility, UtilityError, bayou::Bayou},
+    utility::{
+        Continuation, HistoryRequest, SyncPage, SyncRequest, Utility, UtilityError, bayou::Bayou,
+    },
 };
 use rust_decimal::Decimal;
 use serde::Serialize;
@@ -22,6 +24,9 @@ const KEY: &str = "fictional-bayou-key";
 const CUSTOMER_ID: &str = "71001";
 const ACCOUNT_ID: &str = "fictional-account-a";
 const METER_ID: &str = "fictional-electric-meter";
+const SCE: &str = "southern_california_edison";
+const SCE_REGISTERED_METER: &str = "10101-20202";
+const SCE_INTERVAL_METER: &str = "1010120202";
 
 #[derive(Clone, Debug)]
 struct Request {
@@ -196,12 +201,16 @@ fn request(from: &str, to: &str) -> SyncRequest {
 struct Customer {
     id: u64,
     external_id: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    utility: Option<&'static str>,
     is_currently_authenticated: bool,
     auth_status: &'static str,
     bills_are_ready: bool,
     utility_has_intervals: bool,
     account_has_intervals: bool,
     intervals_are_ready: bool,
+    first_interval_discovered: Option<&'static str>,
+    last_interval_discovered: Option<&'static str>,
     account_numbers: Vec<Account>,
     onboarding_token: &'static str,
 }
@@ -222,12 +231,15 @@ fn customer() -> Customer {
     Customer {
         id: 71001,
         external_id: "fictional-customer",
+        utility: None,
         is_currently_authenticated: true,
         auth_status: "authenticated",
         bills_are_ready: true,
         utility_has_intervals: true,
         account_has_intervals: true,
         intervals_are_ready: true,
+        first_interval_discovered: None,
+        last_interval_discovered: None,
         account_numbers: vec![
             Account {
                 id: "unbound-fictional-account",
@@ -300,9 +312,13 @@ struct Interval {
 }
 
 fn interval_body(rows: Vec<Interval>) -> String {
+    meter_interval_body(METER_ID, rows)
+}
+
+fn meter_interval_body(meter: &'static str, rows: Vec<Interval>) -> String {
     serde_json::to_string(&IntervalResponse {
         meters: vec![IntervalMeter {
-            id: METER_ID,
+            id: meter,
             intervals: rows,
         }],
     })
@@ -372,6 +388,290 @@ async fn sync_all(adapter: &Bayou, mut request: SyncRequest) -> Vec<SyncPage> {
         }
     }
     panic!("fictional sync did not terminate");
+}
+
+#[tokio::test]
+async fn all_history_reads_undated_bills_and_provider_bounded_intervals() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let discovery_pending = AtomicBool::new(true);
+    let fixture = Fixture::new(move |request| {
+        let query = request
+            .url
+            .query_pairs()
+            .collect::<std::collections::HashMap<_, _>>();
+        match request.url.path() {
+            "/api/v2/customers/71001" => {
+                let mut customer = customer();
+                if discovery_pending.swap(false, Ordering::Relaxed) {
+                    customer.account_has_intervals = false;
+                    customer.intervals_are_ready = false;
+                } else {
+                    customer.first_interval_discovered = Some("2024-01-01T00:00:00Z");
+                    customer.last_interval_discovered = Some("2024-02-01T00:00:00Z");
+                }
+                Reply::ok(serde_json::to_string(&customer).unwrap())
+            }
+            "/api/v2/customers/71001/bills" => {
+                assert_eq!(query.len(), 1);
+                assert_eq!(query["account_number"], ACCOUNT_ID);
+                let mut bill = bill();
+                bill.billed_on = Some("2023-12-05");
+                bill.billing_period_from = "2023-11-01";
+                bill.billing_period_to = "2023-11-30";
+                Reply::ok(serde_json::to_string(&vec![bill]).unwrap())
+            }
+            "/api/v2/customers/71001/intervals" => {
+                assert_eq!(query["meter_id"], METER_ID);
+                assert_eq!(query["account_number"], ACCOUNT_ID);
+                assert_eq!(query["latest_only"], "true");
+                if query["start"].starts_with("2024-01-01") {
+                    assert!(query["end"].starts_with("2024-01-31"));
+                    Reply::ok(interval_body(vec![daily(
+                        "2024-01-01T00:00:00Z",
+                        "2024-01-02T00:00:00Z",
+                        10,
+                    )]))
+                } else {
+                    assert!(query["start"].starts_with("2024-01-29"));
+                    Reply::ok(interval_body(vec![daily(
+                        "2024-02-01T00:00:00Z",
+                        "2024-02-02T00:00:00Z",
+                        11,
+                    )]))
+                }
+            }
+            _ => Reply::status(404),
+        }
+    })
+    .await;
+    let adapter = fixture.adapter();
+    let mut request = HistoryRequest {
+        binding: binding(),
+        continuation: None,
+        observed_at: time("2026-10-04T12:00:00Z"),
+    };
+    let first = adapter.sync_history(request.clone()).await.unwrap();
+    assert!(
+        first.observations.iter().any(
+            |row| matches!(row, Observation::Bill(bill) if bill.issued_on == day("2023-12-05"))
+        )
+    );
+    request.continuation = first.continuation;
+    assert!(request.continuation.is_some());
+    let middle = adapter.sync_history(request.clone()).await.unwrap();
+    assert!(middle.observations.iter().any(|row| matches!(row, Observation::Usage(value) if value.start == time("2024-01-01T00:00:00Z"))));
+    request.continuation = middle.continuation;
+    assert!(request.continuation.is_some());
+    let last = adapter.sync_history(request).await.unwrap();
+    assert!(last.continuation.is_none());
+    assert!(last.observations.iter().any(|row| matches!(row, Observation::Usage(value) if value.start == time("2024-02-01T00:00:00Z"))));
+    let bills = last
+        .coverage
+        .iter()
+        .find(|row| row.capability == Capability::Bills)
+        .unwrap();
+    assert_eq!(bills.state, CoverageState::Complete);
+    assert!(bills.from.is_none() && bills.to.is_none());
+}
+
+#[tokio::test]
+async fn sce_intervals_use_wire_meter_id_without_changing_bill_or_usage_identity() {
+    let fixture = Fixture::new(|request| {
+        let pairs = request
+            .url
+            .query_pairs()
+            .collect::<std::collections::HashMap<_, _>>();
+        match request.url.path() {
+            "/api/v2/customers/71001" => {
+                let mut data = customer();
+                data.utility = Some(SCE);
+                data.account_numbers[1].meters[0].id = SCE_REGISTERED_METER;
+                Reply::ok(serde_json::to_string(&data).unwrap())
+            }
+            "/api/v2/customers/71001/bills" if pairs["start"] == "2026-10-01" => {
+                assert_eq!(pairs["account_number"], ACCOUNT_ID);
+                let mut data = bill();
+                data.meters[0].id = SCE_REGISTERED_METER;
+                Reply::ok(serde_json::to_string(&vec![data]).unwrap())
+            }
+            "/api/v2/customers/71001/intervals" => {
+                assert_eq!(pairs["account_number"], ACCOUNT_ID);
+                assert_eq!(pairs["latest_only"], "true");
+                if pairs["meter_id"] != SCE_INTERVAL_METER {
+                    return Reply::status(404);
+                }
+                let mut intervals =
+                    vec![daily("2026-10-02T00:00:00Z", "2026-10-03T00:00:00Z", 2000)];
+                if pairs["start"].starts_with("2026-10-01") {
+                    intervals.insert(
+                        0,
+                        daily("2026-10-01T00:00:00Z", "2026-10-02T00:00:00Z", 1000),
+                    );
+                }
+                Reply::ok(meter_interval_body(SCE_INTERVAL_METER, intervals))
+            }
+            _ => default_reply(request),
+        }
+    })
+    .await;
+    let adapter = fixture.adapter();
+    let mut initial = request("2026-10-01", "2026-10-02");
+    initial.binding.services[0].provider_service = SCE_REGISTERED_METER.to_owned();
+    let pages = sync_all(&adapter, initial.clone()).await;
+    assert!(
+        pages.iter().flat_map(|page| &page.observations).any(
+            |value| matches!(value, Observation::Bill(bill) if bill.total.minor_units == 12050)
+        )
+    );
+    assert!(
+        pages
+            .last()
+            .unwrap()
+            .coverage
+            .iter()
+            .any(|value| value.capability == Capability::Usage
+                && value.state == CoverageState::Complete)
+    );
+    let mut usage = pages
+        .into_iter()
+        .flat_map(|page| page.observations)
+        .filter_map(|value| match value {
+            Observation::Usage(usage) => Some(usage),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(usage.len(), 2);
+    let october_second = usage.pop().unwrap();
+    assert_eq!(october_second.service_id, initial.binding.services[0].id);
+    assert_eq!(october_second.quantity, Decimal::from(2000));
+    initial.from = initial.to;
+    let repeated = sync_all(&adapter, initial).await;
+    let repeated_usage = repeated
+        .iter()
+        .flat_map(|page| &page.observations)
+        .filter_map(|value| match value {
+            Observation::Usage(usage) => Some(usage),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(repeated_usage.len(), 1);
+    assert_eq!(repeated_usage[0].id, october_second.id);
+    fixture.assert_read_only_auth();
+}
+
+#[tokio::test]
+async fn sce_interval_wire_id_must_be_unambiguous_across_the_customer() {
+    for (registered, alias, account) in [
+        (SCE_REGISTERED_METER, SCE_INTERVAL_METER, 1),
+        (SCE_INTERVAL_METER, "1010-120202", 0),
+    ] {
+        let fixture = Fixture::new(move |request| {
+            if request.url.path() == "/api/v2/customers/71001" {
+                let mut data = customer();
+                data.utility = Some(SCE);
+                data.account_numbers[1].meters[0].id = registered;
+                data.account_numbers[account].meters.push(Meter {
+                    id: alias,
+                    kind: "electric",
+                });
+                return Reply::ok(serde_json::to_string(&data).unwrap());
+            }
+            default_reply(request)
+        })
+        .await;
+        let adapter = fixture.adapter();
+        let mut input = request("2026-10-02", "2026-10-02");
+        input.binding.services[0].provider_service = registered.to_owned();
+        input.continuation = adapter.sync(input.clone()).await.unwrap().continuation;
+        assert!(matches!(
+            adapter.sync(input).await,
+            Err(UtilityError::BindingMismatch)
+        ));
+        assert_eq!(
+            fixture.requests.lock().unwrap().len(),
+            3,
+            "ambiguous wire IDs must be rejected before the interval request"
+        );
+    }
+}
+
+#[tokio::test]
+async fn sce_interval_meter_conversion_is_scoped_to_the_exact_wire_contract() {
+    for (utility, registered, selected, wire, returned) in [
+        (
+            None,
+            SCE_REGISTERED_METER,
+            SCE_REGISTERED_METER,
+            SCE_REGISTERED_METER,
+            SCE_REGISTERED_METER,
+        ),
+        (
+            Some("fictional-utility"),
+            SCE_REGISTERED_METER,
+            SCE_REGISTERED_METER,
+            SCE_REGISTERED_METER,
+            SCE_REGISTERED_METER,
+        ),
+        (
+            Some(SCE),
+            "101-01-20202",
+            "101-01-20202",
+            "101-01-20202",
+            "101-01-20202",
+        ),
+        (Some(SCE), "0001-02", "0001-02", "000102", "000102"),
+        (
+            Some(SCE),
+            SCE_REGISTERED_METER,
+            SCE_REGISTERED_METER,
+            SCE_INTERVAL_METER,
+            SCE_REGISTERED_METER,
+        ),
+        (
+            Some(SCE),
+            SCE_INTERVAL_METER,
+            SCE_REGISTERED_METER,
+            SCE_INTERVAL_METER,
+            SCE_INTERVAL_METER,
+        ),
+    ] {
+        let fixture = Fixture::new(move |request| match request.url.path() {
+            "/api/v2/customers/71001" => {
+                let mut data = customer();
+                data.utility = utility;
+                data.account_numbers[1].meters[0].id = registered;
+                Reply::ok(serde_json::to_string(&data).unwrap())
+            }
+            "/api/v2/customers/71001/intervals" => {
+                assert!(
+                    request
+                        .url
+                        .query_pairs()
+                        .any(|(k, v)| k == "meter_id" && v == wire)
+                );
+                Reply::ok(meter_interval_body(returned, Vec::new()))
+            }
+            _ => default_reply(request),
+        })
+        .await;
+        let adapter = fixture.adapter();
+        let mut input = request("2026-10-02", "2026-10-02");
+        input.binding.services[0].provider_service = selected.to_owned();
+        let first = adapter.sync(input.clone()).await;
+        if registered != selected {
+            assert!(matches!(first, Err(UtilityError::BindingMismatch)));
+            assert_eq!(fixture.requests.lock().unwrap().len(), 1);
+            continue;
+        }
+        input.continuation = first.unwrap().continuation;
+        let result = adapter.sync(input).await;
+        if returned == wire {
+            assert!(result.is_ok());
+        } else {
+            assert!(matches!(result, Err(UtilityError::BindingMismatch)));
+        }
+    }
 }
 
 #[tokio::test]
