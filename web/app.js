@@ -14,7 +14,7 @@ const views = {
   bills: ['Bills', 'Billing history, charges, and source documents.'],
   collections: ['Trash collections', 'Scheduled pickups, completion reports, and exceptions.'],
   usage: ['Usage', 'Meter intervals, with the units and time ranges reported by the provider.'],
-  settings: ['Settings', 'Utility connections, provider coverage, and sync.'],
+  settings: ['Settings', 'Utility connections and sync.'],
 };
 const names = {
   waste_management: 'Waste Management', bayou: 'Bayou',
@@ -114,7 +114,7 @@ function providerName(id) { return providers.find((provider) => provider.id === 
 function importedVendors(bindings = accounts) {
   const vendors = new Map();
   for (const account of bindings) {
-    if (!account.import_only) continue;
+    if (account.source.kind !== 'manual_import') continue;
     if (!vendors.has(account.provider)) vendors.set(account.provider, []);
     vendors.get(account.provider).push(account);
   }
@@ -122,13 +122,21 @@ function importedVendors(bindings = accounts) {
 }
 function accountDisplay(id) {
   const account = accounts.find((item) => item.id === id);
-  if (!account?.import_only) return { name: account?.name ?? 'Unknown account' };
+  if (account?.source.kind !== 'manual_import') return { name: account?.name ?? 'Unknown account' };
   const name = providerName(account.provider);
   return { name, context: account.name === name ? undefined : account.name };
 }
+function accountBadge(id) {
+  const account = accounts.find((item) => item.id === id);
+  const identity = account?.source.kind === 'manual_import' ? account.provider : id;
+  let color = 0;
+  for (const character of identity) color = (color * 31 + character.codePointAt(0)) % 6;
+  return node('span', accountDisplay(id).name, `badge account-badge account-color-${color}`);
+}
 function accountCell(id) {
-  const { name, context } = accountDisplay(id);
-  const result = cell(name);
+  const { context } = accountDisplay(id);
+  const result = cell();
+  result.append(accountBadge(id));
   if (context) result.append(node('small', context));
   return result;
 }
@@ -188,6 +196,9 @@ function navigate(next) {
 }
 
 function accountSupports(account, capability) {
+  if (account.source.kind === 'manual_import') {
+    return !!summary?.coverage.some((item) => item.account_id === account.id && item.capability === capability && item.state !== 'unsupported');
+  }
   const provider = providers.find((provider) => provider.id === account.provider);
   return !!provider?.capabilities.includes(capability)
     && !summary?.coverage.some((item) => item.account_id === account.id && item.capability === capability && item.state === 'unsupported');
@@ -460,7 +471,7 @@ async function renderOverview(signal, current) {
     connect.addEventListener('click', () => connectionManager.open());
     setup.append(connect);
     if (connect.disabled) setup.append(node('p', 'Add a Bayou API key in the app configuration to get started.', 'connection-note'));
-    content.replaceChildren(setup, connectionManager.section({ pendingOnly: true }), coveragePanel(summary.coverage));
+    content.replaceChildren(setup, connectionManager.section({ pendingOnly: true }));
     return;
   }
   const hasCollections = accountsFor('collections').length > 0;
@@ -475,7 +486,7 @@ async function renderOverview(signal, current) {
   const metrics = node('section', undefined, 'metrics');
   metrics.setAttribute('aria-label', 'Saved utility data');
   const vendors = importedVendors();
-  const utilityCount = vendors.size + accounts.filter((account) => !account.import_only).length;
+  const utilityCount = vendors.size + accounts.filter((account) => account.source.kind === 'live').length;
   const values = [[utilityCount, vendors.size ? 'Utilities' : 'Utility accounts'], [summary.bills, 'Saved bills'], ...(hasCollections ? [[summary.collections, 'Saved trash collections']] : []), [summary.usage_intervals, 'Usage intervals']];
   for (const [value, title] of values) {
     const metric = node('div', undefined, 'metric');
@@ -488,7 +499,7 @@ async function renderOverview(signal, current) {
   else {
     const freshnessText = node('div');
     freshnessText.append(node('strong', summary.last_synced_at ? `Last synced ${timestamp(summary.last_synced_at)}` : 'No successful sync yet'),
-      node('p', summary.stale ? 'Saved data may be out of date. Coverage below shows which provider results can be relied on.' : 'Coverage and timestamps describe the saved utility records.'));
+      node('p', summary.stale ? 'Saved data may be out of date.' : 'Your saved utility records.'));
     const syncLink = node('button', 'Sync settings', 'text-action');
     syncLink.type = 'button';
     syncLink.addEventListener('click', () => navigate('settings'));
@@ -516,7 +527,7 @@ async function renderOverview(signal, current) {
   columns.append(balancePanel);
   if (collections) {
   const collectionPanel = panel('Next 30 days', ['All trash collections', 'collections']);
-  if (!collections.items.length) collectionPanel.append(node('p', 'No collections reported for the next 30 days. Check coverage before relying on an empty schedule.', 'panel-empty'));
+  if (!collections.items.length) collectionPanel.append(node('p', 'No collections reported for the next 30 days.', 'panel-empty'));
   else {
     const list = node('ul', undefined, 'record-list');
     for (const collection of collections.items) {
@@ -538,7 +549,7 @@ async function renderOverview(signal, current) {
   if (cost) fragment.append(cost);
   const reportedUsage = reportedUsageTrend(bills);
   if (reportedUsage) fragment.append(reportedUsage);
-  fragment.append(columns, coveragePanel(summary.coverage));
+  fragment.append(columns);
   content.replaceChildren(fragment);
 }
 
@@ -691,7 +702,7 @@ function filterForm(type, state, onSubmit) {
   let selected = state.filters.import_provider ? importProviderPrefix + state.filters.import_provider : state.filters.account;
   const options = [
     ['', 'All accounts'],
-    ...matchingAccounts.filter((item) => type !== 'bills' || !item.import_only).map((item) => [item.id, item.name]),
+    ...matchingAccounts.filter((item) => type !== 'bills' || item.source.kind === 'live').map((item) => [item.id, item.name]),
     ...Array.from(vendors.keys(), (id) => [importProviderPrefix + id, providerName(id)]),
   ];
   if (!options.some(([id]) => id === selected)) {
@@ -761,7 +772,7 @@ async function renderList(type, signal, current) {
   }
   function draw() {
     results.replaceChildren();
-    if (!state.items.length) results.append(empty(`No ${type} reported`, 'No saved records match these filters. This is not confirmation that the provider has complete coverage for this period.'));
+    if (!state.items.length) results.append(empty(`No ${type} reported`, 'No saved records match these filters.'));
     else results.append(recordTable(type, state.items));
     const meta = node('div', undefined, 'list-meta');
     const amount = node('p', `${count(state.items.length)} ${state.items.length === 1 ? 'record' : 'records'} shown${state.next ? ' · more available' : ' · end of saved results'}`);
@@ -785,7 +796,7 @@ async function renderList(type, signal, current) {
       });
       meta.append(more);
     }
-    results.append(meta, coveragePanel(state.coverage));
+    results.append(meta);
   }
   try { await page(false); }
   catch (error) {
@@ -852,7 +863,8 @@ async function openBill(id) {
       body.replaceChildren(importedBill(bill, imported));
       return;
     }
-    const heading = node('p', accountName(bill.account_id), 'muted');
+    const heading = node('p');
+    heading.append(accountBadge(bill.account_id));
     const total = node('p', money(bill.total), 'detail-total');
     const fields = node('dl');
     for (const [title, value] of [
@@ -955,8 +967,10 @@ function importedBill(bill, { currency, bill: { record }, related }) {
   const amount = (minor_units) => minor_units == null ? null : money({ currency, minor_units });
   const selectedServices = record.scope === 'selected_services';
   const sheet = node('article', undefined, 'imported-bill');
-  const { name, context } = accountDisplay(bill.account_id);
-  sheet.append(node('h3', name, 'billing-account'));
+  const { context } = accountDisplay(bill.account_id);
+  const account = node('h3', undefined, 'billing-account');
+  account.append(accountBadge(bill.account_id));
+  sheet.append(account);
   if (context) sheet.append(node('p', context, 'billing-account-context'));
   const totals = node('dl', undefined, 'billing-totals');
   for (const [title, value] of [
@@ -1030,8 +1044,7 @@ function importedBill(bill, { currency, bill: { record }, related }) {
 function renderSettings() {
   const fragment = document.createDocumentFragment();
   fragment.append(connectionManager.section());
-  const vendors = importedVendors();
-  const syncAccounts = accounts.filter((account) => !account.import_only);
+  const syncAccounts = accounts.filter((account) => account.source.kind === 'live');
   const providerGrid = node('section', undefined, 'provider-grid');
   providerGrid.setAttribute('aria-label', 'Utility providers');
   for (const provider of providers) {
@@ -1056,37 +1069,46 @@ function renderSettings() {
     capabilities.setAttribute('aria-label', 'Supported data');
     for (const capability of provider.capabilities) capabilities.append(node('span', label(capability)));
     card.append(capabilities);
-    const imported = vendors.get(provider.id);
-    if (imported) {
-      const bindings = node('ul', undefined, 'imported-accounts');
-      bindings.setAttribute('aria-label', 'Imported billing accounts');
-      for (const account of imported) {
-        const row = node('li');
-        row.append(node('strong', account.name));
-        if (account.services.length) {
-          row.append(node('p', account.services.map((service) => service.name).join(', ')));
-        }
-        bindings.append(row);
-      }
-      card.append(bindings);
-    }
     providerGrid.append(card);
   }
   if (!providers.length) providerGrid.append(empty('No providers available', 'Check the app configuration.'));
-  fragment.append(providerGrid);
-  const bindings = panel('Bound accounts');
+  const bindings = panel('Utility accounts');
   bindings.classList.add('settings-section');
   if (!accounts.length) bindings.append(node('p', 'Connect a utility and choose its meters before syncing. Waste Management accounts use explicit bindings in the app configuration.', 'panel-empty'));
   else {
     const grid = node('div', undefined, 'panel-body');
     grid.classList.add('account-grid');
-    for (const account of syncAccounts) {
+    const apiSources = { bayou: 'Bayou', waste_management: 'Waste Management API' };
+    const displayAccounts = [
+      ...syncAccounts,
+      ...Array.from(importedVendors(), ([provider, bindings]) => ({
+        name: providerName(provider), source: { kind: 'manual_import' },
+        services: bindings.flatMap((account) => account.services),
+      })),
+    ];
+    for (const account of displayAccounts) {
       const card = node('article');
-      card.append(node('h3', account.name), node('p', label(account.provider)));
-      const services = node('ul');
-      for (const service of account.services) services.append(node('li', `${service.name} · ${label(service.kind)}`));
-      if (!account.services.length) card.append(node('p', 'No services bound.'));
-      else card.append(services);
+      card.append(node('h3', account.name));
+      const source = account.source.kind === 'manual_import' ? 'Manual import' : apiSources[account.source.provider];
+      const categories = node('div', undefined, 'capabilities');
+      categories.setAttribute('role', 'group');
+      categories.setAttribute('aria-label', 'Data source and service categories');
+      if (source) categories.append(node('span', source, 'badge'));
+      for (const kind of new Set(account.services.map((service) => service.kind))) {
+        categories.append(node('span', label(kind), 'badge'));
+      }
+      card.append(categories);
+      if (!account.services.length) card.append(node('p', 'No services connected.'));
+      const serviceNames = new Set(account.services.filter((service) => service.name !== account.name && service.name !== label(service.kind)).map((service) => service.name));
+      if (account.services.length > 1 && serviceNames.size) {
+        const details = node('details', undefined, 'account-services');
+        const services = node('div', undefined, 'capabilities');
+        for (const name of serviceNames) {
+          services.append(node('span', name));
+        }
+        details.append(node('summary', 'Services'), services);
+        card.append(details);
+      }
       grid.append(card);
     }
     bindings.append(grid);
@@ -1102,8 +1124,9 @@ function renderSettings() {
   }
   body.append(syncStatus());
   sync.append(body);
-  if (syncAccounts.length || !accounts.length) fragment.append(bindings);
-  fragment.append(sync, coveragePanel(summary.coverage));
+  const diagnostics = node('details', undefined, 'settings-section diagnostics');
+  diagnostics.append(node('summary', 'Diagnostics'), providerGrid, coveragePanel(summary.coverage));
+  fragment.append(bindings, sync, diagnostics);
   content.replaceChildren(fragment);
 }
 

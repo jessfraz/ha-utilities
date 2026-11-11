@@ -73,6 +73,12 @@ kind = "electricity"
             config.write_text,
             original.replace('id = "demo-energy"', 'id = "import_provider:spectrum"'),
         )
+    elif getattr(request, "param", None) == "account_cards":
+        values = await asyncio.to_thread(config.read_text)
+        await asyncio.to_thread(
+            config.write_text,
+            values.replace('name = "Energy service"', 'name = "Electricity (SCE)"'),
+        )
     seed_process = await asyncio.create_subprocess_exec(
         str(seed),
         str(database),

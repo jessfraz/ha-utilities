@@ -126,9 +126,9 @@ async def test_expired_ingress_session_points_back_to_home_assistant_not_native_
             try:
                 page = await browser.new_page()
                 await page.goto(str(server.make_url("/example-ingress/")))
-                await expect(
-                    page.get_by_role("heading", name="Data coverage")
-                ).to_be_visible()
+                await expect(page.locator("#content")).to_have_attribute(
+                    "aria-busy", "false"
+                )
                 authenticated = False
                 await page.get_by_role(
                     "button", name="Refresh local utility data"
