@@ -1,3 +1,11 @@
+# 0.1.10
+
+Read Bayou interval windows in the UTC format its API accepts. Keep manual
+imports separate from API accounts, group manual vendors, and show source and
+service tags. Put coverage in collapsed Diagnostics, name stale accounts,
+and keep bill totals, due dates, and quantities visible on mobile. Update the
+shared Home Assistant repair flow and its retry messages.
+
 # 0.1.9
 
 Show billed water use and propane deliveries in Usage, with billing periods

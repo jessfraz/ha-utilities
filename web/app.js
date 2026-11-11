@@ -112,6 +112,10 @@ function node(tag, text, className) {
 function label(value) { return names[value] ?? String(value).replaceAll('_', ' '); }
 function accountName(id) { return accounts.find((account) => account.id === id)?.name ?? 'Unknown account'; }
 function providerName(id) { return providers.find((provider) => provider.id === id)?.name ?? label(id); }
+function accountLabel(id) {
+  const account = accounts.find((item) => item.id === id);
+  return account ? `${providerName(account.provider)} · ${account.name}` : 'Unknown account';
+}
 function importedVendors(bindings = accounts) {
   const vendors = new Map();
   for (const account of bindings) {
@@ -123,7 +127,7 @@ function importedVendors(bindings = accounts) {
 }
 function accountDisplay(id) {
   const account = accounts.find((item) => item.id === id);
-  if (account?.source.kind !== 'manual_import') return { name: account?.name ?? 'Unknown account' };
+  if (account?.source.kind !== 'manual_import') return { name: account?.name ?? 'Unknown account', context: account ? providerName(account.provider) : undefined };
   const name = providerName(account.provider);
   return { name, context: account.name === name ? undefined : account.name };
 }
@@ -138,7 +142,7 @@ function accountCell(id) {
   const { context } = accountDisplay(id);
   const result = cell();
   result.append(accountBadge(id));
-  if (context) result.append(node('small', context));
+  if (context && accounts.find((account) => account.id === id)?.source.kind === 'manual_import') result.append(node('small', context));
   return result;
 }
 function serviceName(id) {
@@ -149,7 +153,7 @@ function serviceName(id) {
   return 'Unknown service';
 }
 function calendarDate(value) {
-  if (!value) return 'Not reported';
+  if (!value) return 'Date unavailable';
   const date = new Date(`${value}T12:00:00`);
   return Number.isNaN(date.valueOf()) ? 'Invalid date' : date.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
 }
@@ -274,7 +278,7 @@ async function allBindings(path, signal, filters) {
   return items;
 }
 
-function showError(error) {
+function showError(error, accountId) {
   if (error.name === 'AbortError') return;
   if (error instanceof ApiError && error.status === 401) {
     const value = byId('freshness-badge');
@@ -287,7 +291,8 @@ function showError(error) {
     retry.hidden = true;
     return;
   }
-  showNotice(error instanceof ApiError ? error.message : 'Utilities received an unexpected response. Try refreshing.', 'error');
+  const message = error instanceof ApiError ? error.message : 'Utilities received an unexpected response. Try refreshing.';
+  showNotice(accountId ? `${accountLabel(accountId)} · ${message}` : message, 'error');
   retry.hidden = false;
 }
 
@@ -301,6 +306,37 @@ function importStatus() {
   return summary.last_imported_at ? `Last imported ${timestamp(summary.last_imported_at)}` : 'Imported records';
 }
 
+function accountWarnings() {
+  const warnings = [];
+  for (const account of accounts.filter((item) => item.source.kind === 'live')) {
+    const job = syncJobs.find((item) => item.account_id === account.id);
+    const manual = summary?.stale_manual_accounts?.find((item) => item.account_id === account.id);
+    const automatic = summary?.stale_automatic_accounts?.find((item) => item.account_id === account.id);
+    const gaps = (summary?.coverage ?? []).filter((item) => item.account_id === account.id
+      && ['partial', 'unavailable', 'not_configured'].includes(item.state) && item.reason !== 'document_import');
+    const credentialsMissing = gaps.some((item) => item.state === 'not_configured');
+    const messages = [];
+    if (job && ['failed', 'interrupted', 'partial'].includes(job.state)) {
+      if (job.state !== 'partial' || !credentialsMissing) messages.push(job.state === 'partial' ? 'The latest sync finished with coverage gaps.' : `${label(job.state)}.`);
+      if (job.error) messages.push(reasonLabels[job.error] ?? 'Check this account’s provider coverage and configuration.');
+    }
+    for (const gap of gaps) {
+      if (gap.reason === 'not_synced' && (!job || manual)) continue;
+      const reason = reasonLabels[gap.reason] ?? `${label(gap.capability)} coverage needs attention.`;
+      if (!messages.includes(reason)) messages.push(reason);
+    }
+    if (manual) messages.push(manual.last_synced_at
+      ? `Last successful sync ${timestamp(manual.last_synced_at)}. Saved data may be out of date.`
+      : 'No successful sync yet.');
+    if (automatic) messages.push(automatic.last_data_at
+      ? `Latest provider data ${timestamp(automatic.last_data_at)}. Newer data has not been reported.`
+      : 'No provider data reported yet.');
+    if (!job && !manual && !automatic) messages.push('Awaiting the first provider sync.');
+    if (messages.length) warnings.push({ accountId: account.id, description: messages.join(' ') });
+  }
+  return warnings;
+}
+
 function updateFreshness() {
   const value = byId('freshness-badge');
   const imported = importStatus();
@@ -310,12 +346,15 @@ function updateFreshness() {
     shell.setStatus(imported);
     return;
   }
-  const covered = summary?.coverage ?? [];
-  const gaps = covered.some((item) => ['partial', 'unavailable', 'not_configured'].includes(item.state));
-  const state = !summary?.last_synced_at ? 'No sync yet' : summary.stale ? 'Data is stale' : gaps ? 'Coverage gaps' : 'Synced';
-  value.textContent = state;
-  value.className = `badge${summary?.stale || gaps ? ' attention' : summary?.last_synced_at ? ' good' : ''}`;
-  shell.setStatus(summary?.last_synced_at ? `Last synced ${timestamp(summary.last_synced_at)}` : 'No successful sync yet');
+  const warnings = accountWarnings();
+  if (warnings.length > 1) {
+    value.replaceChildren(...warnings.map((item) => node('span', `${accountLabel(item.accountId)} · Needs attention`, 'badge attention')));
+    value.className = 'freshness-badges';
+  } else {
+    value.textContent = warnings.length ? `${accountLabel(warnings[0].accountId)} · Needs attention` : summary?.last_synced_at ? 'Synced' : 'Connected';
+    value.className = `badge${warnings.length ? ' attention' : summary?.last_synced_at ? ' good' : ''}`;
+  }
+  shell.setStatus(summary?.last_synced_at ? `Most recent sync ${timestamp(summary.last_synced_at)}` : 'Connected to Utilities');
 }
 
 function markConnectionLost() {
@@ -401,7 +440,11 @@ function table(headers, caption, className = '') {
   wrapper.append(value);
   return { wrapper, body };
 }
-function cell(text, numeric = false) { return node('td', text, numeric ? 'numeric' : undefined); }
+function cell(text, numeric = false, heading) {
+  const value = node('td', text, numeric ? 'numeric' : undefined);
+  if (heading) value.dataset.label = heading;
+  return value;
+}
 
 function coveragePanel(items) {
   const section = panel('Data coverage');
@@ -496,12 +539,18 @@ async function renderOverview(signal, current) {
     metrics.append(metric);
   }
   const imported = importStatus();
-  const freshness = node('section', undefined, `freshness${summary.stale && !imported ? ' attention' : ''}`);
+  const warnings = accountWarnings();
+  const freshness = node('section', undefined, `freshness${warnings.length ? ' attention' : ''}`);
+  freshness.setAttribute('aria-label', 'Account freshness');
   if (imported) freshness.append(node('strong', imported));
   else {
-    const freshnessText = node('div');
-    freshnessText.append(node('strong', summary.last_synced_at ? `Last synced ${timestamp(summary.last_synced_at)}` : 'No successful sync yet'),
-      node('p', summary.stale ? 'Saved data may be out of date.' : 'Your saved utility records.'));
+    const freshnessText = node('div', undefined, 'freshness-accounts');
+    for (const warning of warnings) {
+      const item = node('div');
+      item.append(node('strong', accountLabel(warning.accountId)), node('p', warning.description));
+      freshnessText.append(item);
+    }
+    if (!warnings.length) freshnessText.append(node('strong', summary.last_synced_at ? `Most recent sync ${timestamp(summary.last_synced_at)}` : 'Connected to Utilities'));
     const syncLink = node('button', 'Sync settings', 'text-action');
     syncLink.type = 'button';
     syncLink.addEventListener('click', () => navigate('settings'));
@@ -544,37 +593,13 @@ async function renderOverview(signal, current) {
   }
   columns.append(collectionPanel);
   }
-  fragment.append(metrics, freshness, syncStatus());
-  const billVendors = importedVendors(accountsFor('bills'));
-  if (billVendors.size) fragment.append(importedVendorPanel(billVendors));
+  fragment.append(metrics, freshness);
   const cost = billingTrend(bills);
   if (cost) fragment.append(cost);
   const reportedUsage = reportedUsageTrend(bills);
   if (reportedUsage) fragment.append(reportedUsage);
   fragment.append(columns);
   content.replaceChildren(fragment);
-}
-
-function importedVendorPanel(vendors) {
-  const section = panel('Imported vendors');
-  section.setAttribute('aria-label', 'Imported vendors');
-  const list = node('ul', undefined, 'record-list');
-  for (const id of vendors.keys()) {
-    const name = providerName(id);
-    const row = node('li');
-    const open = node('button', 'View bills', 'quiet');
-    open.type = 'button';
-    open.setAttribute('aria-label', `View ${name} bills`);
-    open.addEventListener('click', () => {
-      const state = listStateFor('bills');
-      state.filters = { ...state.filters, account: '', import_provider: id };
-      navigate('bills');
-    });
-    row.append(node('strong', name), open);
-    list.append(row);
-  }
-  section.append(list);
-  return section;
 }
 
 function billingTrend(bills) {
@@ -678,23 +703,23 @@ async function renderUsage(signal, current) {
       const bills = await allBindings('v1/bills', signal, { from: dateOffset(-365), to: dateOffset(0) });
       if (current !== generation) return;
       const { wrapper, body } = table([
-        'Billing period', 'Utility', 'Service', { text: 'Quantity', numeric: true }, 'Bill',
-      ], 'Billed usage from saved bills', 'billed-usage-table');
+        'Billing period', 'Utility and service', { text: 'Quantity', numeric: true }, 'Bill',
+      ], 'Billed usage from saved bills', 'billed-usage-table responsive-table');
       for (const bill of bills) {
         for (const item of bill.reported_quantities ?? []) {
           if (!Object.hasOwn(reportedQuantityNames, item.kind)) continue;
           const row = node('tr');
-          const service = cell(reportedQuantityNames[item.kind]);
+          const service = accountCell(bill.account_id);
           service.append(node('small', serviceName(item.service_id)));
           const source = cell();
-          const open = node('button', calendarDate(bill.issued_on), 'record-button');
+          const open = node('button', 'View bill and documents', 'record-button');
           open.type = 'button';
-          open.setAttribute('aria-label', `View ${accountName(bill.account_id)} bill issued ${calendarDate(bill.issued_on)}`);
+          open.setAttribute('aria-label', `View ${accountName(bill.account_id)} bill and documents issued ${calendarDate(bill.issued_on)}`);
           open.addEventListener('click', () => openBill(bill.id));
-          source.append(open);
+          source.append(open, node('small', `Issued ${calendarDate(bill.issued_on)}`));
           const period = bill.period_from && bill.period_to
-            ? `${calendarDate(bill.period_from)} – ${calendarDate(bill.period_to)}` : 'Not reported';
-          row.append(cell(period), accountCell(bill.account_id), service, cell(quantity(item.quantity), true), source);
+            ? `${calendarDate(bill.period_from)} – ${calendarDate(bill.period_to)}` : 'Date unavailable';
+          row.append(cell(period, false, 'Billing period'), service, cell(quantity(item.quantity), true, 'Quantity'), source);
           body.append(row);
         }
       }
@@ -714,7 +739,7 @@ function initialFilters(type) {
   return { account: '', service: '', from: dateOffset(type === 'bills' ? -365 : type === 'collections' ? -30 : -7), to: dateOffset(type === 'collections' ? 30 : 0) };
 }
 function listStateFor(type) {
-  if (!listState.has(type)) listState.set(type, { filters: initialFilters(type), items: [], next: null, coverage: [] });
+  if (!listState.has(type)) listState.set(type, { filters: initialFilters(type), items: [], next: null });
   return listState.get(type);
 }
 function selectField(title, name, options, value = '', required = false) {
@@ -821,7 +846,6 @@ async function renderList(type, signal, current, target = content) {
     if (current !== generation) return;
     state.items = append ? [...state.items, ...response.items] : response.items;
     state.next = response.next_page;
-    state.coverage = response.coverage;
     draw();
   }
   function draw() {
@@ -862,23 +886,29 @@ async function renderList(type, signal, current, target = content) {
 }
 
 function recordTable(type, items) {
-  const headers = type === 'bills' ? ['Issued', 'Account', 'Due', { text: 'Total', numeric: true }, 'Source status']
+  const headers = type === 'bills' ? ['Issued', 'Account', 'Due', { text: 'Total', numeric: true }, 'Source']
     : type === 'collections' ? ['Scheduled', 'Service', 'Status', 'ETA / completion', 'Exception']
     : ['Interval start', 'Interval end', 'Service', { text: 'Quantity', numeric: true }, 'Unit'];
-  const { wrapper, body } = table(headers, `${label(type)} matching the selected filters`, 'data-table');
+  const { wrapper, body } = table(headers, `${label(type)} matching the selected filters`, type === 'bills' ? 'data-table bills-table responsive-table' : 'data-table');
   for (const item of items) {
     const row = node('tr');
     if (type === 'bills') {
-      const issued = cell();
+      const issued = cell(undefined, false, 'Issued');
       const open = node('button', calendarDate(item.issued_on), 'record-button');
       open.type = 'button';
       const { name, context } = accountDisplay(item.account_id);
       open.setAttribute('aria-label', `View ${context ? `${name}, ${context}` : name} bill issued ${calendarDate(item.issued_on)}`);
       open.addEventListener('click', () => openBill(item.id));
       issued.append(open);
-      const providerStatus = cell(item.source_status ?? (accounts.find((account) => account.id === item.account_id)?.source.kind === 'manual_import' ? 'Document imported' : 'Not reported'));
-      if (item.provider === 'bayou' && item.source_status) providerStatus.append(node('small', 'Data access status, not payment'));
-      row.append(issued, accountCell(item.account_id), cell(calendarDate(item.due_on)), cell(money(item.total), true), providerStatus);
+      const source = cell();
+      if (accounts.find((account) => account.id === item.account_id)?.source.kind === 'manual_import') {
+        const documents = node('button', 'Original documents', 'record-button');
+        documents.type = 'button';
+        documents.setAttribute('aria-label', `View original documents for ${accountName(item.account_id)} bill issued ${calendarDate(item.issued_on)}`);
+        documents.addEventListener('click', () => openBill(item.id, { showDocuments: true }));
+        source.append(documents);
+      } else source.append(node('span', `Synced from ${providerName(item.provider)}`));
+      row.append(issued, accountCell(item.account_id), cell(calendarDate(item.due_on), false, 'Due'), cell(money(item.total), true, 'Total'), source);
     } else if (type === 'collections') {
       const service = cell(serviceName(item.service_id));
       service.append(node('small', accountName(item.account_id)));
@@ -895,7 +925,7 @@ function recordTable(type, items) {
   return wrapper;
 }
 
-async function openBill(id) {
+async function openBill(id, { showDocuments = false } = {}) {
   detailController?.abort();
   detailController = new AbortController();
   const controller = detailController;
@@ -915,6 +945,7 @@ async function openBill(id) {
     if (controller.signal.aborted || !detail.open) return;
     if (imported) {
       body.replaceChildren(importedBill(bill, imported));
+      if (showDocuments) body.querySelector('.billing-originals a')?.focus();
       return;
     }
     const heading = node('p');
@@ -923,7 +954,7 @@ async function openBill(id) {
     const fields = node('dl');
     for (const [title, value] of [
       ['Issued', calendarDate(bill.issued_on)], ['Due', calendarDate(bill.due_on)],
-      ['Billing period', bill.period_from && bill.period_to ? `${calendarDate(bill.period_from)} – ${calendarDate(bill.period_to)}` : 'Not reported'],
+      ['Billing period', bill.period_from && bill.period_to ? `${calendarDate(bill.period_from)} – ${calendarDate(bill.period_to)}` : 'Date unavailable'],
       [bill.provider === 'bayou' ? 'Previous-cycle balance' : 'Outstanding balance', money(bill.outstanding_balance)], ['Provider status', bill.source_status ?? 'Not reported'],
       ['Provider', label(bill.provider)], ['Observed', timestamp(bill.observed_at)],
     ]) fields.append(node('dt', title), node('dd', value));
@@ -969,7 +1000,7 @@ function documentLinks(sources) {
     if (!/^[a-f0-9]{64}$/.test(source.sha256)) continue;
     const name = sourceNames[source.role] ?? 'Source document';
     const item = node('li');
-    const link = node('a', name);
+    const link = node('a', `Download ${name.toLowerCase()}`);
     link.href = `v1/documents/${source.sha256}`;
     link.download = '';
     item.append(link);
@@ -1041,9 +1072,10 @@ function importedBill(bill, { currency, bill: { record }, related }) {
     sheet.append(node('p', 'This bill omits account-wide totals and payments.', 'muted'));
   }
   sheet.append(detailFields([
-    ['Issued', calendarDate(record.issued_on)], ['Due', record.due_on ? calendarDate(record.due_on) : null],
+    ['Issued', calendarDate(record.issued_on)], ['Due', calendarDate(record.due_on)],
     ['Billing period', billingPeriod(record.period)], ['Previous balance', amount(record.totals.previous_balance_minor)],
     ['Payments received', amount(record.totals.payments_received_minor)], ['Adjustments', amount(record.totals.adjustments_minor)],
+    ['Provider status', bill.source_status],
   ]));
 
   if (record.charges.length) {
@@ -1089,6 +1121,7 @@ function importedBill(bill, { currency, bill: { record }, related }) {
   const originals = documentLinks(record.sources);
   if (originals.childElementCount) {
     const section = panel('Original documents');
+    section.classList.add('billing-originals');
     section.append(originals);
     sheet.append(section);
   }
@@ -1178,7 +1211,7 @@ function renderSettings() {
   }
   body.append(syncStatus());
   sync.append(body);
-  const diagnostics = node('details', undefined, 'settings-section diagnostics');
+  const diagnostics = node('details', undefined, 'panel settings-section diagnostics');
   diagnostics.append(node('summary', 'Diagnostics'), providerGrid, coveragePanel(summary.coverage));
   fragment.append(bindings, sync, diagnostics);
   content.replaceChildren(fragment);
@@ -1225,9 +1258,11 @@ function syncForm(syncAccounts) {
     const running = syncJobs.some((job) => job.account_id === binding?.id && job.state === 'running');
     submit.disabled = submitting || running || !canSync();
     all.disabled = submit.disabled;
-    availability.textContent = submitting ? 'Starting sync…' : running ? 'This account is already syncing.'
+    account.select.disabled = submitting;
+    const context = binding ? accountLabel(binding.id) : '';
+    availability.textContent = submitting ? `${context} · Starting sync…` : running ? `${context} · Already syncing.`
       : !binding ? 'Choose an account to sync.'
-      : !canSync() ? `${label(binding.provider)} credentials are not configured.` : '';
+      : !canSync() ? `${context} · Provider credentials are not configured.` : '';
   }
   account.select.addEventListener('change', updateAvailability);
   updateSyncForm = updateAvailability;
@@ -1242,17 +1277,18 @@ function syncForm(syncAccounts) {
   all.addEventListener('click', () => startSync({ range: 'all' }));
   async function startSync(range) {
     if (submit.disabled || !canSync()) return;
+    const accountId = account.select.value;
     submitting = true;
     updateAvailability();
     showNotice(''); retry.hidden = true;
     try {
-      const job = await api('v1/sync', { body: { account: account.select.value, ...range } });
+      const job = await api('v1/sync', { body: { account: accountId, ...range } });
       syncJobs = [...syncJobs.filter((item) => item.account_id !== job.account_id), job];
       const status = byId('sync-status');
       if (status) renderSyncStatus(status);
       pollSync();
     } catch (error) {
-      showError(error);
+      showError(error, accountId);
     } finally {
       submitting = false;
       updateAvailability();
@@ -1264,10 +1300,10 @@ function syncForm(syncAccounts) {
   return wrapper;
 }
 function syncDescription(job) {
-  if (job.state === 'running') return `Syncing ${accountName(job.account_id)}…`;
+  if (job.state === 'running') return `Syncing ${accountLabel(job.account_id)}…`;
   const state = job.state === 'complete' ? 'Sync complete' : job.state === 'partial' ? 'Sync finished with coverage gaps' : label(job.state);
   const records = `${count(job.observations)} ${job.observations === 1 ? 'observation' : 'observations'} processed`;
-  return `${state} · ${accountName(job.account_id)} · ${records}${job.error ? '. Check provider coverage and configuration.' : '.'}`;
+  return `${state} · ${accountLabel(job.account_id)} · ${records}${job.error ? '. Check this account’s provider coverage and configuration.' : '.'}`;
 }
 function pollSync() {
   clearTimeout(syncTimer);
@@ -1297,7 +1333,7 @@ function pollSync() {
     } catch (error) {
       if (controller.signal.aborted) return;
       const status = byId('sync-status');
-      if (status) status.textContent = 'Sync status could not be checked. The sync may still be running.';
+      if (status) status.textContent = syncJobs.map((job) => `${accountLabel(job.account_id)} · Sync status could not be checked. The last saved state was ${job.state}.`).join(' ');
       showError(error);
     }
   }, delay);
