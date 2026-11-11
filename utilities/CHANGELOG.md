@@ -1,3 +1,9 @@
+# 0.1.11
+
+Keep active sync progress visible on every page, including after closing setup
+or reloading. Keep other accounts’ warnings and leave completed job details in
+Settings.
+
 # 0.1.10
 
 Read Bayou interval windows in the UTC format its API accepts. Keep manual

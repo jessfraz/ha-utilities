@@ -737,6 +737,39 @@ async def test_usage_includes_billed_water_periods_and_source_documents(
     await page.screenshot(path=str(tmp_path / "usage-mobile.png"))
 
 
+async def test_sync_poll_preserves_other_account_warnings(
+    utility_page: Page, web_backend: WebBackend
+) -> None:
+    page = utility_page
+    await page.clock.install()
+    await open_app(page, web_backend)
+    status = page.locator("#freshness-badge")
+    await expect(status).to_contain_text("Bayou · Energy service · Needs attention")
+
+    def set_sync_state(state: str) -> None:
+        with sqlite3.connect(web_backend.database) as database:
+            database.execute(
+                "UPDATE sync_jobs SET state=?,finished_at=NULL WHERE account_id=?",
+                (state, "demo-energy"),
+            )
+
+    await asyncio.to_thread(set_sync_state, "running")
+    await page.clock.fast_forward(15000)
+    await expect(status).to_contain_text("Syncing Bayou · Energy service…")
+    await expect(status).to_contain_text(
+        "Waste Management · Waste service · Needs attention"
+    )
+    await expect(status).not_to_contain_text("Bayou · Energy service · Needs attention")
+    freshness = page.get_by_role("region", name="Account freshness", exact=True)
+    await expect(freshness).not_to_contain_text("Bayou · Energy service")
+    await expect(freshness).to_contain_text("Waste Management · Waste service")
+    await asyncio.to_thread(set_sync_state, "partial")
+    await page.clock.fast_forward(1500)
+    await expect(status).not_to_contain_text("Syncing")
+    await expect(status).to_contain_text("Bayou · Energy service · Needs attention")
+    await expect(page.locator("#sync-status")).to_have_count(0)
+
+
 async def test_sync_warnings_name_the_affected_provider_and_account(
     utility_page: Page, web_backend: WebBackend, tmp_path: Path
 ) -> None:

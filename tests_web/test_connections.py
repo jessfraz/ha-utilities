@@ -216,13 +216,18 @@ async def sign_in(page: Page, fixture: ConnectionBackend) -> None:
 
 
 async def start_connection(
-    page: Page | Frame, provider: BayouFixture, screenshot: Path | None = None
+    page: Page | Frame,
+    provider: BayouFixture,
+    screenshot: Path | None = None,
+    *,
+    from_overview: bool = False,
 ) -> None:
     owner = page.page if isinstance(page, Frame) else page
-    await page.get_by_role("button", name="Settings", exact=True).click()
-    await expect(
-        page.get_by_role("heading", name="Settings", exact=True)
-    ).to_be_visible()
+    if not from_overview:
+        await page.get_by_role("button", name="Settings", exact=True).click()
+        await expect(
+            page.get_by_role("heading", name="Settings", exact=True)
+        ).to_be_visible()
     await page.get_by_role("button", name="Connect utility", exact=True).click()
     dialog = page.get_by_role("dialog", name="Connect utility", exact=True)
     await dialog.get_by_label("Utility", exact=True).select_option("speculoos_power")
@@ -700,6 +705,76 @@ async def test_first_and_manual_sync_share_saved_progress(
             gate.set()
             await expect(status).to_contain_text("Sync finished with coverage gaps")
             assert fixture.provider.bills_queries[-1] == {"account_number"}
+        finally:
+            gate.set()
+            await browser.close()
+
+
+async def test_sync_progress_stays_visible_outside_settings(
+    connection_backend: ConnectionBackend, tmp_path: Path
+) -> None:
+    fixture = connection_backend
+    fixture.provider.bills_ready = True
+    gate = asyncio.Event()
+    fixture.provider.bills_gate = gate
+    progress = "Syncing Bayou · Example electricity…"
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch()
+        try:
+            page = await browser.new_page()
+            await sign_in(page, fixture)
+            await start_connection(page, fixture.provider, from_overview=True)
+            dialog = page.get_by_role("dialog")
+            fixture.provider.authenticated = True
+            await dialog.get_by_role("button", name="Check status", exact=True).click()
+            await dialog.get_by_role("checkbox", name="Electricity").check()
+            await dialog.get_by_role("button", name="Connect selected meters").click()
+            await expect(
+                dialog.get_by_role("button", name="Go to sync settings")
+            ).to_be_visible()
+            await dialog.get_by_role("button", name="Close utility connection").click()
+            await expect(
+                page.get_by_role("heading", name="Overview", exact=True)
+            ).to_be_visible()
+            status = page.locator("#freshness-badge")
+            await expect(status).to_have_text(progress)
+            await expect(status).to_have_attribute("role", "status")
+            await expect(
+                page.get_by_role("region", name="Account freshness", exact=True)
+            ).not_to_contain_text("This account has not been synced yet.")
+            await page.reload()
+            await expect(status).to_have_text(progress)
+            await page.screenshot(
+                path=str(tmp_path / "overview-automatic-progress.png"), full_page=True
+            )
+            await page.set_viewport_size({"width": 390, "height": 844})
+            await expect(status).to_be_in_viewport(ratio=1)
+            await page.screenshot(
+                path=str(tmp_path / "mobile-automatic-progress.png"), full_page=True
+            )
+            gate.set()
+            await expect(status).not_to_contain_text("Syncing", timeout=10000)
+            await expect(status).not_to_contain_text("Sync finished")
+            await expect(page.locator("#sync-status")).to_have_count(0)
+
+            await page.get_by_role("button", name="Settings", exact=True).click()
+            await expect(page.locator("#sync-status")).to_contain_text(
+                "Sync finished with coverage gaps"
+            )
+            gate.clear()
+            await page.get_by_label("Account to sync").select_option(
+                label="Example electricity"
+            )
+            await page.get_by_role("button", name="Sync account", exact=True).click()
+            await expect(page.locator("#sync-status")).to_contain_text(progress)
+            await page.get_by_role("button", name="Bills", exact=True).click()
+            await expect(status).to_have_text(progress)
+            await page.reload()
+            await expect(status).to_have_text(progress)
+            gate.set()
+            await expect(status).not_to_contain_text("Syncing", timeout=10000)
+            await expect(status).not_to_contain_text("Sync finished")
+            await expect(page.locator("#sync-status")).to_have_count(0)
         finally:
             gate.set()
             await browser.close()

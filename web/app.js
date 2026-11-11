@@ -315,6 +315,7 @@ function accountWarnings() {
   const warnings = [];
   for (const account of accounts.filter((item) => item.source.kind === 'live')) {
     const job = syncJobs.find((item) => item.account_id === account.id);
+    if (job?.state === 'running') continue;
     const manual = summary?.stale_manual_accounts?.find((item) => item.account_id === account.id);
     const automatic = summary?.stale_automatic_accounts?.find((item) => item.account_id === account.id);
     const gaps = (summary?.coverage ?? []).filter((item) => item.account_id === account.id
@@ -344,6 +345,7 @@ function accountWarnings() {
 
 function updateFreshness() {
   const value = byId('freshness-badge');
+  const running = syncJobs.filter((job) => job.state === 'running');
   const imported = importStatus();
   if (imported) {
     value.textContent = 'Imported records';
@@ -352,14 +354,18 @@ function updateFreshness() {
     return;
   }
   const warnings = accountWarnings();
-  if (warnings.length > 1) {
-    value.replaceChildren(...warnings.map((item) => node('span', `${accountLabel(item.accountId)} · Needs attention`, 'badge attention')));
+  if (running.length || warnings.length > 1) {
+    value.replaceChildren(
+      ...running.map((job) => node('span', syncDescription(job), 'badge')),
+      ...warnings.map((item) => node('span', `${accountLabel(item.accountId)} · Needs attention`, 'badge attention')),
+    );
     value.className = 'freshness-badges';
   } else {
     value.textContent = warnings.length ? `${accountLabel(warnings[0].accountId)} · Needs attention` : summary?.last_synced_at ? 'Synced' : 'Connected';
     value.className = `badge${warnings.length ? ' attention' : summary?.last_synced_at ? ' good' : ''}`;
   }
-  shell.setStatus(summary?.last_synced_at ? `Most recent sync ${timestamp(summary.last_synced_at)}` : 'Connected to Utilities');
+  shell.setStatus(running.length ? running.map(syncDescription).join(' ')
+    : summary?.last_synced_at ? `Most recent sync ${timestamp(summary.last_synced_at)}` : 'Connected to Utilities');
 }
 
 function markConnectionLost() {
@@ -1289,6 +1295,7 @@ function syncForm(syncAccounts) {
     try {
       const job = await api('v1/sync', { body: { account: accountId, ...range } });
       syncJobs = [...syncJobs.filter((item) => item.account_id !== job.account_id), job];
+      updateFreshness();
       const status = byId('sync-status');
       if (status) renderSyncStatus(status);
       pollSync();
@@ -1321,8 +1328,10 @@ function pollSync() {
     try {
       const next = await api('v1/sync', { signal: controller.signal });
       if (controller.signal.aborted) return;
+      const started = next.some((job) => job.state === 'running' && !syncJobs.some((prior) => prior.id === job.id && prior.state === 'running'));
       const completed = next.some((job) => job.state !== 'running' && !syncJobs.some((prior) => prior.id === job.id && prior.state === job.state));
       syncJobs = next;
+      if (started || completed) updateFreshness();
       const status = byId('sync-status');
       if (status) renderSyncStatus(status);
       if (view === 'settings') updateSyncForm?.();
@@ -1333,7 +1342,7 @@ function pollSync() {
         summary = nextSummary; health = nextHealth; updateFreshness();
         if (view === 'settings') document.querySelector('.coverage-panel')?.replaceWith(coveragePanel(summary.coverage));
         else await renderView();
-      }
+      } else if (started && view === 'overview') await renderView();
       pollSync();
     } catch (error) {
       if (controller.signal.aborted) return;
