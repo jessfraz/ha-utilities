@@ -239,6 +239,10 @@ impl Config {
                         ),
                         ProviderId::Bayou =>
                             matches!(service.kind, ServiceKind::Electricity | ServiceKind::Gas),
+                        ProviderId::Lvmwd => service.kind == ServiceKind::Water,
+                        ProviderId::SuperiorPropane => service.kind == ServiceKind::Propane,
+                        ProviderId::Starlink | ProviderId::Spectrum =>
+                            service.kind == ServiceKind::Internet,
                     },
                     "service kind does not match its utility provider"
                 );
@@ -264,6 +268,7 @@ impl Config {
                 id: a.id.clone(),
                 name: a.name.clone(),
                 provider: a.provider,
+                import_only: false,
                 services: a
                     .services
                     .iter()

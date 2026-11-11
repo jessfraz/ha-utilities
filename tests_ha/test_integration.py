@@ -3,6 +3,7 @@
 import asyncio
 import json
 from datetime import timedelta
+from hashlib import sha256
 
 import pytest
 from homeassistant.config_entries import SOURCE_USER, ConfigEntryState
@@ -15,7 +16,14 @@ from pytest_homeassistant.common import MockUser
 from pytest_homeassistant.typing import ClientSessionGenerator
 
 from custom_components.utilities import UtilitiesConfigEntry
-from custom_components.utilities.const import CONF_BACKEND_URL, CONF_TOKEN, DOMAIN
+from custom_components.utilities.const import (
+    CONF_BACKEND_URL,
+    CONF_TOKEN,
+    DOMAIN,
+    MAX_DOCUMENT_BYTES,
+    MAX_IMPORT_REQUEST_BYTES,
+    MAX_REQUEST_BYTES,
+)
 from custom_components.utilities.diagnostics import async_get_config_entry_diagnostics
 from custom_components.utilities.models import Collection
 
@@ -175,6 +183,72 @@ async def test_bridge_allows_reads_and_admin_sync_only(
     assert json.loads(backend.requests[-1].body) == body
     assert (await user.get(f"{PREFIX}/health")).status == 200
     assert backend.requests[-1].path == "/health"
+
+
+async def test_bridge_import_routes_require_admin_and_bound_their_bodies(
+    entry: UtilitiesConfigEntry,
+    backend: Backend,
+    hass_client: ClientSessionGenerator,
+    hass_user_token: str,
+) -> None:
+    user = await hass_client(hass_user_token)
+    admin = await hass_client()
+    document = b"Fictional source bytes\n" * 256
+    assert len(document) > MAX_REQUEST_BYTES
+    path = f"documents/{sha256(document).hexdigest()}"
+    upload = {"Content-Type": "application/octet-stream"}
+    manifest = b'{"records":[]}' + b" " * MAX_REQUEST_BYTES
+    metadata = {"Content-Type": "application/json"}
+    backend.responses[f"/v1/{path}"] = (204, b"", {})
+    backend.responses["/v1/imports"] = (200, b"{}", {})
+
+    backend.requests.clear()
+    assert (
+        await user.put(f"{PREFIX}/{path}", data=document, headers=upload)
+    ).status == 403
+    assert (
+        await user.post(f"{PREFIX}/imports", data=manifest, headers=metadata)
+    ).status == 403
+    assert (await admin.get(f"{PREFIX}/{path}")).status == 405
+    assert (
+        await admin.put(f"{PREFIX}/documents/not-a-sha256", data=document)
+    ).status == 404
+    assert (
+        await admin.put(f"{PREFIX}/{path}", data=document, headers=metadata)
+    ).status == 415
+    assert (
+        await admin.put(
+            f"{PREFIX}/{path}", data=b"x" * (MAX_DOCUMENT_BYTES + 1), headers=upload
+        )
+    ).status == 413
+    assert (
+        await admin.post(
+            f"{PREFIX}/imports",
+            data=b" " * (MAX_IMPORT_REQUEST_BYTES + 1),
+            headers=metadata,
+        )
+    ).status == 413
+    assert (
+        await admin.post(f"{PREFIX}/sync", data=manifest, headers=metadata)
+    ).status == 413
+    assert not backend.requests
+
+    assert (
+        await admin.put(f"{PREFIX}/{path}", data=document, headers=upload)
+    ).status == 204
+    assert (
+        await admin.post(f"{PREFIX}/imports", data=manifest, headers=metadata)
+    ).status == 200
+    assert [
+        (received.method, received.path, received.content_type, received.body)
+        for received in backend.requests
+    ] == [
+        ("PUT", f"/v1/{path}", "application/octet-stream", document),
+        ("POST", "/v1/imports", "application/json", manifest),
+    ]
+    assert all(
+        request.authorization == f"Bearer {TOKEN}" for request in backend.requests
+    )
 
 
 async def test_hosted_connections_require_admin_even_for_the_authorization_link(

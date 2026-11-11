@@ -343,7 +343,7 @@ impl Store {
 }
 
 pub(crate) mod queries {
-    pub const CLEAR_MANUAL: &str = "UPDATE accounts SET deployment=NULL,binding=NULL WHERE deployment=? AND connection_id IS NULL";
+    pub const CLEAR_MANUAL: &str = "UPDATE accounts SET deployment=NULL,binding=NULL WHERE deployment=? AND connection_id IS NULL AND import_only=0";
     pub const BINDINGS: &str = "SELECT binding FROM accounts WHERE deployment=? AND binding IS NOT NULL ORDER BY id LIMIT 101";
     pub const BINDING: &str =
         "SELECT binding FROM accounts WHERE deployment=? AND id=? AND binding IS NOT NULL";

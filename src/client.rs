@@ -1,7 +1,10 @@
 //! Native and HA transports share the same typed local read model.
+use crate::imports::{
+    ImportReceipt, ImportRequest, MAX_DOCUMENT_BYTES, MAX_IMPORT_REQUEST_BYTES, valid_digest,
+};
 use crate::models::*;
 use reqwest::{
-    Client as HttpClient, Method,
+    Client as HttpClient, Method, Response, StatusCode,
     header::{AUTHORIZATION, HeaderValue},
 };
 use serde::{Serialize, de::DeserializeOwned};
@@ -121,26 +124,31 @@ impl Client {
         }
         Ok(url)
     }
-    async fn request<T: DeserializeOwned>(
+    async fn send(
         &self,
         method: Method,
         url: Url,
-        body: Option<Vec<u8>>,
-    ) -> Result<T, ClientError> {
-        let connection_request = url
-            .path_segments()
-            .is_some_and(|segments| segments.into_iter().any(|segment| segment == "connections"));
+        body: Option<(&'static str, Vec<u8>)>,
+    ) -> Result<Response, ClientError> {
+        let conflict = match url.path_segments().and_then(|mut segments| {
+            segments.nth(match self.transport {
+                Transport::Native => 1,
+                Transport::Ha => 3,
+            })
+        }) {
+            Some("connections") => "connection_changed",
+            Some("imports" | "documents") => "import_conflict",
+            _ => "sync_busy",
+        };
         let mut builder = self
             .http
             .request(method, url)
             .header(AUTHORIZATION, self.authorization.clone())
             .header("Accept", "application/json");
-        if let Some(body) = body {
-            builder = builder
-                .header("Content-Type", "application/json")
-                .body(body);
+        if let Some((content_type, body)) = body {
+            builder = builder.header("Content-Type", content_type).body(body);
         }
-        let mut response = builder
+        let response = builder
             .send()
             .await
             .map_err(|_| ClientError::new("service_unavailable", None))?;
@@ -152,14 +160,30 @@ impl Client {
                     401 => "authentication_required",
                     403 => "access_denied",
                     404 => "not_found",
-                    409 if connection_request => "connection_changed",
-                    409 => "sync_busy",
+                    409 => conflict,
+                    413 => "request_too_large",
+                    415 => "unsupported_content_type",
                     429 => "rate_limited",
                     _ => "service_error",
                 },
                 Some(status.as_u16()),
             ));
         }
+        Ok(response)
+    }
+    async fn request<T: DeserializeOwned>(
+        &self,
+        method: Method,
+        url: Url,
+        body: Option<Vec<u8>>,
+    ) -> Result<T, ClientError> {
+        let response = self
+            .send(method, url, body.map(|body| ("application/json", body)))
+            .await?;
+        Self::response_json(response).await
+    }
+    async fn response_json<T: DeserializeOwned>(mut response: Response) -> Result<T, ClientError> {
+        let status = response.status();
         let mut body = Vec::new();
         while let Some(chunk) = response
             .chunk()
@@ -223,6 +247,54 @@ impl Client {
     }
     pub async fn sync_get(&self, id: &str) -> Result<SyncJob, ClientError> {
         self.get("sync", Some(id), None).await
+    }
+
+    pub async fn upload_document(&self, sha256: &str, bytes: Vec<u8>) -> Result<(), ClientError> {
+        if !valid_digest(sha256) || bytes.is_empty() {
+            return Err(ClientError::new("invalid_document", None));
+        }
+        if bytes.len() > MAX_DOCUMENT_BYTES {
+            return Err(ClientError::new("request_too_large", None));
+        }
+        let response = self
+            .send(
+                Method::PUT,
+                self.endpoint("documents", Some(sha256), None)?,
+                Some(("application/octet-stream", bytes)),
+            )
+            .await?;
+        if response.status() != StatusCode::NO_CONTENT {
+            return Err(ClientError::new(
+                "invalid_response",
+                Some(response.status().as_u16()),
+            ));
+        }
+        Ok(())
+    }
+
+    pub async fn import(&self, input: &ImportRequest) -> Result<ImportReceipt, ClientError> {
+        input
+            .validate()
+            .map_err(|_| ClientError::new("invalid_import", None))?;
+        let body =
+            serde_json::to_vec(input).map_err(|_| ClientError::new("invalid_import", None))?;
+        if body.len() > MAX_IMPORT_REQUEST_BYTES {
+            return Err(ClientError::new("request_too_large", None));
+        }
+        let response = self
+            .send(
+                Method::POST,
+                self.endpoint("imports", None, None)?,
+                Some(("application/json", body)),
+            )
+            .await?;
+        if response.status() != StatusCode::OK {
+            return Err(ClientError::new(
+                "invalid_response",
+                Some(response.status().as_u16()),
+            ));
+        }
+        Self::response_json(response).await
     }
 
     pub async fn connection_utilities(&self) -> Result<Page<ConnectableUtility>, ClientError> {

@@ -75,6 +75,29 @@ continuing. Restarting the app does not blindly repeat an uncertain create.
 GET action. The Home Assistant bridge requires an administrator for connection
 setup and temporary links. Ordinary read-only Assist tools cannot create them.
 
+## Import billing records
+
+Extract bill details, charge lines, payments, and measurements into a typed
+bundle before import. Place the source files and a `manifest.json` in one
+private directory. The manifest contains `documents` entries with `sha256`
+and relative `path`, plus an `imports` array of `ImportRequest` objects
+from the generated OpenAPI schema.
+
+```sh
+ha-utilities ingest ./bundle --check --json
+fetch-home-assistant ha-utilities --transport home-assistant ingest ./bundle --json
+```
+
+The first command checks the whole bundle locally. The import uploads each
+verified source by digest, then commits each account batch. Keep account and
+service IDs and printed record references stable across runs. A replay
+reports zero new records. A conflicting fact requires review or an explicit
+replacement against the current record revision.
+
+The overview shows reported charges and quantities by bill issue month.
+Open a bill for its printed totals, itemized rates, linked payments, and
+source downloads. Import is available to the native owner and HA admins.
+
 ## Develop
 
 `nix develop --command scripts/check` runs Rust, SQLite query-plan, HA, and

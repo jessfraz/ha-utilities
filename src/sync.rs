@@ -54,6 +54,7 @@ impl Providers {
         match provider {
             ProviderId::WasteManagement => self.wm.as_ref(),
             ProviderId::Bayou => self.bayou.as_ref(),
+            _ => None,
         }
     }
     pub(crate) fn bayou(&self) -> Option<&Bayou> {
@@ -106,14 +107,11 @@ impl Providers {
             .into_iter()
             .map(|id| ProviderInfo {
                 id,
-                name: match id {
-                    ProviderId::WasteManagement => "Waste Management",
-                    ProviderId::Bayou => "Bayou",
-                }
-                .to_owned(),
+                name: id.name().to_owned(),
                 capabilities: match id {
                     ProviderId::WasteManagement => crate::utility::waste_management::CAPABILITIES,
                     ProviderId::Bayou => crate::utility::bayou::CAPABILITIES,
+                    _ => &[],
                 }
                 .to_vec(),
                 configured: self.get(id).is_some(),
@@ -131,6 +129,9 @@ pub struct SyncHandle {
 impl SyncHandle {
     pub async fn request(&self, input: SyncInput) -> Result<SyncJob, StoreError> {
         if input.from > input.to || input.to.signed_duration_since(input.from).num_days() > 366 {
+            return Err(StoreError::InvalidQuery);
+        }
+        if self.store.is_import_only(&input.account).await? {
             return Err(StoreError::InvalidQuery);
         }
         self.store
@@ -176,6 +177,9 @@ impl SyncWorker {
         let mut initial = Vec::new();
         let bindings = store.bindings(&config.deployment).await?;
         for account in &bindings {
+            if store.is_import_only(&account.id).await? {
+                continue;
+            }
             for coverage in providers.initial_coverage(account) {
                 if matches!(
                     coverage.state,

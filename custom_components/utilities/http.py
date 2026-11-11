@@ -13,7 +13,12 @@ from homeassistant.helpers.http import HomeAssistantView
 
 from .authorization import authorized
 from .client import ResponseTooLarge
-from .const import DOMAIN, MAX_REQUEST_BYTES
+from .const import (
+    DOMAIN,
+    MAX_DOCUMENT_BYTES,
+    MAX_IMPORT_REQUEST_BYTES,
+    MAX_REQUEST_BYTES,
+)
 from .coordinator import UtilitiesCoordinator
 from .models import record, text
 
@@ -31,6 +36,8 @@ _ROUTES = (
     ),
     (re.compile(rf"bills/{_RECORD_ID}|sync/{_ID}"), {"GET"}, set()),
     (re.compile("sync"), {"POST"}, set()),
+    (re.compile("imports"), {"POST"}, set()),
+    (re.compile(r"documents/[0-9a-f]{64}"), {"PUT"}, set()),
     (re.compile("connections"), {"GET", "POST"}, set()),
     (re.compile("providers/bayou/utilities"), {"GET"}, set()),
     (re.compile(rf"connections/{_CONNECTION_ID}(?:/authorization)?"), {"GET"}, set()),
@@ -126,14 +133,25 @@ class UtilitiesView(HomeAssistantView):
         )
         if not await authorized(self._hass, entry, coordinator, user_id, admin=admin):
             raise web.HTTPForbidden
+        import_request = path == "imports"
+        document_upload = request.method == "PUT"
+        max_bytes = MAX_REQUEST_BYTES
+        content_type = "application/json"
+        if document_upload:
+            max_bytes = MAX_DOCUMENT_BYTES
+            content_type = "application/octet-stream"
+        elif import_request:
+            max_bytes = MAX_IMPORT_REQUEST_BYTES
+        if (import_request or document_upload) and request.content_type != content_type:
+            raise web.HTTPUnsupportedMediaType
         payload = bytearray()
         async for chunk in request.content.iter_chunked(1024):
             payload.extend(chunk)
-            if len(payload) > MAX_REQUEST_BYTES:
+            if len(payload) > max_bytes:
                 raise web.HTTPRequestEntityTooLarge(
-                    max_size=MAX_REQUEST_BYTES, actual_size=len(payload)
+                    max_size=max_bytes, actual_size=len(payload)
                 )
-        if request.method == "POST":
+        if request.method == "POST" and not import_request:
             try:
                 values = json.loads(payload)
                 if path.startswith("connections"):
@@ -154,7 +172,7 @@ class UtilitiesView(HomeAssistantView):
                         raise ValueError("Invalid sync window")
             except ValueError, TypeError, UnicodeDecodeError:
                 raise web.HTTPBadRequest(reason="Invalid request") from None
-        elif payload:
+        elif request.method == "GET" and payload:
             raise web.HTTPBadRequest(reason="GET requests have no body")
         target = "/health" if path == "health" else f"/v1/{path}"
         if request.query:
@@ -164,7 +182,10 @@ class UtilitiesView(HomeAssistantView):
             raise web.HTTPForbidden
         try:
             response = await coordinator.client.request(
-                request.method, target, body=bytes(payload) if payload else None
+                request.method,
+                target,
+                body=bytes(payload) if request.method != "GET" else None,
+                content_type=content_type,
             )
         except TimeoutError:
             raise web.HTTPGatewayTimeout from None
@@ -182,3 +203,4 @@ class UtilitiesView(HomeAssistantView):
 
     get = _proxy
     post = _proxy
+    put = _proxy

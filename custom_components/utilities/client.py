@@ -64,7 +64,12 @@ class UtilitiesClient:
         self._token = token
 
     async def request(
-        self, method: str, path: str, *, body: bytes | None = None
+        self,
+        method: str,
+        path: str,
+        *,
+        body: bytes | None = None,
+        content_type: str = "application/json",
     ) -> BackendResponse:
         """Never follow redirects or accept a per-request destination."""
         if not path.startswith("/") or path.startswith("//") or "\\" in path:
@@ -73,8 +78,8 @@ class UtilitiesClient:
             "Authorization": f"Bearer {self._token}",
             "Accept": "application/json",
         }
-        if body:
-            headers["Content-Type"] = "application/json"
+        if body is not None:
+            headers["Content-Type"] = content_type
         if method == "POST" and path == "/v1/sync":
             headers["X-Utilities-Request"] = "1"
         async with self._session.request(

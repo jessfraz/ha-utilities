@@ -1,5 +1,6 @@
 //! Reconciled observations, indexed keyset reads, and durable sync lifecycle.
 pub(crate) mod connections;
+mod imports;
 use crate::{
     config::{AccountBinding, Config},
     models::*,
@@ -85,6 +86,9 @@ impl Store {
             .execute(&mut *tx)
             .await?;
         for binding in &config.accounts {
+            if self.imported_binding_exists(&mut tx, binding).await? {
+                return Err(StoreError::BindingChanged.into());
+            }
             Self::register_binding(&mut tx, binding, None).await?;
         }
         tx.commit().await?;
@@ -269,6 +273,8 @@ impl Store {
                 .filter(|c| accounts.contains(&c.account_id))
                 .collect(),
             last_synced_at: None,
+            last_imported_at: None,
+            import_only_accounts: 0,
             stale: true,
         };
         for row in query.build().fetch_all(&self.pool).await? {
@@ -292,7 +298,19 @@ impl Store {
                 _ => (),
             }
         }
-        let (last, stale) = self.freshness(accounts).await?;
+        let states = self.import_states(accounts).await?;
+        let native = states
+            .iter()
+            .filter(|state| !state.import_only)
+            .map(|state| state.id.clone())
+            .collect::<Vec<_>>();
+        summary.last_imported_at = states.iter().filter_map(|state| state.imported_at).max();
+        summary.import_only_accounts = states.iter().filter(|state| state.import_only).count();
+        let (last, stale) = if native.is_empty() {
+            (None, summary.last_imported_at.is_none())
+        } else {
+            self.freshness(&native).await?
+        };
         summary.last_synced_at = last;
         summary.stale = stale;
         Ok(summary)
@@ -709,6 +727,8 @@ mod tests {
                         minor_units: 1234,
                         currency: "USD".to_owned(),
                     },
+                    new_charges: None,
+                    reported_quantities: vec![],
                     outstanding_balance: None,
                     source_status: None,
                     observed_at: now,

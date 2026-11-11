@@ -2,14 +2,18 @@
 use crate::{
     config::{Config, valid_id},
     connect::{ConnectionError, ConnectionHandle},
+    imports::{
+        BillDetails, ImportError, ImportReceipt, ImportRequest, MAX_DOCUMENT_BYTES,
+        MAX_IMPORT_REQUEST_BYTES,
+    },
     models::*,
     store::{Store, StoreError},
     sync::{Providers, SyncHandle},
 };
 use dropshot::{
     ApiDescription, Body, ConfigDropshot, HttpError, HttpResponseAccepted, HttpResponseHeaders,
-    HttpResponseOk, HttpServer, HttpServerStarter, Path, Query, RequestContext, TypedBody,
-    endpoint,
+    HttpResponseOk, HttpResponseUpdatedNoContent, HttpServer, HttpServerStarter, Path, Query,
+    RequestContext, TypedBody, UntypedBody, endpoint,
 };
 use http::{HeaderValue, Response};
 use schemars::JsonSchema;
@@ -93,6 +97,17 @@ fn store_error(error: StoreError) -> HttpError {
         StoreError::InvalidQuery => fail(S::BAD_REQUEST, "invalid_query"),
         StoreError::Busy => fail(S::CONFLICT, "sync_busy"),
         _ => HttpError::for_internal_error("database_error".to_owned()),
+    }
+}
+
+fn import_error(error: ImportError) -> HttpError {
+    use dropshot::ClientErrorStatusCode as S;
+    match error {
+        ImportError::Invalid => fail(S::BAD_REQUEST, "invalid_import"),
+        ImportError::Binding => fail(S::CONFLICT, "import_binding_conflict"),
+        ImportError::MissingDocument => fail(S::BAD_REQUEST, "missing_source_document"),
+        ImportError::Conflict => fail(S::CONFLICT, "import_record_conflict"),
+        ImportError::Store(error) => store_error(error),
     }
 }
 
@@ -242,9 +257,31 @@ async fn providers(
     request: RequestContext<Arc<Context>>,
 ) -> Result<PrivateOk<Page<ProviderInfo>>, HttpError> {
     authorized(&request)?;
-    let allowed = request.context().accounts().await?;
+    let context = request.context();
+    let bindings = context
+        .store
+        .bindings(&context.config.deployment)
+        .await
+        .map_err(store_error)?;
+    let allowed: Vec<_> = bindings.iter().map(|account| account.id.clone()).collect();
+    let mut providers = context.providers.info();
+    for binding in &bindings {
+        if !providers.iter().any(|item| item.id == binding.provider) {
+            providers.push(ProviderInfo {
+                id: binding.provider,
+                name: binding.provider.name().to_owned(),
+                capabilities: vec![
+                    Capability::Bills,
+                    Capability::Payments,
+                    Capability::Balances,
+                    Capability::Usage,
+                ],
+                configured: false,
+            });
+        }
+    }
     Ok(private(Page {
-        items: request.context().providers.info(),
+        items: providers,
         next_page: None,
         coverage: request
             .context()
@@ -272,10 +309,22 @@ async fn accounts(
     let allowed = current
         .accounts
         .iter()
-        .map(|account| account.id.as_str())
+        .map(|account| account.id.clone())
         .collect::<Vec<_>>();
+    let import_states = request
+        .context()
+        .store
+        .import_states(&allowed)
+        .await
+        .map_err(store_error)?;
+    let mut items = current.public_accounts();
+    for item in &mut items {
+        item.import_only = import_states
+            .iter()
+            .any(|state| state.id == item.id && state.import_only);
+    }
     Ok(private(Page {
-        items: current.public_accounts(),
+        items,
         next_page: None,
         coverage: request
             .context()
@@ -284,7 +333,7 @@ async fn accounts(
             .await
             .map_err(store_error)?
             .into_iter()
-            .filter(|item| allowed.contains(&item.account_id.as_str()))
+            .filter(|item| allowed.contains(&item.account_id))
             .collect(),
     }))
 }
@@ -516,6 +565,106 @@ async fn usage(
 struct RecordPath {
     id: String,
 }
+
+#[derive(Deserialize, JsonSchema)]
+struct DocumentPath {
+    sha256: String,
+}
+
+#[endpoint {method=PUT,path="/v1/documents/{sha256}",tags=["imports"],request_body_max_bytes=MAX_DOCUMENT_BYTES}]
+async fn document_put(
+    request: RequestContext<Arc<Context>>,
+    path: Path<DocumentPath>,
+    body: UntypedBody,
+) -> Result<HttpResponseUpdatedNoContent, HttpError> {
+    authorized(&request)?;
+    if header(&request, "content-type") != Some("application/octet-stream") {
+        return Err(fail(
+            dropshot::ClientErrorStatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "invalid_document_content_type",
+        ));
+    }
+    let context = request.context();
+    context
+        .store
+        .put_document(
+            &context.config.deployment,
+            &path.into_inner().sha256,
+            body.as_bytes(),
+        )
+        .await
+        .map_err(import_error)?;
+    Ok(HttpResponseUpdatedNoContent())
+}
+
+#[endpoint {method=GET,path="/v1/documents/{sha256}",tags=["imports"]}]
+async fn document_get(
+    request: RequestContext<Arc<Context>>,
+    path: Path<DocumentPath>,
+) -> Result<Response<Body>, HttpError> {
+    authorized(&request)?;
+    let context = request.context();
+    let sha256 = path.into_inner().sha256;
+    let bytes = context
+        .store
+        .document(&context.config.deployment, &sha256)
+        .await
+        .map_err(store_error)?;
+    let extension = if bytes.starts_with(b"%PDF-") {
+        "pdf"
+    } else {
+        "txt"
+    };
+    Response::builder()
+        .header("content-type", "application/octet-stream")
+        .header(
+            "content-disposition",
+            format!("attachment; filename=\"source-{sha256}.{extension}\""),
+        )
+        .header("x-content-type-options", "nosniff")
+        .header("cache-control", "no-store")
+        .body(Body::from(bytes))
+        .map_err(|_| HttpError::for_internal_error("response_error".to_owned()))
+}
+
+#[endpoint {method=POST,path="/v1/imports",tags=["imports"],request_body_max_bytes=MAX_IMPORT_REQUEST_BYTES}]
+async fn import_records(
+    request: RequestContext<Arc<Context>>,
+    body: TypedBody<ImportRequest>,
+) -> Result<PrivateOk<ImportReceipt>, HttpError> {
+    authorized(&request)?;
+    let context = request.context();
+    Ok(private(
+        context
+            .store
+            .import(&context.config.deployment, body.into_inner())
+            .await
+            .map_err(import_error)?,
+    ))
+}
+
+#[endpoint {method=GET,path="/v1/bills/{id}/details",tags=["utilities"]}]
+async fn bill_details(
+    request: RequestContext<Arc<Context>>,
+    path: Path<RecordPath>,
+) -> Result<PrivateOk<BillDetails>, HttpError> {
+    authorized(&request)?;
+    let id = path.into_inner().id;
+    if id.is_empty() || id.len() > 500 {
+        return Err(fail(
+            dropshot::ClientErrorStatusCode::BAD_REQUEST,
+            "invalid_id",
+        ));
+    }
+    let context = request.context();
+    Ok(private(
+        context
+            .store
+            .bill_details(&context.config.deployment, &id)
+            .await
+            .map_err(store_error)?,
+    ))
+}
 #[endpoint {method=GET,path="/v1/bills/{id}",tags=["utilities"]}]
 async fn bill_get(
     request: RequestContext<Arc<Context>>,
@@ -732,7 +881,7 @@ async fn schema(request: RequestContext<Arc<Context>>) -> Result<Response<Body>,
 
 pub fn description() -> anyhow::Result<ApiDescription<Arc<Context>>> {
     let mut api = ApiDescription::new();
-    let endpoints: [dropshot::ApiEndpoint<Arc<Context>>; 27] = [
+    let endpoints: [dropshot::ApiEndpoint<Arc<Context>>; 31] = [
         system.into(),
         health.into(),
         providers.into(),
@@ -748,6 +897,10 @@ pub fn description() -> anyhow::Result<ApiDescription<Arc<Context>>> {
         summary.into(),
         bills.into(),
         bill_get.into(),
+        bill_details.into(),
+        document_put.into(),
+        document_get.into(),
+        import_records.into(),
         balances.into(),
         collections.into(),
         usage.into(),

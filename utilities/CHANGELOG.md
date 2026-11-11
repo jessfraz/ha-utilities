@@ -1,3 +1,9 @@
+# 0.1.6
+
+Import typed billing records with their source documents. View itemized
+charges, rates, and linked payments on each bill, plus monthly costs,
+billed water, and propane deliveries in the overview.
+
 # 0.1.5
 
 Open Bayou sign-in in one click and explain why Bayou saves the utility login.

@@ -32,6 +32,8 @@ async fn main() -> anyhow::Result<()> {
                     minor_units: 8742 + i64::from(index) * 113,
                     currency: "USD".to_owned(),
                 },
+                new_charges: None,
+                reported_quantities: vec![],
                 outstanding_balance: if binding.provider == ProviderId::Bayou {
                     Some(Money {
                         minor_units: 1200,
@@ -119,6 +121,7 @@ async fn main() -> anyhow::Result<()> {
                 ProviderId::Bayou => {
                     matches!(capability, Capability::Payments | Capability::Collections)
                 }
+                _ => true,
             };
             Coverage {
                 account_id: binding.id.clone(),
