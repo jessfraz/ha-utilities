@@ -3,11 +3,12 @@
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.typing import ConfigType
 
-from ._app_kit.repairs import VersionRepairs
+from ._app_kit.repairs import VersionRepairs, async_check_startup_version
 from .client import UtilitiesClient
 from .const import CONF_BACKEND_URL, CONF_TOKEN, DOMAIN
 from .coordinator import UtilitiesCoordinator
@@ -33,7 +34,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: UtilitiesConfigEntry) ->
         entry.data[CONF_TOKEN],
     )
     coordinator = UtilitiesCoordinator(hass, entry, client)
-    await coordinator.async_config_entry_first_refresh()
+    try:
+        await coordinator.async_config_entry_first_refresh()
+    except ConfigEntryNotReady:
+        await async_check_startup_version(hass, entry, VERSION_REPAIR)
+        raise
     entry.runtime_data = coordinator
     entry.async_on_unload(coordinator.stop)
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)

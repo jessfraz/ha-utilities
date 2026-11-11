@@ -972,6 +972,51 @@
         ],
         "type": "object"
       },
+      "ImportBillPurge": {
+        "additionalProperties": false,
+        "properties": {
+          "expected_revision": {
+            "type": "string"
+          },
+          "origin_id": {
+            "type": "string"
+          },
+          "remove_unused_services": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "expected_revision",
+          "origin_id"
+        ],
+        "type": "object"
+      },
+      "ImportBillPurgeReceipt": {
+        "properties": {
+          "documents": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "records": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "removed": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "documents",
+          "records",
+          "removed"
+        ],
+        "type": "object"
+      },
       "ImportProvider": {
         "description": "A manual statement names its issuer, never an API adapter.",
         "enum": [
@@ -2290,7 +2335,7 @@
   "info": {
     "description": "Local utility observations and explicit coverage. Bearer owner credential or authenticated HA bridge. Sync reads providers only; no payments or service changes.",
     "title": "Utilities API",
-    "version": "0.1.12"
+    "version": "0.1.13"
   },
   "openapi": "3.0.3",
   "paths": {
@@ -3363,6 +3408,62 @@
           }
         },
         "summary": "Remove an import-only account and its exclusively linked source documents.",
+        "tags": [
+          "imports"
+        ]
+      }
+    },
+    "/v1/imports/bills/{id}/purge": {
+      "post": {
+        "operationId": "purge_import_bill",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ImportBillPurge"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ImportBillPurgeReceipt"
+                }
+              }
+            },
+            "description": "successful operation",
+            "headers": {
+              "cache-control": {
+                "required": true,
+                "schema": {
+                  "type": "string"
+                },
+                "style": "simple"
+              }
+            }
+          },
+          "4XX": {
+            "$ref": "#/components/responses/Error"
+          },
+          "5XX": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Remove one sourced bill and its explicitly linked imported records.",
         "tags": [
           "imports"
         ]

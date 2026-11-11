@@ -39,7 +39,8 @@ Add this repository to the HA app store and install the Utilities integration
 from Marketplace, or extract the release's `utilities.zip` into
 `custom_components/utilities`. It supplies a collection calendar, sensors,
 guarded Energy statistics, redacted diagnostics, Repairs, and explicitly exposed
-read-only Assist tools. Native HA cold backups own recovery.
+read-only Assist tools. Version Repairs remain available when the first data
+refresh fails. Native HA cold backups own recovery.
 
 [Provider contracts and limits](PROVIDERS.md) explain coverage. Sync only reads
 data. Hosted setup creates a Bayou customer after explicit consent; it does not
@@ -79,8 +80,9 @@ setup and temporary links. Ordinary read-only Assist tools cannot create them.
 
 The first sync reads all history available to the connected account. After
 that, Utilities checks the previous seven completed UTC days once per day. A
-manual sync starts with the past three calendar months filled in. Choose
-**Sync all available history** to read the full provider history again.
+manual sync starts with the past three calendar months filled in. Each live
+connection's Settings dialog contains its sync controls and progress. Choose
+**Sync all available history** there to read the full provider history again.
 
 Repeated reads update matching bills and meter intervals in place. A Home
 Assistant Repair appears after 40 days without new provider records, even if
@@ -132,7 +134,26 @@ retaining its own financial identity and replay receipts. Repeating the exact
 consolidation request returns its saved receipt. Account filters use the
 surviving ID, and existing bill URLs continue to work.
 
-The native owner API can remove an entire import-only account with
+To remove one imported bill, use its bill ID, original intake account ID, and
+current revision. `bills get BILL_ID --json` returns the bill and its revision.
+
+```sh
+fetch-home-assistant ha-utilities --transport home-assistant purge-imported-bill BILL_ID \
+  --origin-id ORIGINAL_ACCOUNT_ID --expected-revision REVISION --json
+```
+
+`POST /v1/imports/bills/{id}/purge` accepts an `ImportBillPurge` request. It
+removes the bill, explicitly linked records, and documents used only by that
+family. A changed revision rejects the whole operation. Repeating the same
+request is a no-op; replaying the removed bill's old intake is rejected.
+Surviving records and shared source documents keep their identities and bytes.
+
+Add `--remove-unused-service SERVICE_ID` for each service to retire. Removal
+requires that the original intake owns the service and no surviving records
+or projections use it. The native API requires the owner credential; the HA
+bridge requires an administrator.
+
+The native owner API can also remove an entire import-only account with
 `POST /v1/imports/accounts/{id}/purge`. Confirm the exact `provider` and
 `expected_records` count in the request. The transaction removes the account,
 its records, and source files referenced only by that account.

@@ -7,7 +7,7 @@ from playwright.async_api import Page, async_playwright, expect
 from pytest_aiohttp.plugin import AiohttpServer
 
 from tests_web.conftest import WebBackend
-from tests_web.test_app import open_app
+from tests_web.test_app import open_app, open_connection_settings
 
 
 async def test_skip_link_preserves_the_active_view_and_focuses_main(
@@ -46,17 +46,15 @@ async def test_sync_is_disabled_with_a_reason_for_each_unconfigured_provider(
     page = utility_page
     await open_app(page, web_backend)
     await page.get_by_role("button", name="Settings", exact=True).click()
-    submit = page.get_by_role("button", name="Sync account", exact=True)
-    await page.get_by_label("Account to sync", exact=True).select_option("demo-wm")
-    await expect(submit).to_be_disabled()
-    await expect(page.locator("#sync-availability")).to_have_text(
-        "Provider credentials are not configured."
-    )
-    await page.get_by_label("Account to sync", exact=True).select_option("demo-energy")
-    await expect(submit).to_be_disabled()
-    await expect(page.locator("#sync-availability")).to_have_text(
-        "Provider credentials are not configured."
-    )
+    for company in ("Waste Management", "Bayou"):
+        dialog = await open_connection_settings(page, company)
+        await expect(
+            dialog.get_by_role("button", name="Sync account", exact=True)
+        ).to_be_disabled()
+        await expect(dialog.locator(".sync-availability")).to_have_text(
+            "Provider credentials are not configured."
+        )
+        await dialog.get_by_role("button", name="Close utility connection").click()
 
 
 async def test_expired_native_session_preserves_saved_bills_and_returns_to_the_view(

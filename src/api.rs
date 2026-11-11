@@ -4,8 +4,8 @@ use crate::{
     connect::{ConnectionError, ConnectionHandle},
     imports::{
         BillDetails, ImportAccountConsolidation, ImportAccountConsolidationReceipt,
-        ImportAccountPurge, ImportAccountPurgeReceipt, ImportError, ImportReceipt, ImportRequest,
-        MAX_DOCUMENT_BYTES, MAX_IMPORT_REQUEST_BYTES,
+        ImportAccountPurge, ImportAccountPurgeReceipt, ImportBillPurge, ImportBillPurgeReceipt,
+        ImportError, ImportReceipt, ImportRequest, MAX_DOCUMENT_BYTES, MAX_IMPORT_REQUEST_BYTES,
     },
     models::*,
     store::{Store, StoreError},
@@ -119,6 +119,7 @@ fn import_error(error: ImportError) -> HttpError {
         ImportError::Binding => fail(S::CONFLICT, "import_binding_conflict"),
         ImportError::MissingDocument => fail(S::BAD_REQUEST, "missing_source_document"),
         ImportError::Conflict => fail(S::CONFLICT, "import_record_conflict"),
+        ImportError::PurgedBill => fail(S::CONFLICT, "import_bill_removed"),
         ImportError::Store(error) => store_error(error),
     }
 }
@@ -728,6 +729,28 @@ async fn consolidate_import_accounts(
     ))
 }
 
+/// Remove one sourced bill and its explicitly linked imported records.
+#[endpoint {method=POST,path="/v1/imports/bills/{id}/purge",tags=["imports"],request_body_max_bytes=MAX_IMPORT_REQUEST_BYTES}]
+async fn purge_import_bill(
+    request: RequestContext<Arc<Context>>,
+    path: Path<RecordPath>,
+    body: TypedBody<ImportBillPurge>,
+) -> Result<PrivateOk<ImportBillPurgeReceipt>, HttpError> {
+    authorized(&request)?;
+    let context = request.context();
+    Ok(private(
+        context
+            .store
+            .purge_import_bill(
+                &context.config.deployment,
+                &path.into_inner().id,
+                body.into_inner(),
+            )
+            .await
+            .map_err(import_error)?,
+    ))
+}
+
 /// Remove an import-only account and its exclusively linked source documents.
 #[endpoint {method=POST,path="/v1/imports/accounts/{id}/purge",tags=["imports"],request_body_max_bytes=1024}]
 async fn purge_import_account(
@@ -987,7 +1010,7 @@ async fn schema(request: RequestContext<Arc<Context>>) -> Result<Response<Body>,
 
 pub fn description() -> anyhow::Result<ApiDescription<Arc<Context>>> {
     let mut api = ApiDescription::new();
-    let endpoints: [dropshot::ApiEndpoint<Arc<Context>>; 33] = [
+    let endpoints: [dropshot::ApiEndpoint<Arc<Context>>; 34] = [
         system.into(),
         health.into(),
         providers.into(),
@@ -1008,6 +1031,7 @@ pub fn description() -> anyhow::Result<ApiDescription<Arc<Context>>> {
         document_get.into(),
         import_records.into(),
         purge_import_account.into(),
+        purge_import_bill.into(),
         consolidate_import_accounts.into(),
         balances.into(),
         collections.into(),

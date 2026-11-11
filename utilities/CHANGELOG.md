@@ -1,3 +1,12 @@
+# 0.1.13
+
+Keep sync controls and progress in each live connection's Settings dialog.
+Remove individual imported bills with origin and revision checks, durable
+replay exclusions, and optional retirement of unused services. Preserve
+surviving records and shared source documents.
+Keep version Repairs actionable when the first data refresh fails, using the
+shared HA App Kit 0.1.6 startup check.
+
 # 0.1.12
 
 Use canonical utility companies and typed service categories throughout the app.

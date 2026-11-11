@@ -39,7 +39,7 @@ function openBayouTab() {
   };
 }
 
-export function createConnections({ api, node, providers, updated, connected, onError }) {
+export function createConnections({ api, node, providers, updated, details, onError }) {
   const dialog = document.createElement('dialog');
   dialog.className = 'connection-dialog';
   dialog.setAttribute('aria-labelledby', 'connection-title');
@@ -63,6 +63,7 @@ export function createConnections({ api, node, providers, updated, connected, on
   let draft = null;
   let panel = null;
   let panelController = null;
+  let disposeDetails = null;
   const stateNames = {
     queued: 'Preparing connection', creating: 'Preparing connection',
     unconfirmed: 'Connection needs checking', awaiting_authorization: 'Sign-in needed',
@@ -123,6 +124,8 @@ export function createConnections({ api, node, providers, updated, connected, on
   }
   function stop() {
     clearTimeout(timer);
+    disposeDetails?.();
+    disposeDetails = null;
     controller?.abort();
     controller = null;
   }
@@ -142,6 +145,8 @@ export function createConnections({ api, node, providers, updated, connected, on
     const nextSignature = JSON.stringify([next.state, next.issue, next.accounts, next.auth_status, next.linked_account_ids]);
     if (nextSignature === signature) { poll(); return; }
     signature = nextSignature;
+    disposeDetails?.();
+    disposeDetails = null;
     footer.replaceChildren();
     title.textContent = next.utility_name;
     const steps = node('ol', undefined, 'connection-steps');
@@ -152,17 +157,18 @@ export function createConnections({ api, node, providers, updated, connected, on
       if (step < 3 && index === step) item.setAttribute('aria-current', 'step');
       steps.append(item);
     });
-    const status = node('p', stateNames[next.state] ?? 'Checking connection', 'connection-status');
+    const status = node('p', next.state === 'connected' ? 'Accounts linked' : stateNames[next.state] ?? 'Checking connection', 'connection-status');
     status.setAttribute('role', 'status');
     const description = node('p', 'Bayou', 'muted');
-    body.replaceChildren(steps, status, description);
-    if (next.issue) body.append(node('p', issues[next.issue] ?? 'Check the connection status before continuing.', 'connection-note'));
     if (next.state === 'connected') {
-      body.append(node('p', 'Your accounts and meters are saved. The first sync starts automatically. Check its progress in sync settings.'));
-      footer.append(action('Go to sync settings', async () => { dialog.close(); await connected(); }));
-    } else if (next.state === 'ready') {
+      const summary = node('div', undefined, 'connection-summary');
+      summary.append(status, node('span', 'Bayou', 'badge'));
+      body.replaceChildren(summary);
+    } else body.replaceChildren(steps, status, description);
+    if (next.issue) body.append(node('p', issues[next.issue] ?? 'Check the connection status before continuing.', 'connection-note'));
+    if (next.state === 'ready') {
       renderMeters(next);
-    } else {
+    } else if (next.state !== 'connected') {
       if (['awaiting_authorization', 'needs_authentication', 'authenticating'].includes(next.state)) {
         body.append(node('p', 'Bayou stores your utility login to keep data in sync. Home Assistant never receives your password. Return here when finished.'));
         const linkArea = node('div', undefined, 'connection-link');
@@ -201,7 +207,17 @@ export function createConnections({ api, node, providers, updated, connected, on
         renderRecord(await request(endpoint('resume'), { body: {} }));
       }));
     }
+    if (next.linked_account_ids.length) mountDetails({
+      accountIds: next.linked_account_ids,
+      connectionId: next.id,
+      available: next.state === 'connected',
+    });
     poll();
+  }
+  function mountDetails(context) {
+    const rendered = details(context);
+    body.append(rendered.element);
+    disposeDetails = rendered.dispose;
   }
   function renderMeters(value) {
     body.append(node('p', 'Choose accounts for this deployment and the meters to use for usage. Bills cover each selected account in full, including its other meters. Nothing is selected automatically.'));
@@ -319,15 +335,24 @@ export function createConnections({ api, node, providers, updated, connected, on
     body.replaceChildren(form);
     (draft ? submit : utility).focus();
   }
-  async function open(id) {
-    if (dialog.open) return;
+  function begin(name = 'Connect utility') {
+    if (dialog.open) return false;
     stop();
     controller = new AbortController();
     record = null; signature = ''; error.textContent = '';
-    title.textContent = 'Connect utility';
+    title.textContent = name;
     footer.replaceChildren();
     body.replaceChildren(node('p', 'Loading connection…', 'muted'));
     dialog.showModal();
+    return true;
+  }
+  function openBound({ name, accountIds }) {
+    if (!begin(name)) return;
+    body.replaceChildren();
+    mountDetails({ accountIds, connectionId: null, available: true });
+  }
+  async function open(id) {
+    if (!begin()) return;
     try {
       if (id) renderRecord(await request(`v1/connections/${encodeURIComponent(id)}`, {}));
       else {
@@ -372,8 +397,10 @@ export function createConnections({ api, node, providers, updated, connected, on
     start.disabled = !providers().some((provider) => provider.id === 'bayou' && provider.configured);
     if (showStart) heading.append(start);
     panel = node('div');
-    panel.append(node('p', start.disabled ? 'Add a Bayou API key in the app configuration to connect a utility.' : 'Loading saved connections…', 'panel-empty'));
-    section.append(heading, panel);
+    panel.append(node('p', 'Loading saved connections…', 'panel-empty'));
+    section.append(heading);
+    if (start.disabled && showStart) section.append(node('p', 'Add a Bayou API key in the app configuration to connect a utility.', 'panel-empty'));
+    section.append(panel);
     // The caller mounts synchronously; defer the owned request until then.
     queueMicrotask(refreshPanel);
     return section;
@@ -385,5 +412,5 @@ export function createConnections({ api, node, providers, updated, connected, on
     if (!document.hidden) poll();
   });
   window.addEventListener('pagehide', () => { stop(); panelController?.abort(); });
-  return { open, section };
+  return { open, openBound, section };
 }

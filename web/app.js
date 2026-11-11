@@ -78,13 +78,15 @@ let connections = [];
 let summary = null;
 let health = null;
 let ready = false;
+let sessionExpired = false;
 let generation = 0;
 let viewController = null;
 let detailController = null;
 let syncTimer = null;
 let syncPollController = null;
 let syncJobs = [];
-let updateSyncForm = null;
+let updateSyncView = null;
+const startingSyncAccounts = new Set();
 let loadController = null;
 const listState = new Map();
 const importProviderPrefix = 'import_provider/';
@@ -100,7 +102,7 @@ const shell = mountAppShell({
 const connectionManager = createConnections({
   api, node, providers: () => providers, onError: showError,
   updated: load,
-  connected: async () => { location.hash = 'settings'; view = 'settings'; await renderView(); byId('main').focus(); },
+  details: renderConnectionDetails,
 });
 
 function node(tag, text, className) {
@@ -283,6 +285,8 @@ async function allBindings(path, signal, filters) {
 function showError(error, accountId) {
   if (error.name === 'AbortError') return;
   if (error instanceof ApiError && error.status === 401) {
+    sessionExpired = true;
+    updateSyncView?.();
     const value = byId('freshness-badge');
     value.textContent = isIngress ? 'Home Assistant session expired' : 'Session expired';
     value.className = 'badge attention';
@@ -394,6 +398,8 @@ async function load() {
     summary = nextSummary;
     health = nextHealth;
     syncJobs = nextJobs;
+    sessionExpired = false;
+    updateSyncView?.();
     if (!Array.isArray(summary.coverage) || !Array.isArray(health.coverage)) throw new ApiError(502);
     ready = true;
     signInAgain.hidden = true;
@@ -802,11 +808,11 @@ function selectField(title, name, options, value = '', required = false) {
   field.append(caption, select);
   return { field, select };
 }
-function dateField(title, name, value) {
+function dateField(title, name, value, prefix = 'utility') {
   const field = node('div', undefined, 'form-field');
   const caption = node('label', title);
   const input = node('input');
-  input.id = `utility-${name}`;
+  input.id = `${prefix}-${name}`;
   caption.htmlFor = input.id;
   input.type = 'date'; input.name = name; input.value = value; input.required = true;
   field.append(caption, input);
@@ -1177,7 +1183,6 @@ function importedBill(bill, { currency, bill: { record }, related }) {
 function renderSettings() {
   const fragment = document.createDocumentFragment();
   fragment.append(connectionManager.section());
-  const syncAccounts = accounts.filter((account) => account.source.kind === 'live');
   const providerGrid = node('section', undefined, 'provider-grid');
   providerGrid.setAttribute('aria-label', 'Utility providers');
   for (const provider of providers) {
@@ -1215,11 +1220,12 @@ function renderSettings() {
     const companies = new Map();
     for (const account of accounts) {
       const key = companyKey(account);
-      if (!companies.has(key)) companies.set(key, { company: companyName(account), sources: new Set(), connections: new Set(), services: [] });
+      if (!companies.has(key)) companies.set(key, { company: companyName(account), sources: new Set(), connections: new Set(), localAccounts: [], services: [] });
       const company = companies.get(key);
       company.sources.add(account.source.kind === 'manual_import' ? 'Manual import' : apiSources[account.source.provider]);
       company.services.push(...account.services);
       if (account.connection_id) company.connections.add(account.connection_id);
+      else if (account.source.kind === 'live') company.localAccounts.push(account.id);
     }
     for (const account of companies.values()) {
       const card = node('article');
@@ -1236,91 +1242,139 @@ function renderSettings() {
       card.append(categories);
       if (!account.services.length) card.append(node('p', 'No services connected.'));
       for (const [index, id] of [...account.connections].entries()) {
-        const details = node('button', account.connections.size > 1 ? `Connection ${index + 1} details` : 'Connection details', 'text-action');
+        const details = node('button', account.connections.size > 1 ? `Connection ${index + 1} settings` : 'Connection settings', 'text-action');
         details.type = 'button';
         details.addEventListener('click', () => connectionManager.open(id));
         card.append(details);
+      }
+      if (account.localAccounts.length) {
+        const settings = node('button', 'Connection settings', 'text-action');
+        settings.type = 'button';
+        settings.addEventListener('click', () => connectionManager.openBound({ name: account.company, accountIds: account.localAccounts }));
+        card.append(settings);
       }
       grid.append(card);
     }
     bindings.append(grid);
   }
-  const sync = panel('Sync provider data');
-  sync.classList.add('settings-section');
-  const body = node('div', undefined, 'panel-body');
-  if (syncAccounts.length) {
-    body.append(node('p', 'Fetch bills, collections, and usage for one bound account. This only reads provider data. It cannot pay a bill, book a pickup, or change a service.', 'muted'),
-      syncForm(syncAccounts));
-  } else {
-    body.append(node('p', 'Connect an account to a utility provider to use sync.', 'muted'));
-  }
-  body.append(syncStatus());
-  sync.append(body);
   const diagnostics = node('details', undefined, 'panel settings-section diagnostics');
   diagnostics.append(node('summary', 'Diagnostics'), providerGrid, coveragePanel(summary.coverage));
-  fragment.append(bindings, sync, diagnostics);
+  fragment.append(bindings, diagnostics);
   content.replaceChildren(fragment);
 }
 
-function syncStatus() {
-  const status = node('div', undefined, 'sync-status');
-  status.id = 'sync-status';
-  status.setAttribute('role', 'status');
-  renderSyncStatus(status);
-  return status;
-}
-
-function renderSyncStatus(status) {
-  status.replaceChildren(...syncJobs.map((job) => {
-    if (job.state === 'running') return node('p', runningSyncDescription(job));
+function renderSyncStatus(status, accountId) {
+  const job = syncJobs.find((item) => item.account_id === accountId);
+  if (!job) {
+    status.replaceChildren(node('p', 'No sync recorded.', 'muted'));
+  } else {
+    if (job.state === 'running') {
+      status.replaceChildren(node('p', 'Syncing…', 'sync-running'));
+      return;
+    }
     const result = node('div', undefined, 'sync-result');
     const heading = node('div', undefined, 'sync-result-heading');
     const state = job.state === 'complete' ? 'Complete' : job.state === 'partial' ? 'Coverage gaps' : label(job.state);
-    heading.append(node('strong', accountLabel(job.account_id)), badge(job.state, state));
-    result.append(heading, node('p', `${count(job.observations)} ${job.observations === 1 ? 'observation' : 'observations'} processed.`, 'muted'));
+    heading.append(node('strong', 'Latest sync'), badge(job.state, state));
+    result.append(heading,
+      node('p', `${count(job.observations)} ${job.observations === 1 ? 'observation' : 'observations'} processed.`, 'muted'),
+      node('p', timestamp(job.finished_at ?? job.started_at), 'muted'));
     if (job.error) result.append(node('p', reasonLabels[job.error] ?? 'Check provider coverage and configuration.'));
-    return result;
-  }));
-  status.hidden = syncJobs.length === 0;
+    if (job.state === 'partial') {
+      const gaps = (summary?.coverage ?? []).filter((item) => item.account_id === accountId
+        && ['partial', 'unavailable', 'not_configured'].includes(item.state));
+      if (gaps.length && gaps.every((gap) => gap.state === 'not_configured')) {
+        result.append(node('p', 'Add provider credentials in the app configuration, then sync again.'));
+      } else {
+        if (gaps.length) {
+          const reasons = node('ul', undefined, 'sync-coverage');
+          for (const gap of gaps) reasons.append(node('li', `${label(gap.capability)} · ${reasonLabels[gap.reason] ?? 'The provider did not return complete data.'}`));
+          result.append(reasons);
+        } else result.append(node('p', 'Some provider data was unavailable for this sync.'));
+        result.append(node('p', 'Check your utility’s website for data the API does not provide.', 'muted'));
+      }
+    }
+    status.replaceChildren(result);
+  }
 }
 
-function syncForm(syncAccounts) {
-  const wrapper = node('div');
+function renderConnectionDetails({ accountIds, connectionId, available }) {
+  const element = node('div', undefined, 'connection-details');
+  const bound = accountIds.map((id) => accounts.find((account) => account.id === id))
+    .filter((account) => account?.source.kind === 'live' && account.connection_id === connectionId);
+  if (!bound.length) {
+    element.append(node('p', 'No live accounts are connected.', 'muted'));
+    return { element, dispose() {} };
+  }
+  element.append(node('p', 'Sync a date range or all available history.', 'muted'));
+  const forms = [];
+  for (const [index, account] of bound.entries()) {
+    const section = node('section', undefined, 'connection-account');
+    section.setAttribute('aria-label', bound.length > 1 ? `Account ${index + 1}` : 'Account sync');
+    const heading = node('div', undefined, 'connection-account-heading');
+    heading.append(node('h3', bound.length > 1 ? `Account ${index + 1}` : 'Sync'));
+    const services = node('div', undefined, 'capabilities');
+    services.setAttribute('aria-label', 'Selected services');
+    for (const kind of new Set(account.services.map((service) => service.kind))) services.append(node('span', label(kind), 'badge'));
+    heading.append(services);
+    const form = syncForm(account, available);
+    forms.push(form);
+    section.append(heading, form.element);
+    element.append(section);
+  }
+  const update = (error) => { for (const form of forms) form.update(error); };
+  updateSyncView = update;
+  update();
+  return {
+    element,
+    dispose() {
+      if (updateSyncView === update) updateSyncView = null;
+      for (const form of forms) form.dispose();
+    },
+  };
+}
+
+function syncForm(account, available) {
+  const wrapper = node('div', undefined, 'connection-sync');
   const form = node('form', undefined, 'sync-form');
-  const account = selectField('Account to sync', 'account', [['', 'Choose an account'], ...syncAccounts.map((item) => [item.id, accountName(item.id)])], '', true);
+  form.setAttribute('aria-label', 'Sync account');
+  const prefix = `sync-${crypto.randomUUID()}`;
   const [defaultFrom, defaultTo] = defaultSyncDates();
-  const from = dateField('From', 'from', defaultFrom);
-  const to = dateField('To', 'to', defaultTo);
+  const from = dateField('From', 'from', defaultFrom, prefix);
+  const to = dateField('To', 'to', defaultTo, prefix);
   const submit = node('button', 'Sync account');
   submit.type = 'submit';
   const all = node('button', 'Sync all available history', 'quiet');
   all.type = 'button';
-  form.append(account.field, from.field, to.field, submit);
+  form.append(from.field, to.field, submit);
   const availability = node('p', '', 'sync-availability');
-  availability.id = 'sync-availability';
+  availability.id = `${prefix}-availability`;
   availability.setAttribute('role', 'status');
   availability.setAttribute('aria-live', 'polite');
   submit.setAttribute('aria-describedby', availability.id);
   all.setAttribute('aria-describedby', availability.id);
-  let submitting = false;
+  const status = node('div', undefined, 'sync-status');
+  status.setAttribute('role', 'status');
+  const failure = node('p', '', 'notice error');
+  failure.setAttribute('role', 'alert');
+  let active = true;
+  let showingSessionFailure = false;
   function canSync() {
-    const binding = syncAccounts.find((item) => item.id === account.select.value);
-    return !!binding && providers.some((provider) => provider.id === binding.provider && provider.configured);
+    const binding = accounts.find((item) => item.id === account.id && item.source.kind === 'live');
+    return !sessionExpired && available && !!binding && providers.some((provider) => provider.id === binding.provider && provider.configured);
   }
   function updateAvailability() {
-    const binding = syncAccounts.find((item) => item.id === account.select.value);
-    const running = syncJobs.some((job) => job.account_id === binding?.id && job.state === 'running');
-    submit.disabled = submitting || running || !canSync();
+    const starting = startingSyncAccounts.has(account.id);
+    const running = syncJobs.some((job) => job.account_id === account.id && job.state === 'running');
+    submit.disabled = starting || running || !canSync();
     all.disabled = submit.disabled;
-    account.select.disabled = submitting;
-    availability.classList.toggle('sync-unavailable', !!binding && !canSync());
-    availability.textContent = submitting ? 'Starting sync…' : running ? 'Already syncing.'
-      : !binding ? 'Choose an account to sync.'
-      : !canSync() ? 'Provider credentials are not configured.' : '';
+    from.input.disabled = submit.disabled;
+    to.input.disabled = submit.disabled;
+    availability.classList.toggle('sync-unavailable', !canSync());
+    availability.textContent = sessionExpired ? '' : running ? '' : starting ? 'Starting sync…'
+      : !available ? 'Sign in again before syncing.'
+      : !canSync() ? 'Provider credentials are not configured.' : 'Updates daily.';
   }
-  account.select.addEventListener('change', updateAvailability);
-  updateSyncForm = updateAvailability;
-  updateAvailability();
   from.input.addEventListener('input', () => setDateValidity(from.input, to.input));
   to.input.addEventListener('input', () => setDateValidity(from.input, to.input));
   form.addEventListener('submit', (event) => {
@@ -1331,28 +1385,53 @@ function syncForm(syncAccounts) {
   all.addEventListener('click', () => startSync({ range: 'all' }));
   async function startSync(range) {
     if (submit.disabled || !canSync()) return;
-    const accountId = account.select.value;
-    submitting = true;
-    updateAvailability();
+    startingSyncAccounts.add(account.id);
+    failure.textContent = '';
+    updateSyncView?.();
     showNotice(''); retry.hidden = true;
     try {
-      const job = await api('v1/sync', { body: { account: accountId, ...range } });
+      const job = await api('v1/sync', { body: { account: account.id, ...range } });
       syncJobs = [...syncJobs.filter((item) => item.account_id !== job.account_id), job];
       updateFreshness();
-      const status = byId('sync-status');
-      if (status) renderSyncStatus(status);
+      updateSyncView?.();
       pollSync();
     } catch (error) {
-      showError(error, accountId);
+      if (active && error.name !== 'AbortError') {
+        failure.textContent = error instanceof ApiError ? error.message : 'Sync could not be started. Check its status before trying again.';
+        showError(error, account.id);
+      }
     } finally {
-      submitting = false;
-      updateAvailability();
+      startingSyncAccounts.delete(account.id);
+      updateSyncView?.();
     }
   }
   const history = node('div', undefined, 'history-sync');
-  history.append(all, node('p', 'Reads the history your provider already makes available.', 'muted'));
-  wrapper.append(form, history, availability);
-  return wrapper;
+  history.append(all);
+  wrapper.append(form, history, availability, failure, status);
+  return {
+    element: wrapper,
+    update(error) {
+      if (!active) return;
+      updateAvailability();
+      if (sessionExpired) {
+        failure.textContent = isIngress
+          ? 'Your Home Assistant session has expired. Reopen Utilities from Home Assistant.'
+          : 'This session has expired. ';
+        if (!isIngress) {
+          const signIn = node('a', 'Sign in again', 'sync-sign-in');
+          signIn.href = `login#${view}`;
+          failure.append(signIn);
+        }
+        showingSessionFailure = true;
+      } else if (showingSessionFailure) {
+        failure.textContent = '';
+        showingSessionFailure = false;
+      }
+      renderSyncStatus(status, account.id);
+      if (error) status.append(node('p', 'Sync status could not be checked. The last saved result is shown above.', 'muted'));
+    },
+    dispose() { active = false; },
+  };
 }
 function runningSyncDescription(job) {
   return `Syncing ${accountLabel(job.account_id)}…`;
@@ -1373,22 +1452,20 @@ function pollSync() {
       const completed = next.some((job) => job.state !== 'running' && !syncJobs.some((prior) => prior.id === job.id && prior.state === job.state));
       syncJobs = next;
       if (started || completed) updateFreshness();
-      const status = byId('sync-status');
-      if (status) renderSyncStatus(status);
-      if (view === 'settings') updateSyncForm?.();
+      updateSyncView?.();
       if (completed) {
         const options = { signal: controller.signal };
         const [nextSummary, nextHealth] = await Promise.all([api('v1/summary', options), api('health', options)]);
         if (controller.signal.aborted) return;
         summary = nextSummary; health = nextHealth; updateFreshness();
+        updateSyncView?.();
         if (view === 'settings') document.querySelector('.coverage-panel')?.replaceWith(coveragePanel(summary.coverage));
         else await renderView();
       } else if (started && view === 'overview') await renderView();
       pollSync();
     } catch (error) {
       if (controller.signal.aborted) return;
-      const status = byId('sync-status');
-      if (status) status.textContent = syncJobs.map((job) => `${accountLabel(job.account_id)} · Sync status could not be checked. The last saved state was ${job.state}.`).join(' ');
+      updateSyncView?.(error);
       showError(error);
     }
   }, delay);
@@ -1420,6 +1497,6 @@ retry.addEventListener('click', () => load());
 byId('close-detail').addEventListener('click', () => detail.close());
 detail.addEventListener('close', () => detailController?.abort());
 window.addEventListener('pagehide', () => {
-  clearTimeout(syncTimer); viewController?.abort(); detailController?.abort(); loadController?.abort();
+  clearTimeout(syncTimer); syncPollController?.abort(); viewController?.abort(); detailController?.abort(); loadController?.abort();
 });
 load();

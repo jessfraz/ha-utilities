@@ -38,6 +38,7 @@ _ROUTES = (
     (re.compile("sync"), {"GET", "POST"}, set()),
     (re.compile("imports"), {"POST"}, set()),
     (re.compile("imports/consolidate"), {"POST"}, set()),
+    (re.compile(rf"imports/bills/{_RECORD_ID}/purge"), {"POST"}, set()),
     (re.compile(r"documents/[0-9a-f]{64}"), {"PUT"}, set()),
     (re.compile("connections"), {"GET", "POST"}, set()),
     (re.compile("providers/bayou/utilities"), {"GET"}, set()),
@@ -133,6 +134,7 @@ class UtilitiesView(HomeAssistantView):
         if not await authorized(self._hass, entry, coordinator, user_id, admin=admin):
             raise web.HTTPForbidden
         import_request = path in {"imports", "imports/consolidate"}
+        bill_purge = path.startswith("imports/bills/")
         document_upload = request.method == "PUT"
         max_bytes = MAX_REQUEST_BYTES
         content_type = "application/json"
@@ -141,7 +143,11 @@ class UtilitiesView(HomeAssistantView):
             content_type = "application/octet-stream"
         elif import_request:
             max_bytes = MAX_IMPORT_REQUEST_BYTES
-        if (import_request or document_upload) and request.content_type != content_type:
+        elif bill_purge:
+            max_bytes = MAX_IMPORT_REQUEST_BYTES
+        if (
+            import_request or document_upload or bill_purge
+        ) and request.content_type != content_type:
             raise web.HTTPUnsupportedMediaType
         payload = bytearray()
         async for chunk in request.content.iter_chunked(1024):
@@ -155,6 +161,25 @@ class UtilitiesView(HomeAssistantView):
                 values = json.loads(payload)
                 if path.startswith("connections"):
                     connection_input(path, values)
+                elif bill_purge:
+                    purge_values = record(values)
+                    required = {"origin_id", "expected_revision"}
+                    services = purge_values.get("remove_unused_services", [])
+                    if (
+                        not required <= set(purge_values)
+                        or set(purge_values) - required - {"remove_unused_services"}
+                        or re.fullmatch(_ID, text(purge_values["origin_id"])) is None
+                        or re.fullmatch(
+                            r"[0-9a-f]{64}", text(purge_values["expected_revision"])
+                        )
+                        is None
+                        or not isinstance(services, list)
+                        or len(services) > 64
+                    ):
+                        raise ValueError("Invalid imported bill deletion")
+                    for service in services:
+                        if re.fullmatch(_ID, text(service)) is None:
+                            raise ValueError("Invalid imported service deletion")
                 elif (
                     not isinstance(values, dict)
                     or not isinstance(values.get("account"), str)

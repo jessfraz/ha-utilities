@@ -7,6 +7,7 @@ from hashlib import sha256
 from pathlib import Path
 
 import pytest
+from aiohttp import ClientSession
 from homeassistant.components.homeassistant import exposed_entities
 from homeassistant.config_entries import SOURCE_USER, ConfigEntryState
 from homeassistant.core import HomeAssistant
@@ -17,7 +18,7 @@ from pytest_homeassistant.typing import ClientSessionGenerator
 
 from custom_components.utilities import UtilitiesConfigEntry
 from custom_components.utilities.const import CONF_BACKEND_URL, CONF_TOKEN, DOMAIN
-from custom_components.utilities.models import page, record
+from custom_components.utilities.models import page, record, text
 from tests_web.conftest import WebBackend
 from tests_web.conftest import web_backend as web_backend
 
@@ -212,6 +213,60 @@ async def test_actual_cli_ha_consolidation_replays_without_recreating_accounts(
     response = await client.get(f"{prefix}/bills?account=fixture-recurring")
     items, _, _ = page(await response.json())
     assert len(items) == 2
+    construction = next(
+        record(item)
+        for item in items
+        if text(record(item)["id"]).startswith("fixture-construction:")
+    )
+    recurring = next(
+        record(item)
+        for item in items
+        if text(record(item)["id"]).startswith("fixture-recurring:")
+    )
+    deleted_id = text(construction["id"])
+    async with ClientSession() as native:
+        response = await native.get(
+            f"{web_backend.origin}/v1/bills/{deleted_id}/details",
+            headers={"Authorization": f"Bearer {web_backend.token}"},
+        )
+        assert response.status == 200
+        revision = text(record(record(await response.json())["bill"])["revision"])
+    arguments = arguments[:-2] + [
+        "purge-imported-bill",
+        deleted_id,
+        "--origin-id",
+        "fixture-construction",
+        "--expected-revision",
+        revision,
+        "--remove-unused-service",
+        "fixture-construction-internet",
+    ]
+    for removed in [True, False]:
+        result, stdout, stderr = await run_cli(arguments)
+        assert result == 0, stderr.decode()
+        receipt = record(json.loads(stdout))
+        assert receipt["removed"] is removed
+        assert receipt["records"] == int(removed)
+        assert receipt["documents"] == 0
+    wrong_revision = list(arguments)
+    wrong_revision[wrong_revision.index("--expected-revision") + 1] = "0" * 64
+    result, _, stderr = await run_cli(wrong_revision)
+    assert result != 0
+    assert record(json.loads(stderr))["status"] == 409
+    assert (await client.get(f"{prefix}/bills/{deleted_id}")).status == 404
+    response = await client.get(f"{prefix}/bills?account=fixture-recurring")
+    items, _, _ = page(await response.json())
+    assert items == [recurring]
+    assert (await client.post(f"{prefix}/imports", json=imports[0])).status == 409
+    response = await client.post(f"{prefix}/imports", json=imports[1])
+    assert response.status == 200
+    assert record(await response.json())["replayed"] is True
+    response = await client.get(f"{prefix}/accounts")
+    items, _, _ = page(await response.json())
+    surviving = [
+        record(item) for item in items if record(item)["provider"] == "spectrum"
+    ]
+    assert surviving == [{**spectrum[0], "services": accounts[1]["services"]}]
 
 
 @pytest.mark.parametrize("revocation", ["inactive", "revoked_token"])
