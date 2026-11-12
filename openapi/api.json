@@ -2335,7 +2335,7 @@
   "info": {
     "description": "Local utility observations and explicit coverage. Bearer owner credential or authenticated HA bridge. Sync reads providers only; no payments or service changes.",
     "title": "Utilities API",
-    "version": "0.1.15"
+    "version": "0.1.16"
   },
   "openapi": "3.0.3",
   "paths": {
