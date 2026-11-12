@@ -174,7 +174,8 @@ dd { margin: 0; overflow-wrap: anywhere; }
 .login-panel form { display: grid; gap: 16px; }
 .login-panel input { min-width: 0; width: 100%; }
 .login-note { color: var(--muted); font-size: 12px; margin: 20px 0 0; }
-.connection-dialog { width: min(600px, calc(100vw - 32px)); max-height: calc(100dvh - 32px); padding: 0; overflow: hidden; }
+/* Keep the header and footer fixed while the body owns all dialog scrolling. */
+.connection-dialog { width: min(600px, calc(100vw - 32px)); max-height: calc(100dvh - 32px); padding: 0; overflow: clip; }
 .connection-dialog[open] { display: flex; flex-direction: column; }
 .connection-dialog .dialog-heading { display: flex; flex-shrink: 0; justify-content: space-between; align-items: center; gap: 16px; padding: 16px 24px; border-bottom: 1px solid var(--line); background: var(--paper); }
 .connection-body { min-height: 0; overflow-y: auto; padding: 24px; }

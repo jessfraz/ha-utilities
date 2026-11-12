@@ -365,6 +365,15 @@ impl Store {
         Self::start_job_on(&self.pool, account, None, false).await
     }
 
+    pub(crate) async fn start_history_job(&self, account: &str) -> Result<SyncJob, StoreError> {
+        let mut tx = self.pool.begin_with(queries::BEGIN_INGEST).await?;
+        // Explicit history replays remain valid after initialization finishes.
+        Self::mark_automatic_start(&mut tx, account).await?;
+        let job = Self::start_job_on(&mut *tx, account, None, true).await?;
+        tx.commit().await?;
+        Ok(job)
+    }
+
     async fn start_job_on<'e>(
         executor: impl Executor<'e, Database = Sqlite>,
         account: &str,
@@ -1317,6 +1326,47 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn only_successful_full_history_finishes_initial_history() {
+        for (full_history, state, finished) in [
+            (true, SyncState::Complete, true),
+            (true, SyncState::Partial, true),
+            (true, SyncState::Failed, false),
+            (true, SyncState::Interrupted, false),
+            (false, SyncState::Complete, false),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let store = Store::open(&directory.path().join("history.sqlite3"))
+                .await
+                .unwrap();
+            let config: Config = toml::from_str(include_str!("../config/example.toml")).unwrap();
+            store.register(&config).await.unwrap();
+            let account = &config.accounts[0].id;
+            let today = Utc::now().date_naive();
+            let job = if full_history {
+                store
+                    .start_automatic_job(account, today, true)
+                    .await
+                    .unwrap()
+            } else {
+                store.start_job(account).await.unwrap()
+            };
+            store.finish_job(&job.id, state, 0, None).await.unwrap();
+            let tomorrow = today.succ_opt().unwrap();
+            let candidate = store
+                .automatic_candidates(&config.deployment, tomorrow)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|(binding, _)| binding.id == *account)
+                .unwrap();
+            assert_eq!(
+                candidate.1, !finished,
+                "full_history={full_history}, state={state:?}"
+            );
+        }
     }
 
     #[tokio::test]

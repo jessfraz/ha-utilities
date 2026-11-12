@@ -200,7 +200,10 @@ impl SyncHandle {
             IngestionMode::Live,
         )
         .map_err(|_| StoreError::InvalidQuery)?;
-        let job = self.store.start_job(account).await?;
+        let job = match range {
+            SyncRange::Dates { .. } => self.store.start_job(account).await?,
+            SyncRange::AllHistory => self.store.start_history_job(account).await?,
+        };
         self.enqueue(job, range).await
     }
 
@@ -576,6 +579,7 @@ mod tests {
     enum LaterPage {
         AuthenticationFailure,
         Pending,
+        PreparingHistory,
         Success,
     }
 
@@ -625,12 +629,12 @@ mod tests {
         }
     }
 
-    fn customer_body() -> String {
+    fn customer_body(bills_ready: bool) -> String {
         serde_json::to_string(&CustomerResponse {
             id: 71001,
             is_currently_authenticated: true,
             auth_status: "authenticated",
-            bills_are_ready: true,
+            bills_are_ready: bills_ready,
             utility_has_intervals: false,
             account_has_intervals: false,
             intervals_are_ready: false,
@@ -711,10 +715,15 @@ mod tests {
                                     std::future::pending::<()>().await;
                                     unreachable!()
                                 }
-                                LaterPage::Success => (200, customer_body()),
+                                LaterPage::PreparingHistory | LaterPage::Success => {
+                                    (200, customer_body(true))
+                                }
                             }
                         } else {
-                            (200, customer_body())
+                            (
+                                200,
+                                customer_body(!matches!(later, LaterPage::PreparingHistory)),
+                            )
                         }
                     } else if path.starts_with("/api/v2/customers/71001/bills?") {
                         if path.contains("start=2026-10-01") {
@@ -836,7 +845,7 @@ mod tests {
         }
 
         async fn terminal_job(&self, id: &str) -> SyncJob {
-            tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::time::timeout(Duration::from_secs(10), async {
                 loop {
                     let job = self.store.job(id).await.unwrap();
                     if job.state != SyncState::Running {
@@ -845,6 +854,16 @@ mod tests {
                     tokio::time::sleep(Duration::from_millis(5)).await;
                 }
             })
+            .await
+            .unwrap()
+        }
+
+        async fn history_tracking(&self) -> (Option<String>, Option<String>) {
+            sqlx::query_as(
+                "SELECT automatic_started_at,initial_history_finished_at FROM accounts WHERE id=?",
+            )
+            .bind(ACCOUNT)
+            .fetch_one(self.store.pool())
             .await
             .unwrap()
         }
@@ -876,6 +895,128 @@ mod tests {
             }
             self.http.abort();
         }
+    }
+
+    #[tokio::test]
+    async fn manual_full_history_satisfies_initial_history_before_daily_sync() {
+        let mut fixture = WorkerFixture::start(LaterPage::Success, false).await;
+        let input = crate::models::HistorySyncInput {
+            account: ACCOUNT.to_owned(),
+            range: crate::models::HistoryRange::All,
+        };
+        let job = fixture.handle.request_history(input.clone()).await.unwrap();
+        assert_eq!(
+            fixture.terminal_job(&job.id).await.state,
+            SyncState::Partial
+        );
+        let tracking = fixture.history_tracking().await;
+        let replay = fixture.handle.request_history(input).await.unwrap();
+        assert_eq!(
+            fixture.terminal_job(&replay.id).await.state,
+            SyncState::Partial
+        );
+        assert_eq!(fixture.history_tracking().await, tracking);
+        fixture.shutdown().await;
+
+        let (_handle, worker) = SyncWorker::new(
+            fixture.store.clone(),
+            fixture.config.clone(),
+            fixture.providers.clone(),
+        )
+        .await
+        .unwrap();
+        let today = Utc::now().date_naive();
+        assert!(
+            worker.next_automatic(today).await.unwrap().is_none(),
+            "successful manual full history must not schedule another initial history"
+        );
+        let tomorrow = today.succ_opt().unwrap();
+        let next = worker.next_automatic(tomorrow).await.unwrap().unwrap();
+        assert!(
+            matches!(next.range, SyncRange::Dates { from, to } if from == tomorrow - Days::new(7) && to == today),
+            "successful manual full history must advance automatic sync to its daily window"
+        );
+        let after_daily = fixture.history_tracking().await;
+        assert!(
+            tracking.0.is_some(),
+            "manual initialization must start the automatic-data age clock; before={tracking:?}, after_daily={after_daily:?}"
+        );
+        assert!(tracking.1.is_some());
+        assert_eq!(after_daily, tracking);
+    }
+
+    #[tokio::test]
+    async fn preparing_manual_history_rejects_duplicate_work_until_provider_is_ready() {
+        let mut fixture = WorkerFixture::start(LaterPage::PreparingHistory, false).await;
+        let input = crate::models::HistorySyncInput {
+            account: ACCOUNT.to_owned(),
+            range: crate::models::HistoryRange::All,
+        };
+        let job = fixture.handle.request_history(input.clone()).await.unwrap();
+        let tracking = fixture.history_tracking().await;
+        assert!(matches!(
+            fixture.handle.request_history(input).await,
+            Err(StoreError::Busy)
+        ));
+        assert_eq!(fixture.history_tracking().await, tracking);
+        assert_eq!(
+            fixture.store.job(&job.id).await.unwrap().state,
+            SyncState::Running
+        );
+        assert!(
+            fixture
+                .store
+                .automatic_candidates(DEPLOYMENT, Utc::now().date_naive())
+                .await
+                .unwrap()
+                .iter()
+                .all(|(binding, _)| binding.id != ACCOUNT)
+        );
+        assert_eq!(
+            fixture.terminal_job(&job.id).await.state,
+            SyncState::Partial
+        );
+        fixture.shutdown().await;
+        let (_handle, worker) = SyncWorker::new(
+            fixture.store.clone(),
+            fixture.config.clone(),
+            fixture.providers.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            worker
+                .next_automatic(Utc::now().date_naive())
+                .await
+                .unwrap()
+                .is_none(),
+            "a finished preparing traversal must satisfy initial history"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_history_admission_preserves_an_unstarted_age_clock() {
+        let mut fixture = WorkerFixture::start(LaterPage::Pending, false).await;
+        let running = fixture.request().await;
+        fixture.await_later_page().await;
+        let tracking = fixture.history_tracking().await;
+        assert_eq!(tracking, (None, None));
+        assert!(matches!(
+            fixture
+                .handle
+                .request_history(crate::models::HistorySyncInput {
+                    account: ACCOUNT.to_owned(),
+                    range: crate::models::HistoryRange::All,
+                })
+                .await,
+            Err(StoreError::Busy)
+        ));
+        assert_eq!(fixture.history_tracking().await, tracking);
+        fixture.shutdown().await;
+        assert_eq!(
+            fixture.store.job(&running.id).await.unwrap().state,
+            SyncState::Interrupted
+        );
     }
 
     #[tokio::test]

@@ -1,3 +1,9 @@
+# 0.1.15
+
+Finish initialization after a successful manual full-history sync, including
+partial coverage. Refresh saved connection status when opening Settings, keep
+Check status available, and keep the dialog header and actions visible.
+
 # 0.1.14
 
 Keep the collection calendar available when a provider explicitly reports no
