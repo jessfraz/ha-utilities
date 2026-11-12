@@ -1298,7 +1298,7 @@ function renderSyncStatus(status, accountId) {
   }
 }
 
-function renderConnectionDetails({ accountIds, connectionId, available }) {
+function renderConnectionDetails({ accountIds, connectionId, available, connectionState }) {
   const element = node('div', undefined, 'connection-details');
   const bound = accountIds.map((id) => accounts.find((account) => account.id === id))
     .filter((account) => account?.source.kind === 'live' && account.connection_id === connectionId);
@@ -1317,7 +1317,7 @@ function renderConnectionDetails({ accountIds, connectionId, available }) {
     services.setAttribute('aria-label', 'Selected services');
     for (const kind of new Set(account.services.map((service) => service.kind))) services.append(node('span', label(kind), 'badge'));
     heading.append(services);
-    const form = syncForm(account, available);
+    const form = syncForm(account, available, connectionState);
     forms.push(form);
     section.append(heading, form.element);
     element.append(section);
@@ -1334,7 +1334,7 @@ function renderConnectionDetails({ accountIds, connectionId, available }) {
   };
 }
 
-function syncForm(account, available) {
+function syncForm(account, available, connectionState) {
   const wrapper = node('div', undefined, 'connection-sync');
   const form = node('form', undefined, 'sync-form');
   form.setAttribute('aria-label', 'Sync account');
@@ -1359,9 +1359,12 @@ function syncForm(account, available) {
   failure.setAttribute('role', 'alert');
   let active = true;
   let showingSessionFailure = false;
-  function canSync() {
+  function providerConfigured() {
     const binding = accounts.find((item) => item.id === account.id && item.source.kind === 'live');
-    return !sessionExpired && available && !!binding && providers.some((provider) => provider.id === binding.provider && provider.configured);
+    return !!binding && providers.some((provider) => provider.id === binding.provider && provider.configured);
+  }
+  function canSync() {
+    return !sessionExpired && available && providerConfigured();
   }
   function updateAvailability() {
     const starting = startingSyncAccounts.has(account.id);
@@ -1372,8 +1375,9 @@ function syncForm(account, available) {
     to.input.disabled = submit.disabled;
     availability.classList.toggle('sync-unavailable', !canSync());
     availability.textContent = sessionExpired ? '' : running ? '' : starting ? 'Starting sync…'
-      : !available ? 'Sign in again before syncing.'
-      : !canSync() ? 'Provider credentials are not configured.' : 'Updates daily.';
+      : !providerConfigured() ? 'Provider credentials are not configured.'
+      : !available ? (['awaiting_authorization', 'needs_authentication', 'authenticating'].includes(connectionState)
+        ? 'Sign in again before syncing.' : 'Check connection status before syncing.') : 'Updates daily.';
   }
   from.input.addEventListener('input', () => setDateValidity(from.input, to.input));
   to.input.addEventListener('input', () => setDateValidity(from.input, to.input));

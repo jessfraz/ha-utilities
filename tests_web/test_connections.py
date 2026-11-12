@@ -8,6 +8,7 @@ from calendar import monthrange
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
+from hashlib import sha256
 from pathlib import Path
 from typing import Literal
 
@@ -48,6 +49,8 @@ class BayouFixture:
     bill: dict[str, object] | None = None
     bill_requests: list[str] = field(default_factory=list)
     extra_accounts: list[dict[str, object]] = field(default_factory=list)
+    auth_status: Literal["onboarding_mfa_needed"] | None = None
+    customer_reads: int = 0
 
     async def handle(self, request: web.Request) -> web.Response:
         if request.path == "/api/v2/utilities":
@@ -73,6 +76,8 @@ class BayouFixture:
                 return web.json_response({}, status=409)
             self.external_id = value["external_id"]
             return web.json_response({}, status=503 if self.lose_post_response else 201)
+        if not request.path.endswith("/bills"):
+            self.customer_reads += 1
         if self.lookup_gate is not None:
             self.lookup_started.set()
             await self.lookup_gate.wait()
@@ -102,11 +107,15 @@ class BayouFixture:
                 "id": 71001,
                 "external_id": self.external_id,
                 "utility": "speculoos_power",
-                "has_filled_credentials": self.authenticated,
+                "has_filled_credentials": self.authenticated
+                or self.auth_status == "onboarding_mfa_needed",
                 "is_currently_authenticated": self.authenticated,
-                "auth_status": "authenticated"
-                if self.authenticated
-                else "onboarding_credentials_needed",
+                "auth_status": self.auth_status
+                or (
+                    "authenticated"
+                    if self.authenticated
+                    else "onboarding_credentials_needed"
+                ),
                 "bills_are_ready": self.bills_ready,
                 "intervals_are_ready": False,
                 "utility_has_intervals": False,
@@ -568,6 +577,273 @@ async def test_hosted_link_meter_selection_and_saved_connection(
             )
             assert not errors
         finally:
+            await browser.close()
+
+
+@pytest.mark.parametrize(
+    ("device", "width", "height", "touch"),
+    [
+        ("iphone", 390, 844, True),
+        ("ipad", 820, 1180, True),
+        ("desktop", 1440, 1000, False),
+    ],
+)
+async def test_opening_saved_connection_refreshes_stale_authentication(
+    connection_backend: ConnectionBackend,
+    tmp_path: Path,
+    device: str,
+    width: int,
+    height: int,
+    touch: bool,
+) -> None:
+    fixture = connection_backend
+    fixture.provider.bills_ready = True
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch()
+        try:
+            page = await browser.new_page(
+                viewport={"width": width, "height": height},
+                is_mobile=touch,
+                has_touch=touch,
+                locale="en-US",
+                timezone_id="UTC",
+            )
+            await sign_in(page, fixture)
+            hashes = {}
+            for name in ("app.js", "app.css", "connections.js"):
+                response = await page.request.get(
+                    f"{fixture.backend.origin}/assets/{name}"
+                )
+                assert response.status == 200
+                content = await response.body()
+                assert content == await asyncio.to_thread(
+                    (ROOT / "web" / name).read_bytes
+                )
+                hashes[name] = sha256(content).hexdigest()
+            await asyncio.to_thread(
+                (tmp_path / f"assets-{device}.json").write_text,
+                json.dumps(hashes, indent=2) + "\n",
+            )
+            await start_connection(page, fixture.provider)
+            dialog = page.get_by_role("dialog")
+
+            async def capture_recovery(state: str) -> None:
+                await page.mouse.move(0, 0)
+                close = dialog.get_by_role("button", name="Close utility connection")
+                bounds = await close.bounding_box()
+                assert bounds is not None
+                geometry = await dialog.evaluate(
+                    "element => ({outerScrollTop: element.scrollTop, "
+                    "bodyScrollTop: element.querySelector('.connection-body')"
+                    ".scrollTop})"
+                )
+                await asyncio.to_thread(
+                    (tmp_path / f"geometry-{device}-{state}.json").write_text,
+                    json.dumps({"close": bounds, **geometry}, indent=2) + "\n",
+                )
+                await expect(close).to_be_in_viewport(ratio=1)
+                assert 0 <= bounds["x"] and bounds["x"] + bounds["width"] <= width
+                assert 0 <= bounds["y"] and bounds["y"] + bounds["height"] <= height
+                await page.screenshot(
+                    path=str(tmp_path / f"recovery-{device}-{state}.png"),
+                    full_page=False,
+                )
+
+            fixture.provider.authenticated = True
+            await dialog.get_by_role("button", name="Check status", exact=True).click()
+            await dialog.get_by_role("checkbox", name="Electricity").check()
+            await dialog.get_by_role("button", name="Connect selected meters").click()
+            await expect(dialog.locator(".sync-status")).to_contain_text(
+                "Coverage gaps"
+            )
+            accounts = await (
+                await page.request.get(f"{fixture.backend.origin}/v1/accounts")
+            ).json()
+            await dialog.get_by_role("button", name="Close utility connection").click()
+            fixture.provider.authenticated = False
+            fixture.provider.auth_status = "onboarding_mfa_needed"
+            reads = fixture.provider.customer_reads
+            await reopen_connection_settings(page)
+            await expect(dialog.locator(".connection-status")).to_have_text(
+                "Sign-in needed"
+            )
+            assert fixture.provider.customer_reads > reads
+            await expect(
+                dialog.get_by_role("button", name="Sign in on Bayou", exact=True)
+            ).to_be_enabled()
+            await expect(
+                dialog.get_by_role("button", name="Sync account", exact=True)
+            ).to_be_disabled()
+            await expect(
+                dialog.get_by_role("button", name="Check status", exact=True)
+            ).to_be_in_viewport(ratio=1)
+            await capture_recovery("mfa")
+            fixture.provider.authenticated = True
+            fixture.provider.auth_status = None
+            await dialog.get_by_role("button", name="Check status", exact=True).click()
+            await expect(dialog.locator(".connection-status")).to_have_text(
+                "Accounts linked"
+            )
+            await expect(
+                dialog.get_by_role("button", name="Check status", exact=True)
+            ).to_be_in_viewport(ratio=1)
+            await expect(
+                dialog.get_by_role("button", name="Sync account", exact=True)
+            ).to_be_enabled()
+            await capture_recovery("healthy")
+            fixture.provider.lookup_error_status = 503
+            await dialog.get_by_role("button", name="Check status", exact=True).click()
+            await expect(
+                dialog.get_by_text("Bayou could not be reached.", exact=False)
+            ).to_be_visible()
+            await expect(dialog.locator(".sync-availability")).to_have_text(
+                "Check connection status before syncing."
+            )
+            await expect(dialog.locator(".connection-steps")).to_have_count(0)
+            await capture_recovery("outage")
+            assert (
+                await (
+                    await page.request.get(f"{fixture.backend.origin}/v1/accounts")
+                ).json()
+                == accounts
+            )
+            assert len(fixture.provider.posts) == 1
+        finally:
+            await browser.close()
+
+
+async def test_connected_status_retry_preserves_dates_bindings_and_sync_jobs(
+    connection_backend: ConnectionBackend,
+) -> None:
+    fixture = connection_backend
+    fixture.provider.bills_ready = True
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch()
+        try:
+            page = await browser.new_page()
+            await sign_in(page, fixture)
+            await start_connection(page, fixture.provider)
+            dialog = page.get_by_role("dialog")
+            fixture.provider.authenticated = True
+            await dialog.get_by_role("button", name="Check status", exact=True).click()
+            await dialog.get_by_role("checkbox", name="Electricity").check()
+            await dialog.get_by_role("button", name="Connect selected meters").click()
+            await expect(dialog.locator(".sync-status")).to_contain_text(
+                "Coverage gaps"
+            )
+            jobs = await (
+                await page.request.get(f"{fixture.backend.origin}/v1/sync")
+            ).json()
+            await dialog.get_by_label("From", exact=True).fill("2026-08-12")
+            await dialog.get_by_label("To", exact=True).fill("2026-09-12")
+            check = dialog.get_by_role("button", name="Check status", exact=True)
+            await expect(check).to_be_visible()
+            reads = fixture.provider.customer_reads
+            await check.click()
+            await expect(check).to_be_enabled()
+            assert fixture.provider.customer_reads == reads + 1
+            await expect(dialog.get_by_label("From", exact=True)).to_have_value(
+                "2026-08-12"
+            )
+            await expect(dialog.get_by_label("To", exact=True)).to_have_value(
+                "2026-09-12"
+            )
+            fixture.provider.lookup_error_status = 503
+            await check.click()
+            await expect(dialog.locator(".connection-note")).to_contain_text(
+                "Bayou could not be reached."
+            )
+            await expect(dialog.locator(".sync-availability")).to_have_text(
+                "Check connection status before syncing."
+            )
+            await expect(dialog.locator(".connection-steps")).to_have_count(0)
+            fixture.provider.lookup_error_status = None
+            await check.click()
+            await expect(dialog.locator(".connection-note")).to_have_count(0)
+            await expect(dialog.locator(".connection-status")).to_have_text(
+                "Accounts linked"
+            )
+            assert (
+                await (
+                    await page.request.get(f"{fixture.backend.origin}/v1/sync")
+                ).json()
+                == jobs
+            )
+            assert len(fixture.provider.posts) == 1
+        finally:
+            await browser.close()
+
+
+async def test_closed_status_refresh_cannot_replace_a_reopened_connection(
+    connection_backend: ConnectionBackend,
+) -> None:
+    fixture = connection_backend
+    fixture.provider.bills_ready = True
+    response_ready = asyncio.Event()
+    release_response = asyncio.Event()
+    response_finished = asyncio.Event()
+    held = False
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch()
+        try:
+            page = await browser.new_page()
+            await sign_in(page, fixture)
+            await start_connection(page, fixture.provider)
+            dialog = page.get_by_role("dialog")
+            fixture.provider.authenticated = True
+            await dialog.get_by_role("button", name="Check status", exact=True).click()
+            await dialog.get_by_role("checkbox", name="Electricity").check()
+            await dialog.get_by_role("button", name="Connect selected meters").click()
+            await expect(dialog.locator(".sync-status")).to_contain_text(
+                "Coverage gaps"
+            )
+            await dialog.get_by_role("button", name="Close utility connection").click()
+
+            async def hold_first_refresh(route: Route) -> None:
+                nonlocal held
+                if held:
+                    await route.continue_()
+                    return
+                held = True
+                response = await route.fetch()
+                response_ready.set()
+                await release_response.wait()
+                try:
+                    await route.fulfill(response=response)
+                finally:
+                    response_finished.set()
+
+            await page.route("**/v1/connections/*/refresh", hold_first_refresh)
+            await reopen_connection_settings(page)
+            await asyncio.wait_for(response_ready.wait(), 5)
+            await expect(dialog.get_by_text("Loading connection…")).to_be_visible()
+            async with page.expect_event(
+                "requestfailed",
+                predicate=lambda request: request.url.endswith("/refresh"),
+            ) as aborted:
+                await dialog.get_by_role(
+                    "button", name="Close utility connection"
+                ).click()
+            assert (await aborted.value).failure is not None
+            await expect(dialog).to_be_hidden()
+            fixture.provider.authenticated = False
+            fixture.provider.auth_status = "onboarding_mfa_needed"
+            await reopen_connection_settings(page)
+            await expect(dialog.locator(".connection-status")).to_have_text(
+                "Sign-in needed"
+            )
+            release_response.set()
+            await asyncio.wait_for(response_finished.wait(), 5)
+            await expect(dialog.locator(".connection-status")).to_have_text(
+                "Sign-in needed"
+            )
+            await expect(
+                dialog.get_by_role("button", name="Sync account", exact=True)
+            ).to_be_disabled()
+            await dialog.get_by_role("button", name="Close utility connection").click()
+            await expect(dialog).to_be_hidden()
+        finally:
+            release_response.set()
             await browser.close()
 
 

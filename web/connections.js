@@ -164,11 +164,14 @@ export function createConnections({ api, node, providers, updated, details, onEr
       const summary = node('div', undefined, 'connection-summary');
       summary.append(status, node('span', 'Bayou', 'badge'));
       body.replaceChildren(summary);
-    } else body.replaceChildren(steps, status, description);
+    } else {
+      body.replaceChildren(status, description);
+      if (!next.linked_account_ids.length && next.state !== 'unavailable') body.prepend(steps);
+    }
     if (next.issue) body.append(node('p', issues[next.issue] ?? 'Check the connection status before continuing.', 'connection-note'));
     if (next.state === 'ready') {
       renderMeters(next);
-    } else if (next.state !== 'connected') {
+    } else {
       if (['awaiting_authorization', 'needs_authentication', 'authenticating'].includes(next.state)) {
         body.append(node('p', 'Bayou stores your utility login to keep data in sync. Home Assistant never receives your password. Return here when finished.'));
         const linkArea = node('div', undefined, 'connection-link');
@@ -211,6 +214,7 @@ export function createConnections({ api, node, providers, updated, details, onEr
       accountIds: next.linked_account_ids,
       connectionId: next.id,
       available: next.state === 'connected',
+      connectionState: next.state,
     });
     poll();
   }
@@ -354,7 +358,7 @@ export function createConnections({ api, node, providers, updated, details, onEr
   async function open(id) {
     if (!begin()) return;
     try {
-      if (id) renderRecord(await request(`v1/connections/${encodeURIComponent(id)}`, {}));
+      if (id) renderRecord(await request(`v1/connections/${encodeURIComponent(id)}/refresh`, { body: {} }));
       else {
         if (draft) {
           const saved = await request('v1/connections', {});
