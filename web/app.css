@@ -45,7 +45,6 @@ p { line-height: 1.55; }
 .section-heading { align-items: center; padding: 16px 20px; border-bottom: 1px solid var(--line); }
 .section-heading p { margin: 4px 0 0; font-size: 12px; }
 .text-action { padding: 6px 0; min-height: 44px; background: transparent; color: var(--ink); border-radius: 0; text-decoration: underline; text-underline-offset: 4px; font-size: 12px; white-space: nowrap; }
-.text-action:hover { background: transparent; }
 .record-list { list-style: none; padding: 0; margin: 0; }
 .record-list li { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; padding: 16px 20px; border-bottom: 1px solid var(--line); }
 .record-list li:last-child { border-bottom: 0; }
@@ -67,7 +66,9 @@ td.numeric, th.numeric { text-align: right; font-variant-numeric: tabular-nums; 
 .numeric-value { font-family: var(--mono); }
 .record-button { display: inline-flex; align-items: center; min-height: 44px; min-width: 44px; margin-block: -10px; padding: 0; background: transparent; color: var(--ink); font-size: inherit; font-weight: 560; border-radius: 0; text-align: left; text-decoration: underline; text-underline-offset: 4px; }
 .list-meta [tabindex="-1"]:focus-visible { outline: 2px solid var(--focus); outline-offset: 4px; }
-.record-button:hover { background: transparent; }
+@media (hover: hover) and (pointer: fine) {
+  .text-action:not(:disabled):hover, .record-button:not(:disabled):hover { background: transparent; text-decoration-thickness: 2px; }
+}
 .toolbar { display: flex; flex-wrap: wrap; align-items: end; gap: 12px; margin-bottom: 20px; }
 .form-field { display: grid; gap: 8px; font-size: 13px; }
 .form-field > input, .form-field > select { min-width: 0; width: 100%; }
