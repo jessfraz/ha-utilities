@@ -51,6 +51,9 @@ export function createConnections({ api, node, providers, updated, details, onEr
   close.setAttribute('aria-label', 'Close utility connection');
   header.append(title, close);
   const body = node('div', undefined, 'connection-body');
+  body.tabIndex = 0;
+  body.setAttribute('role', 'region');
+  body.setAttribute('aria-label', 'Connection details');
   const error = node('p', '', 'notice error');
   error.setAttribute('role', 'alert');
   const footer = node('div', undefined, 'connection-footer');
