@@ -14,10 +14,10 @@ dev = [
   "psutil-home-assistant==0.0.1",
   "hassil==3.12.1",
   "home-assistant-intents==2026.10.27",
-  "playwright==1.64.1",
-  "pytest-homeassistant==2026.11.0",
-  "ruff==0.17.4",
-  "ty==0.0.99",
+  "playwright==1.65.2",
+  "pytest-homeassistant==2026.11.1",
+  "ruff==0.17.5",
+  "ty==0.0.104",
 ]
 
 [tool.pytest.ini_options]
